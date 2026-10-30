@@ -193,6 +193,22 @@ impl ThrowClass {
         }
     }
 
+    /// `Class.getSimpleName` over [`jvm_name`](Self::jvm_name):
+    /// strip the package, then a member-class owner (`$` +
+    /// uppercase strips to the inner, like the JDK; `$` +
+    /// lowercase is a generated name and stays). The reader's
+    /// `#=`/resolver errors report this (the differential oracle
+    /// compares simple names, reader-contract §3).
+    #[must_use]
+    pub fn simple_name(&self) -> &'static str {
+        let full = self.jvm_name();
+        let base = full.rsplit('.').next().unwrap_or(full);
+        match base.rsplit_once('$') {
+            Some((_, simple)) if simple.starts_with(|c: char| c.is_ascii_uppercase()) => simple,
+            _ => base,
+        }
+    }
+
     /// Whether a `catch` on `catch_jvm_name` catches this class:
     /// the name itself or any superclass up the chain (`Throwable`
     /// catches everything).
@@ -571,6 +587,24 @@ mod tests {
             assert_eq!(class.jvm_name(), want);
         }
         assert_eq!(cases.len(), 23);
+    }
+
+    #[test]
+    fn throw_class_simple_names() {
+        // `getSimpleName`: package stripped, member-class owners
+        // (`$` + uppercase) stripped to the inner.
+        let cases = [
+            (ThrowClass::RuntimeException, "RuntimeException"),
+            (ThrowClass::ArithmeticException, "ArithmeticException"),
+            (ThrowClass::NullPointerException, "NullPointerException"),
+            (ThrowClass::NumberFormatException, "NumberFormatException"),
+            (ThrowClass::ArityException, "ArityException"),
+            (ThrowClass::CompilerException, "CompilerException"),
+            (ThrowClass::ReaderException, "ReaderException"),
+        ];
+        for (class, want) in cases {
+            assert_eq!(class.simple_name(), want);
+        }
     }
 
     #[test]

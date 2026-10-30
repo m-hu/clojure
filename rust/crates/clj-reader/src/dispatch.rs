@@ -703,7 +703,9 @@ mod tests {
     fn eval_reader_denies_before_reading() {
         // S7 gate (probe `b-false`): the denial fires before the
         // operand is touched (even `#=`-at-EOF reports the gate),
-        // at the entry span (probe `h-gate-lnpr`).
+        // at the entry span (probe `h-gate-lnpr`). #125: this
+        // triple is the JVM's own (message + simple class + span),
+        // pinned conformant by the corpus `#=(+ 1 2)` case.
         for input in ["#=(+ 1 2)", "#="] {
             let opts = ReaderOpts {
                 read_eval: false,
@@ -718,7 +720,7 @@ mod tests {
                 err.message(),
                 "EvalReader not allowed when *read-eval* is false."
             );
-            assert_eq!(err.jvm_class(), "java.lang.RuntimeException");
+            assert_eq!(err.jvm_class(), "RuntimeException");
             let span = err.span();
             assert_eq!((span.line, span.col), (1, 3), "{input}");
         }
@@ -749,7 +751,7 @@ mod tests {
         let err = read_str("#=(/ 1 0)", &opts, &mut hooks).unwrap_err();
         assert!(matches!(err, ReaderError::EvalFailed { .. }));
         assert_eq!(err.message(), "Divide by zero");
-        assert_eq!(err.jvm_class(), "java.lang.ArithmeticException");
+        assert_eq!(err.jvm_class(), "ArithmeticException");
         let span = err.span();
         assert_eq!((span.line, span.col), (1, 10));
     }

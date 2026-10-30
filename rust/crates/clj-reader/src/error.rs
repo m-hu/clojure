@@ -291,7 +291,9 @@ impl ReaderError {
             | Self::Record { .. }
             | Self::LoneSurrogate { .. } => "ReaderError",
             Self::EvalFailed { error, .. } => match error {
-                crate::hooks::EvalReadError::Failed(t) => t.class.jvm_name(),
+                // Simple, like every other arm (the oracle compares
+                // `getSimpleName`; #125 flips §24 item 2 on this).
+                crate::hooks::EvalReadError::Failed(t) => t.class.simple_name(),
                 crate::hooks::EvalReadError::NoHook => "ReaderError",
             },
             Self::RatioZeroDiv { .. } => "ArithmeticException",
@@ -605,7 +607,7 @@ mod tests {
             }),
         };
         assert_eq!(failed.message(), "Divide by zero");
-        assert_eq!(failed.jvm_class(), "java.lang.ArithmeticException");
+        assert_eq!(failed.jvm_class(), "ArithmeticException");
         assert_eq!(failed.span(), span);
         let messageless = ReaderError::EvalFailed {
             span,
@@ -618,7 +620,7 @@ mod tests {
             }),
         };
         assert_eq!(messageless.message(), "");
-        assert_eq!(messageless.jvm_class(), "java.lang.NullPointerException");
+        assert_eq!(messageless.jvm_class(), "NullPointerException");
         let hookless = ReaderError::EvalFailed {
             span,
             error: EvalReadError::NoHook,

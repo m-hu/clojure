@@ -299,8 +299,10 @@ pub fn case_opts(case: &Case, resolver: &Resolver) -> ReaderOpts {
         refers: resolver.refers.clone(),
         class_map: resolver.class_map.clone(),
         // The corpus drives the standalone reader: defer mode stays
-        // off (S6 consults only on eval paths); the S7 gate fields
-        // ride the struct default.
+        // off (S6 consults only on eval paths); the gate stays
+        // closed like the driver's `(binding [*read-eval* false]
+        // ...)` (#125: the `#=` case compares conformantly).
+        read_eval: false,
         data_readers: false,
         data_reader_keys: std::collections::HashSet::new(),
         data_readers_borked: None,

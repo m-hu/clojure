@@ -21,9 +21,13 @@ our `ReaderError` must expose both (`message()` and `jvm_class()`).
 
 S2 default read options are **load semantics**: `:read-cond :allow`,
 `:features #{:clj}` (JVM always conjs `:clj`, `installPlatformFeature`).
-S5's `read-string` will pass deny explicitly. `*read-eval*` is honored
-only as: `#=` always errors (N5 deferral, §16); the `:unknown` check and
-`false` branch have no S2 equivalent (no dynamic bindings yet).
+S5's `read-string` will pass deny explicitly. S2 honored `*read-eval*`
+only as: `#=` always errored (N5 deferral, §16); the `:unknown` check
+and `false` branch had no S2 equivalent (no dynamic bindings yet).
+S7+ threads the live binding through `ReaderOpts.read_eval`: closed
+⇒ the JVM gate triple, open ⇒ evaluator-hook application (§16).
+The harness reads with the gate closed, like the driver's
+`(binding [*read-eval* false] …)` (#125).
 
 ## §1 Char stream, positions, unread
 
@@ -444,9 +448,16 @@ unreachable in S2 — the ctor path always throws or returns):
 
 ## §16 Eval reader (`#=`)
 
-S2 has no evaluator: `#=` ⇒ immediate N5-deferral error (§22) **without
-consuming the following form** (matches the `*read-eval* false` branch
-position: col right after `#=`, probe1 `#=(+ 1 2)`).
+S2 had no evaluator: `#=` ⇒ immediate N5-deferral error (§22)
+**without consuming the following form**. S7+ honors `*read-eval*`
+(issue #125): closed ⇒ the JVM gate error —
+`[RE] "EvalReader not allowed when *read-eval* is false."` at the
+entry span (col right after `#=`, probe1 `#=(+ 1 2)`), compared
+conformant (§24 item 2); open ⇒ read the operand, then apply the
+evaluator hook at the post-operand span (hookless contexts report
+the `ReadEval` deferral instead). Application semantics (head
+resolution over raw operand forms, never full eval) are
+oracle-pinned in the S7 spec, not here.
 
 ## §17 Unreadable (`#<`)
 
@@ -702,11 +713,14 @@ after normalizing `__\d+#`→`__N#`, `__\d+__auto__`→`__N__auto__`
 match exactly — except §24 cases, which assert divergence-shape
 (expected error on one/both sides as catalogued).
 
-## §24 Catalogued divergences (harness asserts these as divergences)
+## §24 Catalogued divergences (harness asserts these as divergences;
+item 2 conformant since #125, kept numbered for stable references)
 
 1. Big tower (§22 N3 ×3): JVM reads values; we error. Both directions pinned.
-2. `#=` (N5): JVM with `*read-eval*` false errors with its message; we
-   error with ours. Span shape same (col after `#=`).
+2. `#=` (N5 — conformant since #125): with `*read-eval*` false both
+   sides report `[RE] "EvalReader not allowed when *read-eval* is
+   false."` at (line, col after `#=`); the harness compares the
+   triple exactly (corpus case `"#=(+ 1 2)"`, gate unit pin).
 3. `#inst`/`#uuid` (N5): JVM invokes readers (valid ⇒ value; invalid ⇒
    its error); we always defer after consuming tag+form.
 4. Record tags (S5): JVM checks `*read-eval*` first; we defer.

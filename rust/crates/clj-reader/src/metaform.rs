@@ -903,7 +903,7 @@ mod tests {
             err.message(),
             "Cannot read field \"name\" because the return value of \"clojure.lang.LispReader$Resolver.currentNS()\" is null"
         );
-        assert_eq!(err.jvm_class(), "java.lang.NullPointerException");
+        assert_eq!(err.jvm_class(), "NullPointerException");
     }
 
     #[test]

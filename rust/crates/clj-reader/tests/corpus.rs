@@ -110,6 +110,9 @@ fn corpus_files() {
             aliases: resolver.aliases.clone(),
             refers: resolver.refers.clone(),
             class_map: resolver.class_map.clone(),
+            // Like the driver: full files read with `*read-eval*`
+            // false (#125).
+            read_eval: false,
             ..Default::default()
         };
         let forms = match run_ours(&text, &opts) {
