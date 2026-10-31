@@ -39,6 +39,7 @@ pub mod lazy;
 pub mod macros;
 pub mod multi;
 pub mod ns;
+pub mod portdeps;
 pub(crate) mod printsys;
 pub mod protocol;
 pub mod re;
