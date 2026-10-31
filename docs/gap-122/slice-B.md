@@ -166,3 +166,12 @@ regex ops (`cat`/`alt`/`*`/`+`/`?`/`&`, later slice),
 6. Gates: `cargo fmt --check`, `cargo clippy` clean, full
    `clj-eval` suite green; coverage floor + complexity ratchet
    unaffected (no Rust sources touched).
+
+## Known pre-existing port limits (not slice-B work)
+
+- The port's numeric predicates (`even?`, `odd?`, ...) throw
+  `IllegalArgumentException` on non-numeric input where the JVM
+  answers false. Tests that would feed such values through a
+  branch use type predicates instead; `(s/valid?
+  (s/nilable even?) nil)` still works (nil short-circuits before
+  the pred runs).
