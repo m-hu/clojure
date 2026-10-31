@@ -231,15 +231,21 @@ oracle lines above; derivations cite the mechanism.
 ### alt / conform + unform
 
 19. Conform tags
-    When `(s/conform (s/alt :e even? :o odd?) 4)` Then `[:e
-    4]` (a `MapEntry`: `tagged-ret` 1058-1059);
-    When `(key (s/conform (s/alt :e even? :o odd?) 5))`
+    When `(s/conform (s/alt :e even? :o odd?) [4])` Then
+    `[:e 4]` (a `MapEntry`: `tagged-ret` 1058-1059; the
+    input is the one-element sequence the branch matches);
+    When `(key (s/conform (s/alt :e even? :o odd?) [5]))`
     Then `:o`;
-    When `(val (s/conform (s/alt :e even? :o odd?) 5))`
+    When `(val (s/conform (s/alt :e even? :o odd?) [5]))`
     Then `5`.
 20. No branch matches
-    When `(s/conform (s/alt :e even? :o odd?) 4.5)` Then
-    `:clojure.spec.alpha/invalid`.
+    When `(s/conform (s/alt :s string? :k keyword?) [42])`
+    Then `:clojure.spec.alpha/invalid`;
+    When `(s/conform (s/alt :e even? :o odd?) [4.5])` Then
+    `java.lang.IllegalArgumentException | Argument must be
+    an integer: 4.5` (throwing preds propagate out of
+    `deriv`, as upstream: `dt` calls the pred directly, so
+    `even?` on a non-integer throws instead of failing).
 21. Unform unwraps the tag
     When `(s/unform (s/alt :e even? :o odd?) [:e 4])` Then
     `[4]` (`op-unform` 1508-1511 destructures `[k v]` and
@@ -337,10 +343,12 @@ oracle lines above; derivations cite the mechanism.
     (`regex-spec-impl` `explain*` 1714-1717; the `:pred`
     abbreviates as derived in Solution).
 35. alt explains every branch
-    When `(s/explain-str (s/alt :e even? :o odd?) 4.5)`
-    Then `"4.5 - failed: even? in: [0] at: [:e]\n4.5 -
-    failed: odd? in: [0] at: [:o]\n"` (`op-explain` 1598-1608
-    concats one problem per branch, in order).
+    When `(s/explain-str (s/alt :s string? :k keyword?)
+    [42])` Then `"42 - failed: string? in: [0] at:
+    [:s]\n42 - failed: keyword? in: [0] at: [:k]\n"`
+    (`op-explain` 1598-1608 concats one problem per branch,
+    in order; `string?`/`keyword?` never throw, unlike
+    `even?`/`odd?` on non-integers — see scenario 20).
 36. `*` mid-sequence failure
     When `(s/explain-str (s/* integer?) [1 :a])` Then `":a
     - failed: integer? in: [1]\n"` (the `rep` branch
@@ -360,6 +368,29 @@ oracle lines above; derivations cite the mechanism.
     :user/n]` (verbatim upstream: `op-explain` 1566 conj's
     the op's own `:name` onto the caller `via`, which
     already holds the name; the printer shows the last).
+
+### empty-input edges
+
+43. `&` over an empty match conforms to nil
+    When `(s/conform (s/& (s/* integer?) vector?) [])`
+    Then `nil` (`preturn` 1477-1490 of the `amp` hits
+    `noret?` 1455-1459: an empty `rep` result carries no
+    return, so `re-conform` 1662-1666 yields `nil`);
+    When `(s/valid? (s/& (s/* integer?) vector?) [])`
+    Then `true`.
+44. `&` over empty input explains its predicates
+    When `(s/explain-str (s/& (s/* integer?) #(> (count %)
+    5)) [])` Then `"[] - failed: (> (count %) 5)\n"` (the
+    `amp` branch 1579-1583 with an accept-nil `re` runs
+    `explain-pred-list` over the empty `re` result).
+45. `&` over empty input can be insufficient
+    When `(s/explain-str (s/& (s/cat :e even?) vector?)
+    [])` Then `"() - failed: Insufficient input\n"` (the
+    `amp` branch 1584: the `cat` `re` accepts no nil).
+46. `alt` over empty input can be insufficient
+    When `(s/explain-str (s/alt :a (s/cat :x even?)) [])`
+    Then `"() - failed: Insufficient input\n"` (the `alt`
+    branch 1598-1599 with empty input).
 
 ### registry / integration
 
@@ -428,14 +459,14 @@ lines above):
    `preturn`/`add-ret`/`deriv`, `re-conform`, `RegexSpec` +
    `regex-spec-impl`, `maybe-spec` + `spec-impl`
    integration, `declare` updates.
-3. RED: scenarios 18-28 (alt/`*`/`+`/`?`/`&`) -> GREEN:
-   `rep*`/`rep-impl`/`rep+impl`/`amp-impl`/`filter-alt`/
-   `alt*`/`alts`/`alt2`/`alt-impl`/`maybe-impl`,
-   `op-unform`.
+3. RED: scenarios 18-28 + 43 (alt/`*`/`+`/`?`/`&`) ->
+   GREEN: `rep*`/`rep-impl`/`rep+impl`/`amp-impl`/
+   `filter-alt`/`alt*`/`alts`/`alt2`/`alt-impl`/
+   `maybe-impl`, `op-unform`.
 4. RED: scenarios 29-30 (form/describe) -> GREEN:
    `op-describe`.
-5. RED: scenarios 31-38 (explain) -> GREEN: `op-explain`,
-   `re-explain`, the guard-form literal.
+5. RED: scenarios 31-38 + 44-46 (explain) -> GREEN:
+   `op-explain`, `re-explain`, the guard-form literal.
 6. RED: scenarios 39-40 (registry integration) -> GREEN: no
    new code expected (pins step 2's integration); if red,
    fix the `maybe-spec`/`spec-impl` wiring.

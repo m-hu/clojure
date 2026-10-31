@@ -401,12 +401,15 @@ fn form_and_describe_and() {
 
 #[test]
 fn regex_spec_out_of_scope() {
-    // A regex-op-shaped map reaches the slice-1 guard loudly.
+    // Gap-122 slice E retired the slice-1 guard: a regex-op-shaped
+    // map is now a usable spec (see spec_regex.rs for the full
+    // pins). Same input, new behavior: 1 is not sequential, so the
+    // accept op simply does not match (no throw).
     let mut eval = boot();
     require_spec(&mut eval);
     assert_eq!(
-        uncaught(&mut eval, "(s/valid? {:clojure.spec.alpha/op :accept} 1)"),
-        "clojure.lang.ExceptionInfo | regex specs are out of scope in gap-122 slice 1"
+        run(&mut eval, "(s/valid? {:clojure.spec.alpha/op :accept} 1)"),
+        "false"
     );
 }
 

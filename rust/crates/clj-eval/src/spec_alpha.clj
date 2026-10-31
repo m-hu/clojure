@@ -6,20 +6,24 @@
 ;; the terms of this license.
 ;; You must not remove this notice, or any other, from this software.
 
-;; gap-122 slice 1: a faithful subset port of clojure.spec.alpha
-;; (upstream spec.alpha-0.5.238, clojure/spec/alpha.clj) covering the
+;; gap-122 slices 1+E: a faithful subset port of clojure.spec.alpha
+;; (upstream spec.alpha-0.6.249, clojure/spec/alpha.clj) covering the
 ;; spec registry, `def`, predicate specs, `s/and`, `valid?`,
-;; `conform`/`unform`, and basic `explain`/`explain-str`.
+;; `conform`/`unform`, basic `explain`/`explain-str`, and (slice E)
+;; regex specs: `s/cat`, `s/alt`, `s/*`, `s/+`, `s/?`, `s/&` over
+;; the derivative engine, plus the `s/keys*` macro (expansion only;
+;; runtime use waits for slices A + D + F).
 ;;
-;; Port adaptations (see docs/gap-122/slice-1.md for the full list):
+;; Port adaptations (see docs/gap-122/slice-1.md and
+;; docs/gap-122/slice-E.md for the full lists):
 ;; - No syntax-quote and no `::auto-resolve` anywhere in this file:
 ;;   the port reads a whole load batch before evaluating it, so both
 ;;   would qualify against the *requiring* namespace instead of this
 ;;   one. Macros build expansions with `list` (fully-qualified
 ;;   heads), and spec keywords are written out in full.
-;; - Spec objects are `defrecord`s (PredSpec/AndSpec) with the Spec
-;;   protocol extended to them: the port's `reify` instances do not
-;;   support metadata, while the JVM's do (`with-name` needs it).
+;; - Spec objects are `defrecord`s (PredSpec/AndSpec/RegexSpec) with
+;;   the Spec protocol extended to them: the port's `reify` instances
+;;   do not support metadata, while the JVM's do (`with-name` needs it).
 ;; - `specize` is a plain `cond` (not the Specize protocol): the
 ;;   port has no `Object`-default protocol dispatch, and set dispatch
 ;;   would miss sorted sets (exact-class keys). Behavior matches.
@@ -31,7 +35,18 @@
 ;; - `ns-qualify` uses `ns-name` (no `.name` interop, no `str` of
 ;;   namespaces).
 ;; - `gen*`/`with-gen*` are declared on the protocol but left
-;;   unextended (generators are a later slice).
+;;   unextended on PredSpec/AndSpec (generators are a later slice);
+;;   on RegexSpec both surface the `re-gen` stub (`ex-info`
+;;   "generators slice pending"), which slice F replaces.
+;; - `tagged-ret` is `(first {tag ret})`: the port cannot build a
+;;   `MapEntry` object, but the entry of a single-entry map is one.
+;; - `regex-spec-impl` narrows to `[re]` (`gfn` dropped, as the
+;;   other `-impl` ctors); the non-sequential `explain*` `:pred`
+;;   is the literal `(clojure.core/fn [%] (clojure.core/or ...))`
+;;   form (the deterministic value of upstream's `(res ...)` call).
+;; - `keys*` keeps `let`/`fn`/core fns bare in its expansion
+;;   (use-site refers; only the unqualified `let` is the special
+;;   form) while spec/gen heads fully qualify.
 (ns clojure.spec.alpha
   "The spec library specifies the structure of data or functions and provides
   operations to validate, conform, explain, describe, and generate data based on
@@ -39,7 +54,7 @@
 
   Rationale: https://clojure.org/about/spec
   Guide: https://clojure.org/guides/spec"
-  (:refer-clojure :exclude [and def]))
+  (:refer-clojure :exclude [and def + * cat]))
 
 (alias 'c 'clojure.core)
 
@@ -60,11 +75,16 @@
 ;; so forward references resolve at first conform, not at build.
 (defrecord PredSpec [form pred])
 (defrecord AndSpec [forms preds specs])
+;; Slice E (upstream alpha.clj 1697-1723): the Spec glide over a
+;; regex op map. Upstream closes over `re` in a `reify`; the port
+;; holds it in a record field (metadata-carrying, as above).
+(defrecord RegexSpec [re])
 
 ;; Forward declarations: the `extend-type` blocks below call fns
 ;; defined later in this file (the port resolves globals at analyze
-;; time), as do `specize` and `def-impl` (-> `spec-impl`).
-(declare spec-impl dt invalid? unform explain-pred-list)
+;; time), as do `specize` and `def-impl` (-> `spec-impl`), and
+;; `maybe-spec`/`spec-impl` (-> `regex-spec-impl`).
+(declare spec-impl dt invalid? unform explain-pred-list regex-spec-impl re-conform op-unform re-explain re-gen op-describe regex-guard-form)
 
 (extend-type PredSpec
   Spec
@@ -94,6 +114,23 @@
     (explain-pred-list (:forms this) (:preds this) path via in x))
   (describe* [this]
     (apply list 'clojure.spec.alpha/and (:forms this))))
+
+(extend-type RegexSpec
+  Spec
+  (conform* [this x]
+    (if (c/or (nil? x) (sequential? x))
+      (re-conform (:re this) (seq x))
+      :clojure.spec.alpha/invalid))
+  (unform* [this x] (op-unform (:re this) x))
+  (explain* [this path via in x]
+    (if (c/or (nil? x) (sequential? x))
+      (re-explain path via in (:re this) (seq x))
+      [{:path path :pred regex-guard-form :val x :via via :in in}]))
+  (gen* [this overrides path rmap]
+    (re-gen (:re this) overrides path rmap (op-describe (:re this))))
+  (with-gen* [this gfn]
+    (throw (ex-info "generators slice pending" {})))
+  (describe* [this] (op-describe (:re this))))
 
 ;; Upstream alpha.clj 52.
 (defonce ^:private registry-ref (atom {}))
@@ -157,9 +194,7 @@
    (regex? spec) (:clojure.spec.alpha/name spec)
    (spec? spec) (:clojure.spec.alpha/name (meta spec))))
 
-;; Upstream alpha.clj 110-119. Regex ops cannot be built in slice 1,
-;; so a regex reaching here is user data: fail loudly instead of
-;; wrapping it (no `regex-spec-impl` yet).
+;; Upstream alpha.clj 110-119 (slice E wires the regex wrap).
 (defn- maybe-spec
   "spec-or-k must be a spec, regex or resolvable kw/sym, else returns nil."
   [spec-or-k]
@@ -168,7 +203,7 @@
                 (regex? spec-or-k)
                 nil)]
     (if (regex? s)
-      (throw (ex-info "regex specs are out of scope in gap-122 slice 1" {}))
+      (with-name (regex-spec-impl s) (spec-name s))
       s)))
 
 ;; Upstream alpha.clj 121-126 (throw via ex-info, as `reg-resolve!`).
@@ -427,6 +462,72 @@ if value does not match spec, else the (possibly destructured) value."
         (list 'quote (mapv res pred-forms))
         (vec pred-forms)))
 
+;; Upstream alpha.clj 607-611 (built with `list`, as `def`).
+(defmacro *
+  "Returns a regex op that matches zero or more values matching
+  pred. Produces a vector of matches iff there is at least one match"
+  [pred-form]
+  (list 'clojure.spec.alpha/rep-impl (list 'quote (res pred-form)) pred-form))
+
+;; Upstream alpha.clj 613-617 (built with `list`, as `def`).
+(defmacro +
+  "Returns a regex op that matches one or more values matching
+  pred. Produces a vector of matches"
+  [pred-form]
+  (list 'clojure.spec.alpha/rep+impl (list 'quote (res pred-form)) pred-form))
+
+;; Upstream alpha.clj 619-623 (built with `list`, as `def`).
+(defmacro ?
+  "Returns a regex op that matches zero or one value matching
+  pred. Produces a single value (not a collection) if matched."
+  [pred-form]
+  (list 'clojure.spec.alpha/maybe-impl pred-form (list 'quote (res pred-form))))
+
+;; Upstream alpha.clj 625-640 (built with `list`, as `def`;
+;; `assert` is bare, as in `def-impl`, while the `c/and` inside
+;; stays: bare `and` would hit spec's own macro).
+(defmacro alt
+  "Takes key+pred pairs, e.g.
+
+  (s/alt :even even? :small #(< % 42))
+
+  Returns a regex op that returns a map entry containing the key of the
+  first matching pred and the corresponding value. Thus the
+  'key' and 'val' functions can be used to refer generically to the
+  components of the tagged return"
+  [& key-pred-forms]
+  (let [pairs (partition 2 key-pred-forms)
+        keys (mapv first pairs)
+        pred-forms (mapv second pairs)
+        pf (mapv res pred-forms)]
+    (assert (c/and (even? (count key-pred-forms)) (every? keyword? keys)) "alt expects k1 p1 k2 p2..., where ks are keywords")
+    (list 'clojure.spec.alpha/alt-impl keys pred-forms (list 'quote pf))))
+
+;; Upstream alpha.clj 642-656 (built with `list`, as `alt`).
+(defmacro cat
+  "Takes key+pred pairs, e.g.
+
+  (s/cat :e even? :o odd?)
+
+  Returns a regex op that matches (all) values in sequence, returning a map
+  containing the keys of each pred and the corresponding value."
+  [& key-pred-forms]
+  (let [pairs (partition 2 key-pred-forms)
+        keys (mapv first pairs)
+        pred-forms (mapv second pairs)
+        pf (mapv res pred-forms)]
+    (assert (c/and (even? (count key-pred-forms)) (every? keyword? keys)) "cat expects k1 p1 k2 p2..., where ks are keywords")
+    (list 'clojure.spec.alpha/cat-impl keys pred-forms (list 'quote pf))))
+
+;; Upstream alpha.clj 658-665 (built with `list`, as `def`).
+(defmacro &
+  "takes a regex op re, and predicates. Returns a regex-op that consumes
+  input as per re but subjects the resulting value to the
+  conjunction of the predicates, and any conforming they might perform."
+  [re & preds]
+  (let [pv (vec preds)]
+    (list 'clojure.spec.alpha/amp-impl re (list 'quote (res re)) pv (list 'quote (mapv res pv)))))
+
 ;; Upstream alpha.clj 757-768, narrowed: `cpred?` is conformer
 ;; machinery (a later slice). Throw via ex-info, as `reg-resolve!`.
 (defn- dt
@@ -470,14 +571,14 @@ if value does not match spec, else the (possibly destructured) value."
 
 ;; Upstream alpha.clj 913-944, narrowed to `[form pred]` (`gfn` and
 ;; `cpred?`/`unc` are generator/conformer machinery). Builds a
-;; PredSpec record; a regex pred fails loudly (no `regex-spec-impl`
-;; yet).
+;; PredSpec record; a regex pred wraps via `regex-spec-impl`
+;; (slice E).
 (defn ^:skip-wiki spec-impl
   "Do not call this directly, use 'spec'"
   [form pred]
   (cond
    (spec? pred) pred
-   (regex? pred) (throw (ex-info "regex specs are out of scope in gap-122 slice 1" {}))
+   (regex? pred) (regex-spec-impl pred)
    (ident? pred) (the-spec pred)
    :else (->PredSpec form pred)))
 
@@ -488,4 +589,389 @@ if value does not match spec, else the (possibly destructured) value."
   "Do not call this directly, use 'and'"
   [forms preds]
   (->AndSpec forms preds (delay (mapv specize preds forms))))
+
+;; Upstream alpha.clj 1058-1059. The port cannot construct a
+;; `MapEntry` object, so this takes the first entry of a
+;; single-entry map (a port `MapEntry`: identical `pr`, `key`,
+;; `val`, `nth`, `count`, `=`, `vector?`, destructuring).
+(defn- tagged-ret [tag ret]
+  (first {tag ret}))
+
+;; Upstream alpha.clj 1128-1137.
+(defn- and-preds [x preds forms]
+  (loop [ret x
+         [pred & preds] preds
+         [form & forms] forms]
+    (if pred
+      (let [nret (dt pred ret form)]
+        (if (invalid? nret)
+          :clojure.spec.alpha/invalid
+          ;;propagate conformed values
+          (recur nret preds forms)))
+      ret)))
+
+;;;;;;;;;;;;;;;;;;;;;;; regex ;;;;;;;;;;;;;;;;;;;
+;;See:
+;; http://matt.might.net/articles/implementation-of-regular-expression-matching-in-scheme-with-derivatives/
+;; http://www.ccs.neu.edu/home/turon/re-deriv.pdf
+
+;; Upstream alpha.clj 1380-1383.
+(defn- accept [x] {:clojure.spec.alpha/op :clojure.spec.alpha/accept :ret x})
+
+(defn- accept? [{:keys [:clojure.spec.alpha/op]}]
+  (= :clojure.spec.alpha/accept op))
+
+;; Upstream alpha.clj 1385-1395.
+(defn- pcat* [{[p1 & pr :as ps] :ps,  [k1 & kr :as ks] :ks, [f1 & fr :as forms] :forms, ret :ret, rep+ :rep+}]
+  (when (every? identity ps)
+    (if (accept? p1)
+      (let [rp (:ret p1)
+            ret (conj ret (if ks {k1 rp} rp))]
+        (if pr
+          (pcat* {:ps pr :ks kr :forms fr :ret ret})
+          (accept ret)))
+      {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps ps, :ret ret, :ks ks, :forms forms :rep+ rep+})))
+
+(defn- pcat [& ps] (pcat* {:ps ps :ret []}))
+
+;; Upstream alpha.clj 1397-1400.
+(defn ^:skip-wiki cat-impl
+  "Do not call this directly, use 'cat'"
+  [ks ps forms]
+  (pcat* {:ks ks, :ps ps, :forms forms, :ret {}}))
+
+;; Upstream alpha.clj 1402-1407 (`random-uuid` for
+;; `UUID/randomUUID`: same value type, port native).
+(defn- rep* [p1 p2 ret splice form]
+  (when p1
+    (let [r {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 p2, :splice splice, :forms form :id (random-uuid)}]
+      (if (accept? p1)
+        (assoc r :p1 p2 :ret (conj ret (:ret p1)))
+        (assoc r :p1 p1, :ret ret)))))
+
+;; Upstream alpha.clj 1409-1411.
+(defn ^:skip-wiki rep-impl
+  "Do not call this directly, use '*'"
+  [form p] (rep* p p [] false form))
+
+;; Upstream alpha.clj 1413-1416 (the `` `[~form (* ~form)] `` form
+;; vector is list-built, as the macros).
+(defn ^:skip-wiki rep+impl
+  "Do not call this directly, use '+'"
+  [form p]
+  (pcat* {:ps [p (rep* p p [] true form)] :forms (vector form (list 'clojure.spec.alpha/* form)) :ret [] :rep+ form}))
+
+;; Upstream alpha.clj 1418-1421.
+(defn ^:skip-wiki amp-impl
+  "Do not call this directly, use '&'"
+  [re re-form preds pred-forms]
+  {:clojure.spec.alpha/op :clojure.spec.alpha/amp :p1 re :amp re-form :ps preds :forms pred-forms})
+
+;; Upstream alpha.clj 1423-1430.
+(defn- filter-alt [ps ks forms f]
+  (if (c/or ks forms)
+    (let [pks (->> (map vector ps
+                        (c/or (seq ks) (repeat nil))
+                        (c/or (seq forms) (repeat nil)))
+                   (filter #(-> % first f)))]
+      [(seq (map first pks)) (when ks (seq (map second pks))) (when forms (seq (map #(nth % 2) pks)))])
+    [(seq (filter f ps)) ks forms]))
+
+;; Upstream alpha.clj 1432-1442.
+(defn- alt* [ps ks forms]
+  (let [[[p1 & pr :as ps] [k1 :as ks] forms] (filter-alt ps ks forms identity)]
+    (when ps
+      (let [ret {:clojure.spec.alpha/op :clojure.spec.alpha/alt, :ps ps, :ks ks :forms forms}]
+        (if (nil? pr)
+          (if k1
+            (if (accept? p1)
+              (accept (tagged-ret k1 (:ret p1)))
+              ret)
+            p1)
+          ret)))))
+
+(defn- alts [& ps] (alt* ps nil nil))
+(defn- alt2 [p1 p2] (if (c/and p1 p2) (alts p1 p2) (c/or p1 p2)))
+
+;; Upstream alpha.clj 1447-1449 (`random-uuid`, as `rep*`).
+(defn ^:skip-wiki alt-impl
+  "Do not call this directly, use 'alt'"
+  [ks ps forms] (assoc (alt* ps ks forms) :id (random-uuid)))
+
+;; Upstream alpha.clj 1451-1453.
+(defn ^:skip-wiki maybe-impl
+  "Do not call this directly, use '?'"
+  [p form] (assoc (alt* [p (accept :clojure.spec.alpha/nil)] nil [form :clojure.spec.alpha/nil]) :maybe form))
+
+;; Upstream alpha.clj 1455-1459.
+(defn- noret? [p1 pret]
+  (c/or (= pret :clojure.spec.alpha/nil)
+        (c/and (#{:clojure.spec.alpha/rep :clojure.spec.alpha/pcat} (:clojure.spec.alpha/op (reg-resolve! p1))) ;;hrm, shouldn't know these
+               (empty? pret))
+        nil))
+
+(declare preturn)
+
+;; Upstream alpha.clj 1463-1473. The `(next forms)` shift in the
+;; `amp` branch is a verbatim upstream quirk (`preturn` below and
+;; `op-explain` use the unshifted `forms`); it only affects the
+;; `dt` "not a fn" message path.
+(defn- accept-nil? [p]
+  (let [{:keys [:clojure.spec.alpha/op ps p1 p2 forms] :as p} (reg-resolve! p)]
+    (case op
+          :clojure.spec.alpha/accept true
+          nil nil
+          :clojure.spec.alpha/amp (c/and (accept-nil? p1)
+                       (let [ret (-> (preturn p1) (and-preds ps (next forms)))]
+                         (not (invalid? ret))))
+          :clojure.spec.alpha/rep (c/or (identical? p1 p2) (accept-nil? p1))
+          :clojure.spec.alpha/pcat (every? accept-nil? ps)
+          :clojure.spec.alpha/alt (c/some accept-nil? ps))))
+
+(declare add-ret)
+
+;; Upstream alpha.clj 1477-1490.
+(defn- preturn [p]
+  (let [{[p0 & pr :as ps] :ps, [k :as ks] :ks, :keys [:clojure.spec.alpha/op p1 ret forms] :as p} (reg-resolve! p)]
+    (case op
+          :clojure.spec.alpha/accept ret
+          nil nil
+          :clojure.spec.alpha/amp (let [pret (preturn p1)]
+                  (if (noret? p1 pret)
+                    :clojure.spec.alpha/nil
+                    (and-preds pret ps forms)))
+          :clojure.spec.alpha/rep (add-ret p1 ret k)
+          :clojure.spec.alpha/pcat (add-ret p0 ret k)
+          :clojure.spec.alpha/alt (let [[[p0] [k0]] (filter-alt ps ks forms accept-nil?)
+                      r (if (nil? p0) :clojure.spec.alpha/nil (preturn p0))]
+                  (if k0 (tagged-ret k0 r) r)))))
+
+;; Upstream alpha.clj 1492-1511.
+(defn- op-unform [p x]
+  ;;(prn {:p p :x x})
+  (let [{[p0 & pr :as ps] :ps, [k :as ks] :ks, :keys [:clojure.spec.alpha/op p1 ret forms rep+ maybe] :as p} (reg-resolve! p)
+        kps (zipmap ks ps)]
+    (case op
+          :clojure.spec.alpha/accept [ret]
+          nil [(unform p x)]
+          :clojure.spec.alpha/amp (let [px (reduce #(unform %2 %1) x (reverse ps))]
+                  (op-unform p1 px))
+          :clojure.spec.alpha/rep (mapcat #(op-unform p1 %) x)
+          :clojure.spec.alpha/pcat (if rep+
+                   (mapcat #(op-unform p0 %) x)
+                   (mapcat (fn [k]
+                             (when (contains? x k)
+                               (op-unform (kps k) (get x k))))
+                           ks))
+          :clojure.spec.alpha/alt (if maybe
+                  [(unform p0 x)]
+                  (let [[k v] x]
+                    (op-unform (kps k) v))))))
+
+;; Upstream alpha.clj 1513-1524.
+(defn- add-ret [p r k]
+  (let [{:keys [:clojure.spec.alpha/op ps splice] :as p} (reg-resolve! p)
+        prop #(let [ret (preturn p)]
+                (if (empty? ret) r ((if splice into conj) r (if k {k ret} ret))))]
+    (case op
+          nil r
+          (:clojure.spec.alpha/alt :clojure.spec.alpha/accept :clojure.spec.alpha/amp)
+          (let [ret (preturn p)]
+            ;;(prn {:ret ret})
+            (if (= ret :clojure.spec.alpha/nil) r (conj r (if k {k ret} ret))))
+
+          (:clojure.spec.alpha/rep :clojure.spec.alpha/pcat) (prop))))
+
+;; Upstream alpha.clj 1526-1544 (`(next forms)` in the `amp`
+;; branch, as in `accept-nil?`).
+(defn- deriv
+  [p x]
+  (let [{[p0 & pr :as ps] :ps, [k0 & kr :as ks] :ks, :keys [:clojure.spec.alpha/op p1 p2 ret splice forms amp] :as p} (reg-resolve! p)]
+    (when p
+      (case op
+            :clojure.spec.alpha/accept nil
+            nil (let [ret (dt p x p)]
+                  (when-not (invalid? ret) (accept ret)))
+            :clojure.spec.alpha/amp (when-let [p1 (deriv p1 x)]
+                    (if (= :clojure.spec.alpha/accept (:clojure.spec.alpha/op p1))
+                      (let [ret (-> (preturn p1) (and-preds ps (next forms)))]
+                        (when-not (invalid? ret)
+                          (accept ret)))
+                      (amp-impl p1 amp ps forms)))
+            :clojure.spec.alpha/pcat (alt2 (pcat* {:ps (cons (deriv p0 x) pr), :ks ks, :forms forms, :ret ret})
+                         (when (accept-nil? p0) (deriv (pcat* {:ps pr, :ks kr, :forms (next forms), :ret (add-ret p0 ret k0)}) x)))
+            :clojure.spec.alpha/alt (alt* (map #(deriv % x) ps) ks forms)
+            :clojure.spec.alpha/rep (alt2 (rep* (deriv p1 x) p2 ret splice forms)
+                        (when (accept-nil? p1) (deriv (rep* p2 p2 (add-ret p1 ret nil) splice forms) x)))))))
+
+;; Upstream alpha.clj 1546-1560 (syntax-quoted op heads are
+;; literal fully-qualified symbols, as the macros).
+(defn- op-describe [p]
+  (let [{:keys [:clojure.spec.alpha/op ps ks forms splice p1 rep+ maybe amp] :as p} (reg-resolve! p)]
+    ;;(prn {:op op :ks ks :forms forms :p p})
+    (when p
+      (case op
+            :clojure.spec.alpha/accept nil
+            nil p
+            :clojure.spec.alpha/amp (list* 'clojure.spec.alpha/& amp forms)
+            :clojure.spec.alpha/pcat (if rep+
+                     (list 'clojure.spec.alpha/+ rep+)
+                     (cons 'clojure.spec.alpha/cat (mapcat vector (c/or (seq ks) (repeat :_)) forms)))
+            :clojure.spec.alpha/alt (if maybe
+                    (list 'clojure.spec.alpha/? maybe)
+                    (cons 'clojure.spec.alpha/alt (mapcat vector ks forms)))
+            :clojure.spec.alpha/rep (list (if splice 'clojure.spec.alpha/+ 'clojure.spec.alpha/*) forms)))))
+
+;; Upstream alpha.clj 1562-1615.
+(defn- op-explain [form p path via in input]
+  ;;(prn {:form form :p p :path path :input input})
+  (let [[x :as input] input
+        {:keys [:clojure.spec.alpha/op ps ks forms splice p1 p2] :as p} (reg-resolve! p)
+        via (if-let [name (spec-name p)] (conj via name) via)
+        insufficient (fn [path form]
+                       [{:path path
+                         :reason "Insufficient input"
+                         :pred form
+                         :val ()
+                         :via via
+                         :in in}])]
+    (when p
+      (case op
+            :clojure.spec.alpha/accept nil
+            nil (if (empty? input)
+                  (insufficient path form)
+                  (explain-1 form p path via in x))
+            :clojure.spec.alpha/amp (if (empty? input)
+                    (if (accept-nil? p1)
+                      (explain-pred-list forms ps path via in (preturn p1))
+                      (insufficient path (:amp p)))
+                    (if-let [p1 (deriv p1 x)]
+                      (explain-pred-list forms ps path via in (preturn p1))
+                      (op-explain (:amp p) p1 path via in input)))
+            :clojure.spec.alpha/pcat (let [pkfs (map vector
+                                   ps
+                                   (c/or (seq ks) (repeat nil))
+                                   (c/or (seq forms) (repeat nil)))
+                         [pred k form] (if (= 1 (count pkfs))
+                                         (first pkfs)
+                                         (first (remove (fn [[p]] (accept-nil? p)) pkfs)))
+                         path (if k (conj path k) path)
+                         form (c/or form (op-describe pred))]
+                     (if (c/and (empty? input) (not pred))
+                       (insufficient path form)
+                       (op-explain form pred path via in input)))
+            :clojure.spec.alpha/alt (if (empty? input)
+                    (insufficient path (op-describe p))
+                    (apply concat
+                           (map (fn [k form pred]
+                                  (op-explain (c/or form (op-describe pred))
+                                              pred
+                                              (if k (conj path k) path)
+                                              via
+                                              in
+                                              input))
+                                (c/or (seq ks) (repeat nil))
+                                (c/or (seq forms) (repeat nil))
+                                ps)))
+            :clojure.spec.alpha/rep (op-explain (if (identical? p1 p2)
+                                forms
+                                (op-describe p1))
+                              p1 path via in input)))))
+
+;; Upstream alpha.clj 1617-1655. STUB: slice F replaces this body
+;; with the real generator; until then both gen paths fail
+;; honestly (see `RegexSpec`).
+(defn- re-gen [p overrides path rmap f]
+  (throw (ex-info "generators slice pending" {})))
+
+;; Upstream alpha.clj 1658-1669.
+(defn- re-conform [p [x & xs :as data]]
+  ;;(prn {:p p :x x :xs xs})
+  (if (empty? data)
+    (if (accept-nil? p)
+      (let [ret (preturn p)]
+        (if (= ret :clojure.spec.alpha/nil)
+          nil
+          ret))
+      :clojure.spec.alpha/invalid)
+    (if-let [dp (deriv p x)]
+      (recur dp xs)
+      :clojure.spec.alpha/invalid)))
+
+;; Upstream alpha.clj 1671-1695.
+(defn- re-explain [path via in re input]
+  (loop [p re [x & xs :as data] input i 0]
+    ;;(prn {:p p :x x :xs xs :re re}) (prn)
+    (if (empty? data)
+      (if (accept-nil? p)
+        nil ;;success
+        (op-explain (op-describe p) p path via in nil))
+      (if-let [dp (deriv p x)]
+        (recur dp xs (inc i))
+        (if (accept? p)
+          (if (= (:clojure.spec.alpha/op p) :clojure.spec.alpha/pcat)
+            (op-explain (op-describe p) p path via (conj in i) (seq data))
+            [{:path path
+              :reason "Extra input"
+              :pred (op-describe re)
+              :val data
+              :via via
+              :in (conj in i)}])
+          (c/or (op-explain (op-describe p) p path via (conj in i) (seq data))
+                [{:path path
+                  :reason "Extra input"
+                  :pred (op-describe p)
+                  :val data
+                  :via via
+                  :in (conj in i)}]))))))
+
+;; The deterministic value of upstream's `(res `#(c/or (nil? %)
+;; (sequential? %)))` (regex-spec-impl explain*, alpha.clj 1717):
+;; syntax-quote qualifies, `unfn` restores `(fn [%] ...)`, `res`
+;; re-resolves the symbols via core refers. Abbreviates to
+;; `(or (nil? %) (sequential? %))`.
+(def ^:private regex-guard-form
+  '(clojure.core/fn [%] (clojure.core/or (clojure.core/nil? %) (clojure.core/sequential? %))))
+
+;; Upstream alpha.clj 1697-1723, narrowed to `[re]` (slice-1 rule 8:
+;; `gfn` dropped; `gen*`/`with-gen*` surface the `re-gen` stub
+;; until slice F). Builds a RegexSpec record (slice-1 rule 2).
+(defn ^:skip-wiki regex-spec-impl
+  "Do not call this directly, use 'spec' with a regex op argument"
+  [re]
+  (->RegexSpec re))
+
+;; Upstream alpha.clj 1794-1812 (built with `list`, as `def`;
+;; `let`/`fn`/core fns stay bare for use-site resolution while
+;; spec/gen heads fully qualify). `::kvs->map` itself needs
+;; `conformer` (slice D), so only the macro lands here: runtime
+;; use waits for slices A + D + F.
+(defmacro keys*
+  "takes the same arguments as spec/keys and returns a regex op that matches sequences of key/values,
+  converts them into a map, and conforms that map with a corresponding
+  spec/keys call:
+
+  user=> (s/conform (s/keys :req-un [::a ::c]) {:a 1 :c 2})
+  {:a 1, :c 2}
+  user=> (s/conform (s/keys* :req-un [::a ::c]) [:a 1 :c 2])
+  {:a 1, :c 2}
+
+  the resulting regex op can be composed into a larger regex:
+
+  user=> (s/conform (s/cat :i1 integer? :m (s/keys* :req-un [::a ::c]) :i2 integer?) [42 :a 1 :c 2 :d 4 99])
+  {:i1 42, :m {:a 1, :c 2, :d 4}, :i2 99}"
+  [& kspecs]
+  (let [mspec (gensym "mspec")
+        m (gensym "m")]
+    (list 'let [mspec (apply list 'clojure.spec.alpha/keys kspecs)]
+          (list 'clojure.spec.alpha/with-gen
+                (list 'clojure.spec.alpha/&
+                      (list 'clojure.spec.alpha/*
+                            (list 'clojure.spec.alpha/cat :clojure.spec.alpha/k 'keyword? :clojure.spec.alpha/v 'any?))
+                      :clojure.spec.alpha/kvs->map
+                      mspec)
+                (list 'fn []
+                      (list 'clojure.spec.gen.alpha/fmap
+                            (list 'fn [m] (list 'apply 'concat m))
+                            (list 'clojure.spec.gen.alpha/gen mspec)))))))
 
