@@ -45,6 +45,10 @@ map): `any` `any-printable` `boolean` `bytes` `char` `char-alpha`
 `char-alphanumeric` `char-ascii` `double` `double*` `int` `keyword` `keyword-ns`
 `large-integer` `large-integer*` `ratio` `simple-type` `simple-type-printable`
 `string` `string-ascii` `string-alphanumeric` `symbol` `symbol-ns` `uuid`.
+Each prim is a variadic fn returning the (once-built) generator value, exactly
+like the upstream `lazy-prim` expansion (`(let [g …] (defn s [& _] g))`), so
+callers write `(boolean)`, `(string-alphanumeric)`, etc. — and `gen-for-name`
+on a prim name fails with "not a generator", as upstream.
 
 Deferred (documented, not silent): `hash-map`, `vector-distinct` (F-remainder);
 `delay`/`delay-impl` (`gen/alpha.clj:55-66`, needed by F2 recursive-spec `gen*`);
@@ -125,7 +129,12 @@ follow the `spec_alpha.clj` file header)
 - `gen-for-name` ports `dynaload`+`gen-for-name` (`gen/alpha.clj:17-26,68-74`)
   with `require`+`resolve`+`deref` (all probe-verified, including requiring
   the already-loaded self ns); `RuntimeException.` construction becomes
-  `ex-info` with identical messages (the `spec_alpha.clj` precedent).
+  `ex-info` with identical messages (the `spec_alpha.clj` precedent). One
+  deliberate micro-divergence: the `require` is guarded by `find-ns`, because
+  the port's `require` (unlike the JVM's, where `clojure.core` sits in
+  `loaded-libs`) throws for boot namespaces — without the guard the oracle
+  "not a generator" mode would be unreachable for `clojure.core/*` vars.
+  Side effect (superset, pinned by test): `user`-ns vars also resolve.
 - `float?` builtin maps to `(double)` exactly as upstream (`gen/alpha.clj:143`,
   upstream quirk preserved).
 - `size-bounded-bigint` is replaced by `large-integer` inside
@@ -140,7 +149,12 @@ follow the `spec_alpha.clj` file header)
   (`(quot % 2)` in `container-type` is exact).
 - `coll-distinct-by` ports without the ordered/duplicate arms (only `set`/`map`
   use it in F1; `the-shuffle-fn` and the `allows-dupes?`/`ordered?` params move
-  with `vector-distinct` to F-remainder).
+  with `vector-distinct` to F-remainder). Its option defaults use a merged
+  default map (like `such-that`) instead of upstream's arglist `:or`: the port
+  miscompiles calls to `:or`-defaulted fn bindings (pre-existing bug —
+  `(let [{:keys [e] :or {e (fn [m] …)}} …] (e x))` passes the callee as its own
+  first arg), so upstream's `:or` shape is avoided for fns. Untouched by F1
+  beyond the workaround; the port bug itself is out of slice scope.
 - `sample`/`sample-seq` keep the size-cycling shape (`(cycle (range 0 200))`,
   `generators.cljc:143-180`); `sample` keeps its assert, `generate` keeps its
   3 arities (default size 30) and no assert, as upstream.
@@ -201,11 +215,11 @@ follow the `spec_alpha.clj` file header)
 - Given `gen-for-pred`, every builtin pred (all 45 oracle entries except
   `uri?`) resolves to a generator whose draws satisfy the pred; set preds
   become `elements`; `uri?` resolves to nil (documented, divergence 3).
-- Given `gen-for-name`, qualified names of `gen` vars resolve to working
-  generators; unqualified / non-generator / missing-var / missing-ns inputs
-  fail with the oracle failure modes.
-- Given `boolean`…`uuid` used via `gen-for-name`, generated values match the
-  direct prims (same seed ⇒ same value).
+- Given `gen-for-name`, qualified names of generator-valued vars resolve to
+  working generators (same seed ⇒ same value as the direct var); unqualified /
+  non-generator / missing-var / missing-ns inputs fail with the oracle failure
+  modes — including prim names, which are fns (as upstream) and fail with
+  "not a generator".
 
 ## TDD (implementation order)
 
