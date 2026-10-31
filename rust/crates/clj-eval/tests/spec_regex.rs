@@ -701,26 +701,31 @@ fn spec_macro_wraps_regex() {
     );
 }
 
-// ---- generators stub (scenario 41) ----
+// ---- generators wired (scenario 41) ----
 
 #[test]
-fn gen_paths_throw_pending() {
-    // Scenario 41 (oracle re-gen 1617-1655, stubbed for slice F).
+fn gen_paths_wired() {
+    // Scenario 41 (oracle re-gen 1617-1655): slice F2 wires the real
+    // generator (this test asserted the slice-E stub before F2).
     let mut eval = boot();
     require_spec(&mut eval);
+    eval.eval_source("(require '[clojure.spec.gen.alpha :as gen])")
+        .unwrap();
     assert_eq!(
-        uncaught(
+        run(
             &mut eval,
-            "(clojure.spec.alpha/gen* (s/spec (s/cat :e even?)) nil [] {})"
+            "(s/valid? (s/cat :e int?)
+                (gen/generate (clojure.spec.alpha/gen* (s/spec (s/cat :e int?)) nil [] {}) 30 1))"
         ),
-        "clojure.lang.ExceptionInfo | generators slice pending"
+        "true"
     );
     assert_eq!(
-        uncaught(
+        run(
             &mut eval,
-            "(clojure.spec.alpha/with-gen* (s/spec (s/cat :e even?)) (fn [] :g))"
+            "(def gspec (clojure.spec.alpha/with-gen* (s/spec (s/cat :e int?)) (fn [] (gen/return [7]))))
+             (gen/generate (clojure.spec.alpha/gen* gspec nil [] {}) 30 1)"
         ),
-        "clojure.lang.ExceptionInfo | generators slice pending"
+        "[7]"
     );
 }
 
@@ -834,7 +839,7 @@ fn keys_star_expands() {
         run(
             &mut eval,
             &format!(
-                "(let [e {exp} g (nth (nth e 2) 2) fmc (nth g 2)] (= (first (nth fmc 2)) 'clojure.spec.gen.alpha/gen))"
+                "(let [e {exp} g (nth (nth e 2) 2) fmc (nth g 2)] (= (first (nth fmc 2)) 'clojure.spec.alpha/gen))"
             )
         ),
         "true"

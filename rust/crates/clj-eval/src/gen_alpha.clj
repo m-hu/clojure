@@ -28,9 +28,16 @@
 ;;   distributions are approximate; `uri?` has no builtin (no host
 ;;   URI constructor); `inst?` covers 1970-2100 only. All pinned by
 ;;   `rust/crates/clj-eval/tests/gen_alpha.rs`.
+;;
+;; gap-122 slice F2 adds the three F1-deferred fns the spec `gen*`
+;; wiring needs (`delay`/`delay-impl`, `hash-map`,
+;; `vector-distinct` + `the-shuffle-fn`), restoring
+;; `coll-distinct-by` to the upstream arg shape and the ns
+;; `:exclude` to upstream's list (see docs/gap-122/slice-F2.md,
+;; pinned by `rust/crates/clj-eval/tests/gen_wiring.rs`).
 (ns clojure.spec.gen.alpha
-  (:refer-clojure :exclude [boolean bytes cat list map not-empty set vector
-                            char double int keyword symbol string uuid shuffle]))
+  (:refer-clojure :exclude [boolean bytes cat hash-map list map not-empty set vector
+                            char double int keyword symbol string uuid delay shuffle]))
 
 (alias 'c 'clojure.core)
 
@@ -218,6 +225,24 @@
   ([generator size seed]
    (call-gen generator (make-rng seed) size)))
 
+;; Upstream `gen/alpha.clj:52-66`. The macro is list-built (no
+;; syntax-quote, per the file header); the `clojure.core/delay` head
+;; is load-bearing — a bare `delay` would expand to this very macro.
+;; `call-gen` on the derefed generator is the root-value equivalent
+;; of upstream's `((:gen @gfnd) rnd size)`.
+(defn ^:skip-wiki delay-impl
+  [gfnd]
+  (make-gen (fn [rnd size]
+              (call-gen @gfnd rnd size))))
+
+(defmacro delay
+  "given body that returns a generator, returns a
+  generator that delegates to that, but delays
+  creation until used."
+  [& body]
+  (c/list 'clojure.spec.gen.alpha/delay-impl
+          (c/apply c/list 'clojure.core/delay body)))
+
 (defn choose
   "Creates a generator that generates integers uniformly in the range
   `lower` to `upper`, inclusive."
@@ -378,12 +403,31 @@
     (fmap #(reduce swap coll %)
           (vector (tuple index-gen index-gen) 0 (* 2 (count coll))))))
 
-;; Upstream `generators.cljc` coll-distinct-by, minus the ordered /
-;; allows-dupes arms (only `set`/`map` use it in F1; `the-shuffle-fn`
-;; moves with `vector-distinct` to F-remainder) and minus the
-;; shrink-tree filters (generation already yields exact counts).
+;; Upstream `generators.cljc:777-790`, verbatim (`split` /
+;; `rand-range` / `swap` are the F1 ports). A plain utility fn, not a
+;; generator: shuffles the drawn elements once, inside the gen fn.
+(defn- the-shuffle-fn
+  [rng coll]
+  (let [v (vec coll)
+        card (count coll)
+        dec-card (dec card)]
+    (first
+     (reduce (fn [[v rng] idx]
+               (let [[rng1 rng2] (split rng)
+                     swap-idx (rand-range rng1 idx dec-card)]
+                 [(swap v [idx swap-idx]) rng2]))
+             [v rng]
+             (range card)))))
+
+;; Upstream `generators.cljc:792-839` with the upstream
+;; `[empty-coll key-fn allows-dupes? ordered? gen opts]` shape (F2
+;; restores the `ordered?` arm: `set`/`map` pass `false`, only
+;; `vector-distinct` passes `true`). `allows-dupes?` stays
+;; shrink-only (accepted, still unused — shrinking is slice I), and
+;; the shrink-tree filters are dropped (generation already yields
+;; exact counts).
 (defn- coll-distinct-by*
-  [empty-coll key-fn gen rng size num-elements min-elements max-tries ex-fn]
+  [empty-coll key-fn shuffle-fn gen rng size num-elements min-elements max-tries ex-fn]
   (loop [elts []
          s #{}
          rng rng
@@ -397,7 +441,7 @@
 
           (or (= max-tries tries)
               (= (count elts) num-elements))
-          (into empty-coll elts)
+          (into empty-coll (shuffle-fn rng elts))
 
           :else
           (let [[rng1 rng2] (split rng)
@@ -422,15 +466,18 @@
    :ex-fn (fn [m] (ex-info "Couldn't generate enough distinct elements!" m))})
 
 (defn- coll-distinct-by
-  [empty-coll key-fn gen opts]
+  [empty-coll key-fn allows-dupes? ordered? gen opts]
   (let [{:keys [num-elements min-elements max-elements max-tries ex-fn]}
         (merge default-distinct-opts opts)
+        shuffle-fn (if ordered?
+                     the-shuffle-fn
+                     (fn [_rng coll] coll))
         hard-min-elements (or num-elements min-elements 1)]
     (if num-elements
       (do (assert (and (nil? min-elements) (nil? max-elements)))
           (make-gen
            (fn [rng gen-size]
-             (coll-distinct-by* empty-coll key-fn gen rng gen-size
+             (coll-distinct-by* empty-coll key-fn shuffle-fn gen rng gen-size
                                 num-elements hard-min-elements max-tries ex-fn))))
       (let [min-elements (or min-elements 0)]
         (gen-bind
@@ -440,7 +487,7 @@
          (fn [num-elements]
            (make-gen
             (fn [rng gen-size]
-              (coll-distinct-by* empty-coll key-fn gen rng gen-size
+              (coll-distinct-by* empty-coll key-fn shuffle-fn gen rng gen-size
                                  num-elements hard-min-elements max-tries ex-fn)))))))))
 
 (defn set
@@ -450,7 +497,7 @@
   ([gen] (set gen {}))
   ([gen opts]
    (assert (generator? gen) "First arg to set must be a generator!")
-   (coll-distinct-by #{} identity gen opts)))
+   (coll-distinct-by #{} identity false false gen opts)))
 
 (defn map
   "Creates a generator that generates maps, with keys chosen from
@@ -459,7 +506,34 @@
   :max-tries :ex-fn."
   ([key-gen val-gen] (map key-gen val-gen {}))
   ([key-gen val-gen opts]
-   (coll-distinct-by {} first (tuple key-gen val-gen) opts)))
+   (coll-distinct-by {} first false false (tuple key-gen val-gen) opts)))
+
+;; Upstream `generators.cljc:841-855`, verbatim (list-distinct and
+;; the -by variants stay out: `gen/alpha.clj` does not re-export
+;; them and spec never calls them).
+(defn vector-distinct
+  "Generates a vector of elements from the given generator, with the
+  guarantee that the elements will be distinct.
+
+  If the generator cannot or is unlikely to produce enough distinct
+  elements, this generator will fail in the same way as `such-that`.
+
+  Available options:
+
+    :num-elements  the fixed size of generated vectors
+    :min-elements  the min size of generated vectors
+    :max-elements  the max size of generated vectors
+    :max-tries     the number of times the generator will be tried before
+                   failing when it does not produce distinct elements
+                   (default 10)
+    :ex-fn         a function of one arg that will be called if test.check cannot
+                   generate enough distinct values; it will be passed a map with
+                   `:gen`, `:num-elements`, and `:max-tries` and should return an
+                   exception"
+  ([gen] (vector-distinct gen {}))
+  ([gen opts]
+   (assert (generator? gen) "First arg to vector-distinct must be a generator!")
+   (coll-distinct-by [] identity true true gen opts)))
 
 (defn cat
   "Returns a generator of a sequence catenated from results of
@@ -467,6 +541,20 @@
   [& gens]
   (fmap #(apply concat %)
         (apply tuple gens)))
+
+;; Upstream `generators.cljc:691-713`, verbatim (both asserts kept).
+(defn hash-map
+  "Like clojure.core/hash-map, except the values are generators.
+   Returns a generator that makes maps with the supplied keys and
+   values generated using the supplied generators."
+  [& kvs]
+  (assert (even? (count kvs)))
+  (let [ks (take-nth 2 kvs)
+        vs (take-nth 2 (rest kvs))]
+    (assert (every? generator? vs)
+            "Value args to hash-map must be generators")
+    (fmap #(zipmap ks %)
+          (apply tuple vs))))
 
 ;; Large integers: upstream `generators.cljc` long->large-integer /
 ;; large-integer** / large-integer*, near-verbatim (`Long/MIN_VALUE`
@@ -944,7 +1032,8 @@
 ;; documented divergence 3).
 (def ^:private
   gen-builtins
-  (delay
+  ;; `c/delay` qualified: bare `delay` is this ns's generator macro.
+  (c/delay
    (let [simple (simple-type-printable)]
      {any? (one-of [(return nil) (any-printable)])
       some? (such-that some? (any-printable))

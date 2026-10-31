@@ -11,14 +11,15 @@
 ;; spec registry, `def`, predicate specs, `s/and`, `valid?`,
 ;; `conform`/`unform`, basic `explain`/`explain-str`, and (slice E)
 ;; regex specs: `s/cat`, `s/alt`, `s/*`, `s/+`, `s/?`, `s/&` over
-;; the derivative engine, plus the `s/keys*` macro (expansion only;
-;; runtime use waits for slices A + D + F).
+;; the derivative engine, plus the `s/keys*` macro (slice F2
+;; unblocks runtime use: `::kvs->map` + the fixed `gen` head).
 ;;
 ;; gap-122 slice A adds map specs (`s/keys`/`map-spec-impl` and
 ;; `s/merge`/`merge-spec-impl`; upstream 414-474, 503-509,
 ;; 822-908, 1195-1221), narrowed like slice 1 (no `:gen`, no
-;; conformers): `MapSpec`/`MergeSpec` records, `pvalid?`, and the
-;; list-built `keys`/`merge` macros (see docs/gap-122/slice-A.md).
+;; conformers; slice F2 restores `:gen`): `MapSpec`/`MergeSpec`
+;; records, `pvalid?`, and the list-built `keys`/`merge` macros
+;; (see docs/gap-122/slice-A.md).
 ;;
 ;; Port adaptations (see docs/gap-122/slice-1.md,
 ;; docs/gap-122/slice-A.md and docs/gap-122/slice-E.md for the full lists):
@@ -41,20 +42,22 @@
 ;; - `->sym` reads the var's `:ns`/`:name` meta (no `(symbol var)`).
 ;; - `ns-qualify` uses `ns-name` (no `.name` interop, no `str` of
 ;;   namespaces).
-;; - `gen*`/`with-gen*` are declared on the protocol but left
-;;   unextended on PredSpec/AndSpec (generators are a later slice);
-;;   on RegexSpec both surface the `re-gen` stub (`ex-info`
-;;   "generators slice pending"), which slice F replaces.
+;; - `gen*`/`with-gen*` are wired on every record (slice F2);
+;;   every record carries the upstream `gfn` (Or/Multi/Map also
+;;   the `id`), and `-impl` ctors keep short arities delegating
+;;   with nil `gfn`, as upstream.
 ;; - `tagged-ret` is `(first {tag ret})`: the port cannot build a
 ;;   `MapEntry` object, but the entry of a single-entry map is one.
-;; - `regex-spec-impl` narrows to `[re]` (`gfn` dropped, as the
-;;   other `-impl` ctors); the non-sequential `explain*` `:pred`
+;; - `regex-spec-impl` keeps the `[re]` arity (nil `gfn`) for
+;;   `maybe-spec`; the non-sequential `explain*` `:pred`
 ;;   is the literal `(clojure.core/fn [%] (clojure.core/or ...))`
 ;;   form (the deterministic value of upstream's `(res ...)` call).
 ;; - `keys*` keeps `let`/`fn`/core fns bare in its expansion
 ;;   (use-site refers; only the unqualified `let` is the special
-;;   form) while spec/gen heads fully qualify.
-;;   unextended (generators are a later slice).
+;;   form) while spec/gen heads fully qualify. Slice F2 fixes the
+;;   `gen` head to `clojure.spec.alpha/gen` (upstream's
+;;   syntax-quote resolves it there, not to the gen alias) and
+;;   registers `::kvs->map`, unblocking runtime use.
 ;;
 ;; gap-122 slice D2 adds `tuple`/`multi-spec`/`conformer`/
 ;; `nonconforming` (see docs/gap-122/slice-D2.md): `PredSpec`
@@ -76,6 +79,13 @@
 ;; (no `long`); the `every` opts map is built with an explicit
 ;; `apply hash-map`; `or` joins the `:refer-clojure :exclude`
 ;; list. (`tagged-ret` is slice E's `(first {tag ret})`, reused.)
+;;
+;; gap-122 slice F2 wires `gen*`/`with-gen*` on every record above
+;; (plus `s/gen`, `s/with-gen`, `s/exercise`, `s/exercise-fn` and
+;; the `:gen` kwargs of `s/spec`/`s/keys`/`s/every`; see
+;; docs/gap-122/slice-F2.md). Records carry the upstream `gfn`
+;; (Or/Multi/Map also the `id`); `-impl` ctors keep short arities
+;; delegating with nil `gfn`, as upstream.
 (ns clojure.spec.alpha
   "The spec library specifies the structure of data or functions and provides
   operations to validate, conform, explain, describe, and generate data based on
@@ -83,12 +93,12 @@
 
   Rationale: https://clojure.org/about/spec
   Guide: https://clojure.org/guides/spec"
-  (:refer-clojure :exclude [and def + * cat keys merge or]))
+  (:refer-clojure :exclude [and def + * cat keys merge or])
+  (:require [clojure.spec.gen.alpha :as gen]))
 
 (alias 'c 'clojure.core)
 
-;; Upstream alpha.clj 44-50. `gen*`/`with-gen*` are declared so later
-;; slices extend them; slice 1 leaves them unimplemented.
+;; Upstream alpha.clj 44-50.
 (defprotocol Spec
   (conform* [spec x])
   (unform* [spec y])
@@ -103,26 +113,27 @@
 ;; in metadata. AndSpec's `specs` field holds a delay (as upstream),
 ;; so forward references resolve at first conform, not at build.
 ;; Slice D2: PredSpec carries the upstream `cpred?`/`unc`
-;; conformer flags (nil for plain predicate specs).
-(defrecord PredSpec [form pred cpred? unc])
-(defrecord AndSpec [forms preds specs])
+;; conformer flags (nil for plain predicate specs). Slice F2: every
+;; record carries the upstream `gfn` (nil unless `with-gen`/`:gen`).
+(defrecord PredSpec [form pred cpred? unc gfn])
+(defrecord AndSpec [forms preds specs gfn])
 ;; Slice E (upstream alpha.clj 1697-1723): the Spec glide over a
 ;; regex op map. Upstream closes over `re` in a `reify`; the port
 ;; holds it in a record field (metadata-carrying, as above).
-(defrecord RegexSpec [re])
+(defrecord RegexSpec [re gfn])
 
 ;; MapSpec fields mirror the upstream `map-spec-impl` argm (plus the
 ;; precomputed `k->s` table standing in for the `keys->specnames`
 ;; closure); MergeSpec mirrors `merge-spec-impl`'s `[forms preds]`.
-(defrecord MapSpec [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt k->s])
-(defrecord MergeSpec [forms preds])
+(defrecord MapSpec [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt gfn id k->s])
+(defrecord MergeSpec [forms preds gfn])
 
 ;; Forward declarations: the `extend-type` blocks below call fns
 ;; defined later in this file (the port resolves globals at analyze
 ;; time), as do `specize` and `def-impl` (-> `spec-impl`),
 ;; `maybe-spec`/`spec-impl` (-> `regex-spec-impl`), and MapSpec methods
 ;; (-> `registry`/`conform`/`pvalid?`/`explain-1`).
-(declare spec-impl dt invalid? unform explain-pred-list regex-spec-impl re-conform op-unform re-explain re-gen op-describe regex-guard-form registry conform pvalid? explain-1)
+(declare spec-impl dt invalid? unform explain-pred-list regex-spec-impl re-conform op-unform re-explain re-gen op-describe regex-guard-form registry conform pvalid? explain-1 gensub inck recur-limit? and-spec-impl map-spec-impl merge-spec-impl or-spec-impl tuple-impl multi-spec-impl nilable-impl every-impl nonconforming k-gen or-k-gen and-k-gen empty-coll)
 
 (extend-type PredSpec
   Spec
@@ -140,6 +151,12 @@
   (explain* [this path via in x]
     (when (invalid? (dt (:pred this) x (:form this) (:cpred? this)))
       [{:path path :pred (:form this) :val x :via via :in in}]))
+  (gen* [this _ _ _]
+    (if (:gfn this)
+      ((:gfn this))
+      (gen/gen-for-pred (:pred this))))
+  (with-gen* [this gfn]
+    (spec-impl (:form this) (:pred this) gfn (:cpred? this) (:unc this)))
   (describe* [this] (:form this)))
 
 (extend-type AndSpec
@@ -157,6 +174,12 @@
     (reduce #(unform %2 %1) x (reverse (:preds this))))
   (explain* [this path via in x]
     (explain-pred-list (:forms this) (:preds this) path via in x))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (gensub (first (:preds this)) overrides path rmap (first (:forms this)))))
+  (with-gen* [this gfn]
+    (and-spec-impl (:forms this) (:preds this) gfn))
   (describe* [this]
     (apply list 'clojure.spec.alpha/and (:forms this))))
 
@@ -172,14 +195,15 @@
       (re-explain path via in (:re this) (seq x))
       [{:path path :pred regex-guard-form :val x :via via :in in}]))
   (gen* [this overrides path rmap]
-    (re-gen (:re this) overrides path rmap (op-describe (:re this))))
+    (if (:gfn this)
+      ((:gfn this))
+      (re-gen (:re this) overrides path rmap (op-describe (:re this)))))
   (with-gen* [this gfn]
-    (throw (ex-info "generators slice pending" {})))
+    (regex-spec-impl (:re this) gfn))
   (describe* [this] (op-describe (:re this))))
 
-;; Upstream alpha.clj 834-877/903-908 (`conform*`/`unform*`/
-;; `explain*`/`describe*`; `gen*`/`with-gen*` unextended, as in
-;; slice 1). `(k->s k)` is map-as-fn, as upstream's closure.
+;; Upstream alpha.clj 834-877/878-902/903-908. `(k->s k)` is
+;; map-as-fn, as upstream's closure.
 (extend-type MapSpec
   Spec
   (conform* [this m]
@@ -228,6 +252,37 @@
                         (explain-1 (c/or (k->s k) k) (c/or (k->s k) k)
                                    (conj path k) via (conj in k) v)))
                     (seq x))))))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (let [rmap (inck rmap (:id this))
+            rgen (fn [k s] [k (gensub s overrides (conj path k) rmap k)])
+            ogen (fn [k s]
+                   (when-not (recur-limit? rmap (:id this) path k)
+                     [k (gen/delay (gensub s overrides (conj path k) rmap k))]))
+            reqs (map rgen (:req-keys this) (:req-specs this))
+            opts (remove nil? (map ogen (:opt-keys this) (:opt-specs this)))]
+        (when (every? identity (concat (map second reqs) (map second opts)))
+          (gen/bind
+           (gen/tuple
+            (and-k-gen (:req this))
+            (or-k-gen (:opt this))
+            (and-k-gen (:req-un this))
+            (or-k-gen (:opt-un this)))
+           (fn [[req-ks opt-ks req-un-ks opt-un-ks]]
+             (let [qks (flatten (concat req-ks opt-ks))
+                   unqks (map (comp keyword name) (flatten (concat req-un-ks opt-un-ks)))]
+               (->> (into reqs opts)
+                    (filter #((set (concat qks unqks)) (first %)))
+                    (apply concat)
+                    (apply gen/hash-map)))))))))
+  (with-gen* [this gfn]
+    (map-spec-impl {:req-un (:req-un this) :opt-un (:opt-un this)
+                    :keys-pred (:keys-pred this) :pred-exprs (:pred-exprs this)
+                    :opt-keys (:opt-keys this) :req-specs (:req-specs this)
+                    :req (:req this) :req-keys (:req-keys this)
+                    :opt-specs (:opt-specs this) :pred-forms (:pred-forms this)
+                    :opt (:opt this) :gfn gfn}))
   (describe* [this]
     (cons 'clojure.spec.alpha/keys
           (cond-> []
@@ -236,8 +291,7 @@
             (:req-un this) (conj :req-un (:req-un this))
             (:opt-un this) (conj :opt-un (:opt-un this))))))
 
-;; Upstream alpha.clj 1204-1212/1221 (`conform*`/`unform*`/
-;; `explain*`/`describe*`; `gen*`/`with-gen*` unextended).
+;; Upstream alpha.clj 1204-1221.
 (extend-type MergeSpec
   Spec
   (conform* [this x]
@@ -251,6 +305,15 @@
     (apply concat
            (map #(explain-1 %1 %2 path via in x)
                 (:forms this) (:preds this))))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (gen/fmap
+       #(apply c/merge %)
+       (apply gen/tuple (map #(gensub %1 overrides path rmap %2)
+                             (:preds this) (:forms this))))))
+  (with-gen* [this gfn]
+    (merge-spec-impl (:forms this) (:preds this) gfn))
   (describe* [this]
     (apply list 'clojure.spec.alpha/merge (:forms this))))
 
@@ -561,15 +624,18 @@ if value does not match spec, else the (possibly destructured) value."
   [k]
   (get (registry) (if (keyword? k) k (->sym k))))
 
-;; Upstream alpha.clj 366-383, narrowed to `[form]`: the `:gen`
-;; kwarg belongs to the generators slice.
+;; Upstream alpha.clj 366-383 (the `(when form …)` guard stays
+;; dropped: pre-existing slice-1 narrowing, out of F2 scope).
 (defmacro spec
   "Takes a single predicate form, e.g. can be the name of a predicate,
   like even?, or a fn literal like #(< % 42).
 
+  Optionally takes :gen generator-fn, which must be a fn of no args that
+  returns a test.check generator.
+
   Returns a spec."
-  [form]
-  (list 'clojure.spec.alpha/spec-impl (list 'quote (res form)) form))
+  [form & {:keys [gen]}]
+  (list 'clojure.spec.alpha/spec-impl (list 'quote (res form)) form gen nil))
 
 ;; Upstream alpha.clj 493-501 (built with `list`, as `def`).
 (defmacro and
@@ -650,12 +716,9 @@ if value does not match spec, else the (possibly destructured) value."
   (let [pv (vec preds)]
     (list 'clojure.spec.alpha/amp-impl re (list 'quote (res re)) pv (list 'quote (mapv res pv)))))
 
-;; Upstream alpha.clj 414-474, narrowed: no `:gen` kwarg
-;; (generators are a later slice; one passed in is ignored).
-;; Built with `list` (no syntax-quote: see the file header),
-;; `walk/postwalk` is the local `spec-postwalk`, and the
-;; `c/assert` is bare `assert`. The docstring drops the `:gen`
-;; paragraph only.
+;; Upstream alpha.clj 414-474. Built with `list` (no
+;; syntax-quote: see the file header), `walk/postwalk` is the
+;; local `spec-postwalk`, and the `c/assert` is bare `assert`.
 (defmacro keys
   "Creates and returns a map validating spec. :req and :opt are both
   vectors of namespaced-qualified keywords. The validator will ensure
@@ -680,8 +743,11 @@ if value does not match spec, else the (possibly destructured) value."
 
   In addition, the values of *all* namespace-qualified keys will be validated
   (and possibly destructured) by any registered specs. Note: there is
-  no support for inline value specification, by design."
-  [& {:keys [req req-un opt opt-un]}]
+  no support for inline value specification, by design.
+
+  Optionally takes :gen generator-fn, which must be a fn of no args that
+  returns a test.check generator."
+  [& {:keys [req req-un opt opt-un gen]}]
   (let [unk (fn [k] (keyword (name k)))
         req-keys (filterv keyword? (flatten req))
         req-un-specs (filterv keyword? (flatten req-un))
@@ -721,10 +787,11 @@ if value does not match spec, else the (possibly destructured) value."
            :opt-specs (list 'quote opt-specs)
            :pred-forms (list 'quote pred-forms)
            :pred-exprs pred-exprs
-           :keys-pred keys-pred})))
+           :keys-pred keys-pred
+           :gfn gen})))
 
-;; Upstream alpha.clj 503-509, narrowed: no `gfn` (generators
-;; are a later slice). Built with `list`, as `and`.
+;; Upstream alpha.clj 503-509 (passes nil `gfn`, as upstream).
+;; Built with `list`, as `and`.
 (defmacro merge
   "Takes map-validating specs (e.g. 'keys' specs) and
   returns a spec that returns a conformed map satisfying all of the
@@ -779,6 +846,118 @@ if value does not match spec, else the (possibly destructured) value."
       (explain* pred path (if-let [name (spec-name pred)] (conj via name) via) in v)
       [{:path path :pred form :val v :via via :in in}])))
 
+;; ---- gap-122 slice F2: generation ----
+
+;; Upstream alpha.clj 26-30.
+(def ^:dynamic *recursion-limit*
+  "A soft limit on how many times a branching spec (or/alt/*/opt-keys/multi-spec)
+  can be recursed through during generation. After this a
+  non-recursive branch will be chosen."
+  4)
+
+;; Upstream alpha.clj 750-755 (`::recursion-limit` written out, per
+;; the file header).
+(defn- recur-limit? [rmap id path k]
+  (c/and (> (get rmap id) (:clojure.spec.alpha/recursion-limit rmap))
+         (contains? (set path) k)))
+
+(defn- inck [m k]
+  (assoc m k (inc (c/or (get m k) 0))))
+
+;; Upstream alpha.clj 210-216 (`::gfn` written out).
+(defn with-gen
+  "Takes a spec and a no-arg, generator-returning fn and returns a version of that spec that uses that generator"
+  [spec gen-fn]
+  (let [spec (reg-resolve spec)]
+    (if (regex? spec)
+      (assoc spec :clojure.spec.alpha/gfn gen-fn)
+      (with-gen* (specize spec) gen-fn))))
+
+;; Upstream alpha.clj 279-290 (throw via ex-info, as `reg-resolve!`).
+(defn- gensub
+  [spec overrides path rmap form]
+  (let [spec (specize spec)]
+    (if-let [g (c/or (when-let [gfn (c/or (get overrides (c/or (spec-name spec) spec))
+                                          (get overrides path))]
+                       (gfn))
+                     (gen* spec overrides path rmap))]
+      (gen/such-that #(valid? spec %) g 100)
+      (let [abbr (abbrev form)]
+        (throw (ex-info (str "Unable to construct gen at: " path " for: " abbr)
+                        {:clojure.spec.alpha/path path
+                         :clojure.spec.alpha/form form
+                         :clojure.spec.alpha/failure :no-gen}))))))
+
+;; Upstream alpha.clj 292-303.
+(defn gen
+  "Given a spec, returns the generator for it, or throws if none can
+  be constructed. Optionally an overrides map can be provided which
+  should map spec names or paths (vectors of keywords) to no-arg
+  generator-creating fns. These will be used instead of the generators at those
+  names/paths. Note that parent generator (in the spec or overrides
+  map) will supersede those of any subtrees. A generator for a regex
+  op must always return a sequential collection (i.e. a generator for
+  s/? should return either an empty sequence/vector or a
+  sequence/vector with one item in it)"
+  ([spec] (gen spec nil))
+  ([spec overrides] (gensub spec overrides [] {:clojure.spec.alpha/recursion-limit *recursion-limit*} spec)))
+
+;; Upstream alpha.clj 1866-1872.
+(defn exercise
+  "generates a number (default 10) of values compatible with spec and maps conform over them,
+  returning a sequence of [val conformed-val] tuples. Optionally takes
+  a generator overrides map as per gen"
+  ([spec] (exercise spec 10))
+  ([spec n] (exercise spec n nil))
+  ([spec n overrides]
+   (map #(vector % (conform spec %)) (gen/sample (gen spec overrides) n))))
+
+;; Upstream alpha.clj 1874-1888 (throw via ex-info, as
+;; `reg-resolve!`; full fspec use waits for slice G, but the fn
+;; ports verbatim and works over `{:args …}` maps).
+(defn exercise-fn
+  "exercises the fn named by sym (a symbol) by applying it to
+  n (default 10) generated samples of its args spec. When fspec is
+  supplied its arg spec is used, and sym-or-f can be a fn.  Returns a
+  sequence of tuples of [args ret]. "
+  ([sym] (exercise-fn sym 10))
+  ([sym n] (exercise-fn sym n (get-spec sym)))
+  ([sym-or-f n fspec]
+   (let [f (if (symbol? sym-or-f) (resolve sym-or-f) sym-or-f)]
+     (if-let [arg-spec (c/and fspec (:args fspec))]
+       (for [args (gen/sample (gen arg-spec) n)]
+         [args (apply f args)])
+       (throw (ex-info "No :args spec found, can't generate" {}))))))
+
+;; Map key generators (upstream alpha.clj 795-819; `or-k-gen`/
+;; `and-k-gen` are declared at the top, as upstream's line-793
+;; declare).
+(defn- k-gen
+  "returns a generator for form f, which can be a keyword or a list
+  starting with 'or or 'and."
+  [f]
+  (cond
+   (keyword? f) (gen/return f)
+   (= 'or (first f)) (or-k-gen 1 (rest f))
+   (= 'and (first f)) (and-k-gen (rest f))))
+
+(defn- or-k-gen
+  "returns a tuple generator made up of generators for a random subset
+  of min-count (default 0) to all elements in s."
+  ([s] (or-k-gen 0 s))
+  ([min-count s]
+   (gen/bind (gen/tuple
+              (gen/choose min-count (count s))
+              (gen/shuffle (map k-gen s)))
+             (fn [[n gens]]
+               (apply gen/tuple (take n gens))))))
+
+(defn- and-k-gen
+  "returns a tuple generator made up of generators for every element
+  in s."
+  [s]
+  (apply gen/tuple (map k-gen s)))
+
 ;; Upstream alpha.clj 1140-1150.
 (defn- explain-pred-list
   [forms preds path via in x]
@@ -791,30 +970,30 @@ if value does not match spec, else the (possibly destructured) value."
           (explain-1 form pred path via in ret)
           (recur nret forms preds))))))
 
-;; Upstream alpha.clj 913-944, narrowed (the `gfn` parameter is
-;; generator machinery, a later slice). Slice D2 adds the
-;; `cpred?`/`unc` conformer arities (upstream's `[form pred gfn
-;; cpred?]` / `[form pred gfn cpred? unc]` minus `gfn`). Builds a
-;; PredSpec record; a regex pred wraps via `regex-spec-impl`
-;; (slice E).
+;; Upstream alpha.clj 913-944. The conformer arities are
+;; upstream's `[form pred gfn cpred?]` / `[form pred gfn cpred?
+;; unc]`; slice 1's `[form pred]` convenience (nil `gfn`) stays for
+;; `specize`/`def-impl`. Builds a PredSpec record; a regex pred
+;; wraps via `regex-spec-impl` (slice E).
 (defn ^:skip-wiki spec-impl
   "Do not call this directly, use 'spec'"
-  ([form pred] (spec-impl form pred nil nil))
-  ([form pred cpred?] (spec-impl form pred cpred? nil))
-  ([form pred cpred? unc]
+  ([form pred] (spec-impl form pred nil nil nil))
+  ([form pred gfn cpred?] (spec-impl form pred gfn cpred? nil))
+  ([form pred gfn cpred? unc]
    (cond
-    (spec? pred) pred
-    (regex? pred) (regex-spec-impl pred)
-    (ident? pred) (the-spec pred)
-    :else (->PredSpec form pred cpred? unc))))
+    (spec? pred) (cond-> pred gfn (with-gen gfn))
+    (regex? pred) (regex-spec-impl pred gfn)
+    (ident? pred) (cond-> (the-spec pred) gfn (with-gen gfn))
+    :else (->PredSpec form pred cpred? unc gfn))))
 
-;; Upstream alpha.clj 1151-1193, narrowed to `[forms preds]` (same
-;; reason as `spec-impl`). Builds an AndSpec record; the per-count
-;; fast paths are one loop (behavior-identical).
+;; Upstream alpha.clj 1151-1193. Builds an AndSpec record; the
+;; per-count fast paths are one loop (behavior-identical). The
+;; `[forms preds]` arity (nil `gfn`) stays for the `and` macro.
 (defn ^:skip-wiki and-spec-impl
   "Do not call this directly, use 'and'"
-  [forms preds]
-  (->AndSpec forms preds (delay (mapv specize preds forms))))
+  ([forms preds] (and-spec-impl forms preds nil))
+  ([forms preds gfn]
+   (->AndSpec forms preds (delay (mapv specize preds forms)) gfn)))
 
 ;; Upstream alpha.clj 1058-1059. The port cannot construct a
 ;; `MapEntry` object, so this takes the first entry of a
@@ -1104,11 +1283,46 @@ if value does not match spec, else the (possibly destructured) value."
                                 (op-describe p1))
                               p1 path via in input)))))
 
-;; Upstream alpha.clj 1617-1655. STUB: slice F replaces this body
-;; with the real generator; until then both gen paths fail
-;; honestly (see `RegexSpec`).
+;; Upstream alpha.clj 1617-1655 (`::op`/`::gfn` written out, per
+;; the file header).
 (defn- re-gen [p overrides path rmap f]
-  (throw (ex-info "generators slice pending" {})))
+  (let [origp p
+        {:keys [:clojure.spec.alpha/op :ps :ks :p1 :p2 :forms :splice :ret :id :clojure.spec.alpha/gfn] :as p} (reg-resolve! p)
+        rmap (if id (inck rmap id) rmap)
+        ggens (fn [ps ks forms]
+                (let [gen (fn [p k f]
+                            (when-not (c/and rmap id k (recur-limit? rmap id path k))
+                              (if id
+                                (gen/delay (re-gen p overrides (if k (conj path k) path) rmap (c/or f p)))
+                                (re-gen p overrides (if k (conj path k) path) rmap (c/or f p)))))]
+                  (map gen ps (c/or (seq ks) (repeat nil)) (c/or (seq forms) (repeat nil)))))]
+    (c/or (when-let [gfn (c/or (get overrides (spec-name origp))
+                               (get overrides (spec-name p))
+                               (get overrides path))]
+            (case op
+              (:clojure.spec.alpha/accept nil) (gen/fmap vector (gfn))
+              (gfn)))
+          (when gfn
+            (gfn))
+          (when p
+            (case op
+              :clojure.spec.alpha/accept (if (= ret :clojure.spec.alpha/nil)
+                                           (gen/return [])
+                                           (gen/return [ret]))
+              nil (when-let [g (gensub p overrides path rmap f)]
+                    (gen/fmap vector g))
+              :clojure.spec.alpha/amp (re-gen p1 overrides path rmap (op-describe p1))
+              :clojure.spec.alpha/pcat (let [gens (ggens ps ks forms)]
+                                         (when (every? identity gens)
+                                           (apply gen/cat gens)))
+              :clojure.spec.alpha/alt (let [gens (remove nil? (ggens ps ks forms))]
+                                        (when-not (empty? gens)
+                                          (gen/one-of gens)))
+              :clojure.spec.alpha/rep (if (recur-limit? rmap id [id] id)
+                                        (gen/return [])
+                                        (when-let [g (re-gen p2 overrides path rmap forms)]
+                                          (gen/fmap #(apply concat %)
+                                                    (gen/vector g)))))))))
 
 ;; Upstream alpha.clj 1658-1669.
 (defn- re-conform [p [x & xs :as data]]
@@ -1159,19 +1373,22 @@ if value does not match spec, else the (possibly destructured) value."
 (def ^:private regex-guard-form
   '(clojure.core/fn [%] (clojure.core/or (clojure.core/nil? %) (clojure.core/sequential? %))))
 
-;; Upstream alpha.clj 1697-1723, narrowed to `[re]` (slice-1 rule 8:
-;; `gfn` dropped; `gen*`/`with-gen*` surface the `re-gen` stub
-;; until slice F). Builds a RegexSpec record (slice-1 rule 2).
+;; Upstream alpha.clj 1697-1723. Builds a RegexSpec record
+;; (slice-1 rule 2); the `[re]` arity (nil `gfn`) stays for
+;; `maybe-spec`. `gen*` without `gfn` reaches the `re-gen` stub
+;; until the F2 regex chunk lands it.
 (defn ^:skip-wiki regex-spec-impl
   "Do not call this directly, use 'spec' with a regex op argument"
-  [re]
-  (->RegexSpec re))
+  ([re] (regex-spec-impl re nil))
+  ([re gfn]
+   (->RegexSpec re gfn)))
 
 ;; Upstream alpha.clj 1794-1812 (built with `list`, as `def`;
 ;; `let`/`fn`/core fns stay bare for use-site resolution while
-;; spec/gen heads fully qualify). `::kvs->map` itself needs
-;; `conformer` (slice D), so only the macro lands here: runtime
-;; use waits for slices A + D + F.
+;; spec/gen heads fully qualify). Bare `gen` in the upstream
+;; expansion syntax-quotes to `clojure.spec.alpha/gen` (s/gen),
+;; not the gen alias. Slice F2 also registers `::kvs->map`
+;; (below the `conformer` macro) so runtime use works.
 (defmacro keys*
   "takes the same arguments as spec/keys and returns a regex op that matches sequences of key/values,
   converts them into a map, and conforms that map with a corresponding
@@ -1199,24 +1416,26 @@ if value does not match spec, else the (possibly destructured) value."
                 (list 'fn []
                       (list 'clojure.spec.gen.alpha/fmap
                             (list 'fn [m] (list 'apply 'concat m))
-                            (list 'clojure.spec.gen.alpha/gen mspec)))))))
+                            (list 'clojure.spec.alpha/gen mspec)))))))
 
-;; Upstream alpha.clj 822-908, narrowed to the argm minus `:gfn`
-;; (generators are a later slice). Builds a MapSpec record (see
-;; the file header); `k->s` is precomputed here, standing in for
-;; the `keys->specnames` closure.
+;; Upstream alpha.clj 822-908. Builds a MapSpec record (see the
+;; file header); `k->s` is precomputed here, standing in for the
+;; `keys->specnames` closure. The `id` is a `random-uuid` minted
+;; per construction (as upstream).
 (defn ^:skip-wiki map-spec-impl
   "Do not call this directly, use 'keys'"
-  [{:keys [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt]}]
+  [{:keys [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt gfn]}]
   (->MapSpec req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt
+             gfn (random-uuid)
              (zipmap (concat req-keys opt-keys) (concat req-specs opt-specs))))
 
-;; Upstream alpha.clj 1195-1221, narrowed to `[forms preds]`
-;; (same reason as `map-spec-impl`). Builds a MergeSpec record.
+;; Upstream alpha.clj 1195-1221. Builds a MergeSpec record. The
+;; `[forms preds]` arity (nil `gfn`) stays for the `merge` macro.
 (defn ^:skip-wiki merge-spec-impl
   "Do not call this directly, use 'merge'"
-  [forms preds]
-  (->MergeSpec forms preds))
+  ([forms preds] (merge-spec-impl forms preds nil))
+  ([forms preds gfn]
+   (->MergeSpec forms preds gfn)))
 
 ;; ---- gap-122 slice D2: tuple/multi-spec/conformer/nonconforming ----
 
@@ -1231,10 +1450,17 @@ if value does not match spec, else the (possibly destructured) value."
   second fn that does unform of result of first"
   ([f] (list 'clojure.spec.alpha/spec-impl
              (list 'quote (list 'conformer (res f)))
-             f true))
+             f nil true))
   ([f unf] (list 'clojure.spec.alpha/spec-impl
                  (list 'quote (list 'conformer (res f) (res unf)))
-                 f true unf)))
+                 f nil true unf)))
+
+;; Upstream alpha.clj 1793 (`::k`/`::v`/`::kvs->map` written out).
+;; Registered after the `conformer` macro so `keys*` runtime use
+;; works (slice F2 unblocks it).
+(clojure.spec.alpha/def :clojure.spec.alpha/kvs->map
+  (conformer #(zipmap (map :clojure.spec.alpha/k %) (map :clojure.spec.alpha/v %))
+             #(map (fn [[k v]] {:clojure.spec.alpha/k k :clojure.spec.alpha/v v}) %)))
 
 ;; Upstream alpha.clj 694-700, built with `list` (as `def`).
 ;; `assert` is bare (not `c/assert`), as in `def-impl`.
@@ -1285,14 +1511,14 @@ if value does not match spec, else the (possibly destructured) value."
         retag))
 
 ;; Slice-D2 spec object records (same record-for-reify shape as
-;; PredSpec/AndSpec; `gen*`/`with-gen*` stay unextended).
+;; PredSpec/AndSpec; slice F2 extends `gen*`/`with-gen*`).
 ;; TupleSpec's `specs` field holds a delay (as upstream), so
 ;; forward references resolve at first conform, not at build.
-(defrecord TupleSpec [forms preds specs])
+(defrecord TupleSpec [forms preds specs gfn])
 ;; MultiSpec's `mmvar` is derefed fresh on every operation (as
 ;; upstream), so late-installed methods apply; `retag` is
 ;; gen-only and rides along for `describe*`.
-(defrecord MultiSpec [form mmvar retag])
+(defrecord MultiSpec [form mmvar retag gfn id])
 ;; NonconformingSpec's `spec` field holds a delay (as upstream).
 (defrecord NonconformingSpec [spec])
 ;;;;;;;;;;;;;;;;;;;;;;; gap-122 slice B: combinators ;;;;;;;;;;;;;;;;;;;;;;;
@@ -1301,8 +1527,8 @@ if value does not match spec, else the (possibly destructured) value."
 ;; oracle as slice 1; `s/tuple` is slice D2's, reused by
 ;; `every-kv`). Everything below is slice-B code, appended
 ;; after the slice-D2 definitions so no forward `declare`s are
-;; needed. `gen*`/`with-gen*` stay unextended; every `-impl`
-;; constructor drops the `gfn` param.
+;; needed. (Slice F2 extends `gen*`/`with-gen*` throughout and
+;; restores the upstream `gfn`/`id` ctor params.)
 
 ;; Upstream alpha.clj 36-42.
 (def ^:dynamic *coll-check-limit*
@@ -1353,9 +1579,9 @@ if value does not match spec, else the (possibly destructured) value."
 ;; `::describe` data the `every` macro built) plus the lazily
 ;; specized element spec, the index-key fn, and the
 ;; collection-shape dispatch closure.
-(defrecord OrSpec [keys forms preds specs kps])
-(defrecord NilableSpec [form pred spec])
-(defrecord EverySpec [form pred opts spec kfn cfns])
+(defrecord OrSpec [keys forms preds specs kps gfn id])
+(defrecord NilableSpec [form pred spec gfn])
+(defrecord EverySpec [form pred opts spec kfn cfns gfn])
 
 (extend-type OrSpec
   Spec
@@ -1377,6 +1603,19 @@ if value does not match spec, else the (possibly destructured) value."
                     (when-not (pvalid? pred x)
                       (explain-1 form pred (conj path k) via in x)))
                   (:keys this) (:forms this) (:preds this)))))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (let [gen (fn [k p f]
+                  (let [rmap (inck rmap (:id this))]
+                    (when-not (recur-limit? rmap (:id this) path k)
+                      (gen/delay
+                       (gensub p overrides (conj path k) rmap f)))))
+            gs (remove nil? (map gen (:keys this) (:preds this) (:forms this)))]
+        (when-not (empty? gs)
+          (gen/one-of gs)))))
+  (with-gen* [this gfn]
+    (or-spec-impl (:keys this) (:forms this) (:preds this) gfn))
   (describe* [this]
     (apply list 'clojure.spec.alpha/or (mapcat vector (:keys this) (:forms this)))))
 
@@ -1388,6 +1627,14 @@ if value does not match spec, else the (possibly destructured) value."
     (when-not (c/or (pvalid? @(:spec this) x) (nil? x))
       (conj (explain-1 (:form this) (:pred this) (conj path :clojure.spec.alpha/pred) via in x)
             {:path (conj path :clojure.spec.alpha/nil) :pred 'nil? :val x :via via :in in})))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (gen/frequency
+       [[1 (gen/delay (gen/return nil))]
+        [9 (gen/delay (gensub (:pred this) overrides (conj path :clojure.spec.alpha/pred) rmap (:form this)))]])))
+  (with-gen* [this gfn]
+    (nilable-impl (:form this) (:pred this) gfn))
   (describe* [this] (list 'clojure.spec.alpha/nilable (res (:form this)))))
 
 (extend-type TupleSpec
@@ -1434,6 +1681,16 @@ if value does not match spec, else the (possibly destructured) value."
                      (when-not (pvalid? pred v)
                        (explain-1 form pred (conj path i) via (conj in i) v))))
                  (range (count (:preds this))) (:forms this) (:preds this)))))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (let [gen (fn [i p f]
+                  (gensub p overrides (conj path i) rmap f))
+            gs (map gen (range (count (:preds this))) (:preds this) (:forms this))]
+        (when (every? identity gs)
+          (apply gen/tuple gs)))))
+  (with-gen* [this gfn]
+    (tuple-impl (:forms this) (:preds this) gfn))
   (describe* [this]
     (apply list 'clojure.spec.alpha/tuple (:forms this))))
 
@@ -1500,6 +1757,45 @@ if value does not match spec, else the (possibly destructured) value."
                                    (when-not (valid? spec v)
                                      (explain-1 form pred path via (conj in k) v))))
                                (range) x)))))))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (let [opts (:opts this)
+            form (:form this)
+            pred (:pred this)
+            conform-into (:into opts)
+            kind (:kind opts)
+            kind-form (:clojure.spec.alpha/kind-form opts)
+            gen-max (c/or (:gen-max opts) 20)
+            gen-into (if conform-into (empty conform-into) (get empty-coll kind-form))
+            pgen (gensub pred overrides path rmap form)]
+        (gen/bind
+         (cond
+          gen-into (gen/return gen-into)
+          kind (gen/fmap #(if (empty? %) % (empty %))
+                         (gensub kind overrides path rmap form))
+          :else (gen/return []))
+         (fn [init]
+           (gen/fmap
+            #(if (vector? init) % (into init %))
+            (cond
+             (:distinct opts)
+             (if (:count opts)
+               (gen/vector-distinct pgen {:num-elements (:count opts) :max-tries 100})
+               (gen/vector-distinct pgen {:min-elements (c/or (:min-count opts) 0)
+                                          :max-elements (c/or (:max-count opts) (max gen-max (c/* 2 (c/or (:min-count opts) 0))))
+                                          :max-tries 100}))
+
+             (:count opts)
+             (gen/vector pgen (:count opts))
+
+             (c/or (:min-count opts) (:max-count opts))
+             (gen/vector pgen (c/or (:min-count opts) 0) (c/or (:max-count opts) (max gen-max (c/* 2 (c/or (:min-count opts) 0)))))
+
+             :else
+             (gen/vector pgen 0 gen-max))))))))
+  (with-gen* [this gfn]
+    (every-impl (:form this) (:pred this) (:opts this) gfn))
   (describe* [this]
     (let [opts (:opts this)]
       (c/or (:clojure.spec.alpha/describe opts)
@@ -1526,11 +1822,12 @@ if value does not match spec, else the (possibly destructured) value."
 
 ;; Upstream alpha.clj 520-566. The opts seq is parsed with an
 ;; explicit `apply hash-map` (see `res-kind-pairs`); `:gen` is
-;; accepted and dropped (generators are a later slice). The
-;; `::cpred` fn form is emitted with `list` (a `fn*` over a
-;; gensym, as upstream); the only evaluation-shape change is the
-;; `Integer/MAX_VALUE` default bound, which reads 2147483647 (the
-;; port has no `Integer/MAX_VALUE`).
+;; threaded to `every-impl` as `gfn` (and stays dissoced from the
+;; describe opts, as upstream). The `::cpred` fn form is emitted
+;; with `list` (a `fn*` over a gensym, as upstream); the only
+;; evaluation-shape change is the `Integer/MAX_VALUE` default
+;; bound, which reads 2147483647 (the port has no
+;; `Integer/MAX_VALUE`).
 (defmacro every
   "takes a pred and validates collection elements against that pred.
 
@@ -1596,7 +1893,7 @@ if value does not match spec, else the (possibly destructured) value."
                   (assoc :clojure.spec.alpha/kind-form (list 'quote kind-form)
                          :clojure.spec.alpha/describe desc-form
                          :clojure.spec.alpha/cpred (list 'fn* [gx] (apply list 'clojure.core/and cpreds))))]
-    (list 'clojure.spec.alpha/every-impl (list 'quote pred) pred nopts)))
+    (list 'clojure.spec.alpha/every-impl (list 'quote pred) pred nopts (:gen m))))
 
 ;; Upstream alpha.clj 568-577.
 (defmacro every-kv
@@ -1665,22 +1962,27 @@ if value does not match spec, else the (possibly destructured) value."
   (let [pf (res pred)]
     (list 'clojure.spec.alpha/nilable-impl (list 'quote pf) pred)))
 
-;; Upstream alpha.clj 1061-1066, narrowed to `[keys forms preds]`
-;; (no `id`/`gfn`: generator machinery). The 2-/3-branch fast
-;; paths are one loop (behavior-identical), as with `AndSpec`.
+;; Upstream alpha.clj 1061-1066. The 2-/3-branch fast paths are
+;; one loop (behavior-identical), as with `AndSpec`. The `id` is a
+;; `random-uuid` minted per construction (as upstream); the short
+;; arity (nil `gfn`) stays for the `or` macro.
 (defn ^:skip-wiki or-spec-impl
   "Do not call this directly, use 'or'"
-  [keys forms preds]
-  (->OrSpec keys forms preds (delay (mapv specize preds forms)) (zipmap keys preds)))
+  ([keys forms preds] (or-spec-impl keys forms preds nil))
+  ([keys forms preds gfn]
+   (->OrSpec keys forms preds (delay (mapv specize preds forms)) (zipmap keys preds) gfn (random-uuid))))
 
-;; Upstream alpha.clj 1834-1837, narrowed to `[form pred]`.
+;; Upstream alpha.clj 1834-1837. The `[form pred]` arity (nil `gfn`)
+;; stays for the `nilable` macro.
 (defn ^:skip-wiki nilable-impl
   "Do not call this directly, use 'nilable'"
-  [form pred]
-  (->NilableSpec form pred (delay (specize pred form))))
+  ([form pred] (nilable-impl form pred nil))
+  ([form pred gfn]
+   (->NilableSpec form pred (delay (specize pred form)) gfn)))
 
 
-;; Upstream alpha.clj 962-974, narrowed (no `id`/`tag`: gen-only).
+;; Upstream alpha.clj 962-974. These two helpers stay `id`/`tag`-free
+;; (those live in `MultiSpec` `gen*`, slice F2).
 ;; The method-exists check is `get-method`, exactly like upstream's
 ;; `.getMethod` (hierarchy-aware, nil on miss, throws on
 ;; ambiguity): no try/catch, so method-body throws propagate.
@@ -1712,6 +2014,28 @@ if value does not match spec, else the (possibly destructured) value."
       (if-let [pred (multi-predx (:mmvar this) x)]
         (explain-1 (:form this) pred path via in x)
         [{:path path :pred (:form this) :val x :reason "no method" :via via :in in}])))
+  (gen* [this overrides path rmap]
+    (if (:gfn this)
+      ((:gfn this))
+      (let [tag (if (keyword? (:retag this))
+                  #(assoc %1 (:retag this) %2)
+                  (:retag this))
+            gen (fn [[k f]]
+                  (let [p (f nil)]
+                    (let [rmap (inck rmap (:id this))]
+                      (when-not (recur-limit? rmap (:id this) path k)
+                        (gen/delay
+                         (gen/fmap
+                          #(tag % k)
+                          (gensub p overrides (conj path k) rmap (list 'method (:form this) k))))))))
+            gs (->> (methods @(:mmvar this))
+                    (remove (fn [[k]] (invalid? k)))
+                    (map gen)
+                    (remove nil?))]
+        (when (every? identity gs)
+          (gen/one-of gs)))))
+  (with-gen* [this gfn]
+    (multi-spec-impl (:form this) (:mmvar this) (:retag this) gfn))
   (describe* [this]
     (list 'clojure.spec.alpha/multi-spec (:form this) (:retag this))))
 
@@ -1725,45 +2049,58 @@ if value does not match spec, else the (possibly destructured) value."
   (unform* [this x] x)
   (explain* [this path via in x]
     (explain* @(:spec this) path via in x))
+  (gen* [this overrides path rmap] (gen* @(:spec this) overrides path rmap))
+  (with-gen* [this gfn] (nonconforming (with-gen* @(:spec this) gfn)))
   (describe* [this]
     (list 'clojure.spec.alpha/nonconforming (describe* @(:spec this)))))
 
-;; Upstream alpha.clj 996-1059, narrowed to `[forms preds]` (the
-;; `gfn` parameter is generator machinery). Builds a TupleSpec
-;; record.
+;; Upstream alpha.clj 996-1059. Builds a TupleSpec record. The
+;; `[forms preds]` arity (nil `gfn`) stays for the `tuple` macro.
 (defn ^:skip-wiki tuple-impl
   "Do not call this directly, use 'tuple'"
-  [forms preds]
-  (->TupleSpec forms preds (delay (mapv specize preds forms))))
+  ([forms preds] (tuple-impl forms preds nil))
+  ([forms preds gfn]
+   (->TupleSpec forms preds (delay (mapv specize preds forms)) gfn)))
 
-;; Upstream alpha.clj 946-994, narrowed to `[form mmvar retag]`
-;; (same reason as `tuple-impl`). Builds a MultiSpec record.
+;; Upstream alpha.clj 946-994. Builds a MultiSpec record. The
+;; `[form mmvar retag]` arity (nil `gfn`) stays for the
+;; `multi-spec` macro; the `id` is a `random-uuid` minted per
+;; construction (as upstream).
 (defn ^:skip-wiki multi-spec-impl
   "Do not call this directly, use 'multi-spec'"
-  [form mmvar retag]
-  (->MultiSpec form mmvar retag))
+  ([form mmvar retag] (multi-spec-impl form mmvar retag nil))
+  ([form mmvar retag gfn]
+   (->MultiSpec form mmvar retag gfn (random-uuid))))
 
-;; Upstream alpha.clj 1813-1832, narrowed (no `gen*`/`with-gen*`).
-;; Builds a NonconformingSpec record.
+;; Upstream alpha.clj 1813-1832. Builds a NonconformingSpec record.
 (defn ^:skip-wiki nonconforming
   "takes a spec and returns a spec that has the same properties except
   'conform' returns the original (not the conformed) value. Note, will specize regex ops."
   [spec]
   (->NonconformingSpec (delay (specize spec))))
 
-;; Upstream alpha.clj 1245-1282, narrowed to `[form pred opts]`
-;; (no `gfn`; `gen-into`/`gen-max` are generator machinery). The
-;; `count` opt shadows `clojure.core/count` in this body, so every
-;; boolean connective here is `c/and`/`c/or` (as upstream, which
-;; needs the same for its shadowed `and`/`or`).
+;; Upstream alpha.clj 1243. Keys are the evaluated value of
+;; upstream's syntax-quoted kind symbols (`res` of a `:kind` form
+;; answers the same). Used by `EverySpec` `gen*` only.
+(def ^:private empty-coll
+  {'clojure.core/vector? [] 'clojure.core/set? #{} 'clojure.core/list? () 'clojure.core/map? {}})
+
+;; Upstream alpha.clj 1245-1282. (`gen-into`/`gen-max` live in the
+;; `gen*` body, computed from the stored opts, instead of closing
+;; over the ctor locals as upstream.) The `count` opt shadows
+;; `clojure.core/count` in this body, so every boolean connective
+;; here is `c/and`/`c/or` (as upstream, which needs the same for
+;; its shadowed `and`/`or`).
 (defn ^:skip-wiki every-impl
   "Do not call this directly, use 'every', 'every-kv', 'coll-of' or 'map-of'"
-  [form pred {conform-into :into
+  ([form pred opts] (every-impl form pred opts nil))
+  ([form pred {conform-into :into
               describe-form :clojure.spec.alpha/describe
               :keys [kind :clojure.spec.alpha/kind-form count max-count min-count distinct gen-max :clojure.spec.alpha/kfn :clojure.spec.alpha/cpred
                      conform-keys :clojure.spec.alpha/conform-all]
               :or {gen-max 20}
-              :as opts}]
+              :as opts}
+    gfn]
   (let [spec (delay (specize pred))
         kfn (c/or kfn (fn [i v] i))
         addcv (fn [ret i v cv] (conj ret cv))
@@ -1790,5 +2127,5 @@ if value does not match spec, else the (possibly destructured) value."
                 [(constantly ()) addcv reverse]
 
                 :else [(fn [coll] (empty (c/or conform-into coll))) addcv identity]))]
-    (->EverySpec form pred opts spec kfn cfns)))
+    (->EverySpec form pred opts spec kfn cfns gfn))))
 
