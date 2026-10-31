@@ -46,6 +46,7 @@ pub const MULTI_NATIVES: &[(&str, NativeFnPtr)] = &[
     ("__prefer_method*", native_prefer),
     ("get-method", native_get_method),
     ("methods", native_methods),
+    ("__dispatch_fn*", native_dispatch_fn),
 ];
 
 /// The JVM multifn class (cast target for non-multifn values).
@@ -302,6 +303,16 @@ fn native_methods(_eval: &mut Evaluator, args: &[Value]) -> Result<Value, Native
     check_arity("clojure.core/methods", args, &[1])?;
     let mf = multifn_arg(&args[0])?;
     Ok(Value::Map(mf.methods.clone()))
+}
+
+/// The dispatch fn behind a multifn value (gap-122 slice D2):
+/// `multi-spec` applies `(.dispatchFn mm)` on every path upstream,
+/// and the port exposes no accessor — anything else is the
+/// `ClassCastException` (`e-prefer-nonmulti`).
+fn native_dispatch_fn(_eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeError> {
+    check_arity("clojure.core/__dispatch_fn*", args, &[1])?;
+    let mf = multifn_arg(&args[0])?;
+    Ok(mf.dispatch.clone())
 }
 
 /// Invoke a multifn value (split for budget): the dispatch fn runs

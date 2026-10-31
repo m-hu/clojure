@@ -20,6 +20,8 @@
 ;; - Spec objects are `defrecord`s (PredSpec/AndSpec) with the Spec
 ;;   protocol extended to them: the port's `reify` instances do not
 ;;   support metadata, while the JVM's do (`with-name` needs it).
+;;   Slice D2's TupleSpec/MultiSpec/NonconformingSpec records follow
+;;   the same shape.
 ;; - `specize` is a plain `cond` (not the Specize protocol): the
 ;;   port has no `Object`-default protocol dispatch, and set dispatch
 ;;   would miss sorted sets (exact-class keys). Behavior matches.
@@ -32,6 +34,17 @@
 ;;   namespaces).
 ;; - `gen*`/`with-gen*` are declared on the protocol but left
 ;;   unextended (generators are a later slice).
+;;
+;; gap-122 slice D2 adds `tuple`/`multi-spec`/`conformer`/
+;; `nonconforming` (see docs/gap-122/slice-D2.md): `PredSpec`
+;; carries the upstream `cpred?`/`unc` conformer flags,
+;; `spec-impl`/`dt` grow the upstream conformer arities
+;; (minus the `:gen` parameter), and the new `TupleSpec`/
+;; `MultiSpec`/`NonconformingSpec` records mirror the upstream
+;; `tuple-impl`/`multi-spec-impl`/`nonconforming` reifies.
+;; Multi-spec dispatch-value/method lookup is
+;; `clojure.core/get-method` plus the `__dispatch_fn*` glue
+;; native (the port has no `.dispatchFn`/`.getMethod` interop).
 (ns clojure.spec.alpha
   "The spec library specifies the structure of data or functions and provides
   operations to validate, conform, explain, describe, and generate data based on
@@ -58,7 +71,9 @@
 ;; records do, and `with-name`/`spec-name` store the registered name
 ;; in metadata. AndSpec's `specs` field holds a delay (as upstream),
 ;; so forward references resolve at first conform, not at build.
-(defrecord PredSpec [form pred])
+;; Slice D2: PredSpec carries the upstream `cpred?`/`unc`
+;; conformer flags (nil for plain predicate specs).
+(defrecord PredSpec [form pred cpred? unc])
 (defrecord AndSpec [forms preds specs])
 
 ;; Forward declarations: the `extend-type` blocks below call fns
@@ -70,10 +85,17 @@
   Spec
   (conform* [this x]
     (let [ret ((:pred this) x)]
-      (if ret x :clojure.spec.alpha/invalid)))
-  (unform* [this x] x)
+      (if (:cpred? this)
+        ret
+        (if ret x :clojure.spec.alpha/invalid))))
+  (unform* [this x]
+    (if (:cpred? this)
+      (if-let [unc (:unc this)]
+        (unc x)
+        (throw (ex-info "no unform fn for conformer" {})))
+      x))
   (explain* [this path via in x]
-    (when (invalid? (dt (:pred this) x (:form this)))
+    (when (invalid? (dt (:pred this) x (:form this) (:cpred? this)))
       [{:path path :pred (:form this) :val x :via via :in in}]))
   (describe* [this] (:form this)))
 
@@ -427,17 +449,21 @@ if value does not match spec, else the (possibly destructured) value."
         (list 'quote (mapv res pred-forms))
         (vec pred-forms)))
 
-;; Upstream alpha.clj 757-768, narrowed: `cpred?` is conformer
-;; machinery (a later slice). Throw via ex-info, as `reg-resolve!`.
+;; Upstream alpha.clj 757-768 (slice D2 adds the `cpred?` arity:
+;; conformer preds return their result as-is, only `::invalid`
+;; fails). Throw via ex-info, as `reg-resolve!`.
 (defn- dt
-  [pred x form]
-  (if pred
-    (if-let [spec (the-spec pred)]
-      (conform spec x)
-      (if (ifn? pred)
-        (if (pred x) x :clojure.spec.alpha/invalid)
-        (throw (ex-info (str (pr-str form) " is not a fn, expected predicate fn") {}))))
-    x))
+  ([pred x form] (dt pred x form nil))
+  ([pred x form cpred?]
+   (if pred
+     (if-let [spec (the-spec pred)]
+       (conform spec x)
+       (if (ifn? pred)
+         (if cpred?
+           (pred x)
+           (if (pred x) x :clojure.spec.alpha/invalid))
+         (throw (ex-info (str (pr-str form) " is not a fn, expected predicate fn") {}))))
+     x)))
 
 ;; Upstream alpha.clj 770-777.
 (defn valid?
@@ -448,6 +474,17 @@ if value does not match spec, else the (possibly destructured) value."
   ([spec x form]
    (let [spec (specize spec form)]
      (not (invalid? (conform* spec x))))))
+
+;; Upstream alpha.clj 779-784. Slice D2: shared with slice A
+;; (`keys`/`merge`) — see docs/gap-122/slice-D2.md for the overlap
+;; note. `::unknown` is written out (no auto-resolve, per the file
+;; header).
+(defn- pvalid?
+  "internal helper function that returns true when x is valid for spec."
+  ([pred x]
+   (not (invalid? (dt pred x :clojure.spec.alpha/unknown))))
+  ([pred x form]
+   (not (invalid? (dt pred x form)))))
 
 ;; Upstream alpha.clj 786-793.
 (defn- explain-1 [form pred path via in v]
@@ -468,18 +505,22 @@ if value does not match spec, else the (possibly destructured) value."
           (explain-1 form pred path via in ret)
           (recur nret forms preds))))))
 
-;; Upstream alpha.clj 913-944, narrowed to `[form pred]` (`gfn` and
-;; `cpred?`/`unc` are generator/conformer machinery). Builds a
+;; Upstream alpha.clj 913-944, narrowed (the `gfn` parameter is
+;; generator machinery, a later slice). Slice D2 adds the
+;; `cpred?`/`unc` conformer arities (upstream's `[form pred gfn
+;; cpred?]` / `[form pred gfn cpred? unc]` minus `gfn`). Builds a
 ;; PredSpec record; a regex pred fails loudly (no `regex-spec-impl`
 ;; yet).
 (defn ^:skip-wiki spec-impl
   "Do not call this directly, use 'spec'"
-  [form pred]
-  (cond
-   (spec? pred) pred
-   (regex? pred) (throw (ex-info "regex specs are out of scope in gap-122 slice 1" {}))
-   (ident? pred) (the-spec pred)
-   :else (->PredSpec form pred)))
+  ([form pred] (spec-impl form pred nil nil))
+  ([form pred cpred?] (spec-impl form pred cpred? nil))
+  ([form pred cpred? unc]
+   (cond
+    (spec? pred) pred
+    (regex? pred) (throw (ex-info "regex specs are out of scope in gap-122 slice 1" {}))
+    (ident? pred) (the-spec pred)
+    :else (->PredSpec form pred cpred? unc))))
 
 ;; Upstream alpha.clj 1151-1193, narrowed to `[forms preds]` (same
 ;; reason as `spec-impl`). Builds an AndSpec record; the per-count
@@ -488,4 +529,200 @@ if value does not match spec, else the (possibly destructured) value."
   "Do not call this directly, use 'and'"
   [forms preds]
   (->AndSpec forms preds (delay (mapv specize preds forms))))
+
+;; ---- gap-122 slice D2: tuple/multi-spec/conformer/nonconforming ----
+
+;; Upstream alpha.clj 666-672, built with `list` (no syntax-quote:
+;; see the file header). The expansion's `true` is `cpred?`; the
+;; one-arg shape has no `unc`, so unforming it throws (upstream
+;; alpha.clj 935).
+(defmacro conformer
+  "takes a predicate function with the semantics of conform i.e. it should return either a
+  (possibly converted) value or :clojure.spec.alpha/invalid, and returns a
+  spec that uses it as a predicate/conformer. Optionally takes a
+  second fn that does unform of result of first"
+  ([f] (list 'clojure.spec.alpha/spec-impl
+             (list 'quote (list 'clojure.spec.alpha/conformer (res f)))
+             f true))
+  ([f unf] (list 'clojure.spec.alpha/spec-impl
+                 (list 'quote (list 'clojure.spec.alpha/conformer (res f) (res unf)))
+                 f true unf)))
+
+;; Upstream alpha.clj 694-700, built with `list` (as `def`).
+;; `assert` is bare (not `c/assert`), as in `def-impl`.
+(defmacro tuple
+  "takes one or more preds and returns a spec for a tuple, a vector
+  where each element conforms to the corresponding pred. Each element
+  will be referred to in paths using its ordinal."
+  [& preds]
+  (assert (not (empty? preds)))
+  (list 'clojure.spec.alpha/tuple-impl
+        (list 'quote (mapv res preds))
+        (vec preds)))
+
+;; Upstream alpha.clj 385-412, built with `list` (as `def`).
+;; `retag` is evaluated (a keyword or fn value, carried into
+;; `describe`; only `gen*` consumes it, and generators are a later
+;; slice).
+(defmacro multi-spec
+  "Takes the name of a spec/predicate-returning multimethod and a
+  tag-restoring keyword or fn (retag).  Returns a spec that when
+  conforming or explaining data will pass it to the multimethod to get
+  an appropriate spec. You can e.g. use multi-spec to dynamically and
+  extensibly associate specs with 'tagged' data (i.e. data where one
+  of the fields indicates the shape of the rest of the structure).
+
+  (defmulti mspec :tag)
+
+  The methods should ignore their argument and return a predicate/spec:
+  (defmethod mspec :int [_] (s/keys :req-un [::tag ::i]))
+
+  retag is used during generation to retag generated values with
+  matching tags. retag can either be a keyword, at which key the
+  dispatch-tag will be assoc'ed, or a fn of generated value and
+  dispatch-tag that should return an appropriately retagged value.
+
+  Note that because the tags themselves comprise an open set,
+  the tag key spec cannot enumerate the values, but can e.g.
+  test for keyword?.
+
+  Note also that the dispatch values of the multimethod will be
+  included in the path, i.e. in reporting and gen overrides, even
+  though those values are not evident in the spec.
+"
+  [mm retag]
+  (list 'clojure.spec.alpha/multi-spec-impl
+        (list 'quote (res mm))
+        (list 'var mm)
+        retag))
+
+;; Slice-D2 spec object records (same record-for-reify shape as
+;; PredSpec/AndSpec; `gen*`/`with-gen*` stay unextended).
+;; TupleSpec's `specs` field holds a delay (as upstream), so
+;; forward references resolve at first conform, not at build.
+(defrecord TupleSpec [forms preds specs])
+;; MultiSpec's `mmvar` is derefed fresh on every operation (as
+;; upstream), so late-installed methods apply; `retag` is
+;; gen-only and rides along for `describe*`.
+(defrecord MultiSpec [form mmvar retag])
+;; NonconformingSpec's `spec` field holds a delay (as upstream).
+(defrecord NonconformingSpec [spec])
+
+(extend-type TupleSpec
+  Spec
+  (conform* [this x]
+    (let [specs @(:specs this)
+          cnt (count (:preds this))]
+      (if-not (c/and (vector? x)
+                     (= (count x) cnt))
+        :clojure.spec.alpha/invalid
+        (loop [ret x i 0]
+          (if (= i cnt)
+            ret
+            (let [v (x i)
+                  cv (conform* (specs i) v)]
+              (if (invalid? cv)
+                :clojure.spec.alpha/invalid
+                (recur (if (identical? cv v) ret (assoc ret i cv))
+                       (inc i)))))))))
+  (unform* [this x]
+    (assert (c/and (vector? x)
+                   (= (count x) (count (:preds this)))))
+    (loop [ret x i 0]
+      (if (= i (count x))
+        ret
+        (let [cv (x i)
+              v (unform ((:preds this) i) cv)]
+          (recur (if (identical? cv v) ret (assoc ret i v))
+                 (inc i))))))
+  (explain* [this path via in x]
+    (cond
+     (not (vector? x))
+     [{:path path :pred 'clojure.core/vector? :val x :via via :in in}]
+
+     (not= (count x) (count (:preds this)))
+     [{:path path
+       :pred (list 'clojure.core/= (list 'clojure.core/count '%) (count (:preds this)))
+       :val x :via via :in in}]
+
+     :else
+     (apply concat
+            (map (fn [i form pred]
+                   (let [v (x i)]
+                     (when-not (pvalid? pred v)
+                       (explain-1 form pred (conj path i) via (conj in i) v))))
+                 (range (count (:preds this))) (:forms this) (:preds this)))))
+  (describe* [this]
+    (apply list 'clojure.spec.alpha/tuple (:forms this))))
+
+;; Upstream alpha.clj 962-974, narrowed (no `id`/`tag`: gen-only).
+;; The method-exists check is `get-method`, exactly like upstream's
+;; `.getMethod` (hierarchy-aware, nil on miss, throws on
+;; ambiguity): no try/catch, so method-body throws propagate.
+;; The dispatch fn comes from the `__dispatch_fn*` glue native
+;; (no `.dispatchFn` interop in the port).
+(defn- multi-dval [mmvar x]
+  ((clojure.core/__dispatch_fn* @mmvar) x))
+
+(defn- multi-predx [mmvar x]
+  (let [mm @mmvar
+        dv ((clojure.core/__dispatch_fn* mm) x)]
+    (c/and (get-method mm dv) (mm x))))
+
+(extend-type MultiSpec
+  Spec
+  (conform* [this x]
+    (if-let [pred (multi-predx (:mmvar this) x)]
+      (dt pred x (:form this))
+      :clojure.spec.alpha/invalid))
+  (unform* [this x]
+    (if-let [pred (multi-predx (:mmvar this) x)]
+      (unform pred x)
+      (throw (ex-info (str "No method of: " (:form this)
+                           " for dispatch value: " (multi-dval (:mmvar this) x))
+                      {}))))
+  (explain* [this path via in x]
+    (let [dv (multi-dval (:mmvar this) x)
+          path (conj path dv)]
+      (if-let [pred (multi-predx (:mmvar this) x)]
+        (explain-1 (:form this) pred path via in x)
+        [{:path path :pred (:form this) :val x :reason "no method" :via via :in in}])))
+  (describe* [this]
+    (list 'clojure.spec.alpha/multi-spec (:form this) (:retag this))))
+
+(extend-type NonconformingSpec
+  Spec
+  (conform* [this x]
+    (let [ret (conform* @(:spec this) x)]
+      (if (invalid? ret)
+        :clojure.spec.alpha/invalid
+        x)))
+  (unform* [this x] x)
+  (explain* [this path via in x]
+    (explain* @(:spec this) path via in x))
+  (describe* [this]
+    (list 'clojure.spec.alpha/nonconforming (describe* @(:spec this)))))
+
+;; Upstream alpha.clj 996-1059, narrowed to `[forms preds]` (the
+;; `gfn` parameter is generator machinery). Builds a TupleSpec
+;; record.
+(defn ^:skip-wiki tuple-impl
+  "Do not call this directly, use 'tuple'"
+  [forms preds]
+  (->TupleSpec forms preds (delay (mapv specize preds forms))))
+
+;; Upstream alpha.clj 946-994, narrowed to `[form mmvar retag]`
+;; (same reason as `tuple-impl`). Builds a MultiSpec record.
+(defn ^:skip-wiki multi-spec-impl
+  "Do not call this directly, use 'multi-spec'"
+  [form mmvar retag]
+  (->MultiSpec form mmvar retag))
+
+;; Upstream alpha.clj 1813-1832, narrowed (no `gen*`/`with-gen*`).
+;; Builds a NonconformingSpec record.
+(defn ^:skip-wiki nonconforming
+  "takes a spec and returns a spec that has the same properties except
+  'conform' returns the original (not the conformed) value. Note, will specize regex ops."
+  [spec]
+  (->NonconformingSpec (delay (specize spec))))
 

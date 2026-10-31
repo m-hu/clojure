@@ -226,8 +226,11 @@ multimethods defined in the test setup.
     `(defmethod late-mm :a [_] integer?)`
     When `(s/valid? :user/lm ...)` — dispatching `:a` — Then the
     new method applies (no stale miss).
-22. describe
-    `(s/describe :user/ms)` => `(multi-spec user/mspec :tag)`.
+22. form/describe
+    `(s/form :user/ms)` =>
+    `(clojure.spec.alpha/multi-spec user/mspec :tag)`;
+    `(s/describe :user/ms)` => `(multi-spec mspec :tag)` (oracle
+    `abbrev` strips the namespace).
 
 ### conformer (+ unform)
 
