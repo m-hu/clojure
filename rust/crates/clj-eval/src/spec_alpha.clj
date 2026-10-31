@@ -11,6 +11,12 @@
 ;; spec registry, `def`, predicate specs, `s/and`, `valid?`,
 ;; `conform`/`unform`, and basic `explain`/`explain-str`.
 ;;
+;; gap-122 slice A adds map specs (`s/keys`/`map-spec-impl` and
+;; `s/merge`/`merge-spec-impl`; upstream 414-474, 503-509,
+;; 822-908, 1195-1221), narrowed like slice 1 (no `:gen`, no
+;; conformers): `MapSpec`/`MergeSpec` records, `pvalid?`, and the
+;; list-built `keys`/`merge` macros (see docs/gap-122/slice-A.md).
+;;
 ;; Port adaptations (see docs/gap-122/slice-1.md for the full list):
 ;; - No syntax-quote and no `::auto-resolve` anywhere in this file:
 ;;   the port reads a whole load batch before evaluating it, so both
@@ -39,7 +45,7 @@
 
   Rationale: https://clojure.org/about/spec
   Guide: https://clojure.org/guides/spec"
-  (:refer-clojure :exclude [and def]))
+  (:refer-clojure :exclude [and def keys merge]))
 
 (alias 'c 'clojure.core)
 
@@ -60,11 +66,16 @@
 ;; so forward references resolve at first conform, not at build.
 (defrecord PredSpec [form pred])
 (defrecord AndSpec [forms preds specs])
+;; MapSpec fields mirror the upstream `map-spec-impl` argm (plus the
+;; precomputed `k->s` table standing in for the `keys->specnames`
+;; closure); MergeSpec mirrors `merge-spec-impl`'s `[forms preds]`.
+(defrecord MapSpec [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt k->s])
+(defrecord MergeSpec [forms preds])
 
 ;; Forward declarations: the `extend-type` blocks below call fns
 ;; defined later in this file (the port resolves globals at analyze
 ;; time), as do `specize` and `def-impl` (-> `spec-impl`).
-(declare spec-impl dt invalid? unform explain-pred-list)
+(declare spec-impl dt invalid? unform explain-pred-list registry conform pvalid? explain-1)
 
 (extend-type PredSpec
   Spec
@@ -94,6 +105,83 @@
     (explain-pred-list (:forms this) (:preds this) path via in x))
   (describe* [this]
     (apply list 'clojure.spec.alpha/and (:forms this))))
+
+;; Upstream alpha.clj 834-877/903-908 (`conform*`/`unform*`/
+;; `explain*`/`describe*`; `gen*`/`with-gen*` unextended, as in
+;; slice 1). `(k->s k)` is map-as-fn, as upstream's closure.
+(extend-type MapSpec
+  Spec
+  (conform* [this m]
+    (if ((:keys-pred this) m)
+      (let [reg (registry)
+            k->s (:k->s this)]
+        (loop [ret m, [[k v] & ks :as keys] m]
+          (if keys
+            (let [sname (c/or (k->s k) k)]
+              (if-let [s (get reg sname)]
+                (let [cv (conform s v)]
+                  (if (invalid? cv)
+                    :clojure.spec.alpha/invalid
+                    (recur (if (identical? cv v) ret (assoc ret k cv))
+                           ks)))
+                (recur ret ks)))
+            ret)))
+      :clojure.spec.alpha/invalid))
+  (unform* [this m]
+    (let [reg (registry)
+          k->s (:k->s this)]
+      (loop [ret m, [k & ks :as keys] (c/keys m)]
+        (if keys
+          (if (contains? reg (c/or (k->s k) k))
+            (let [cv (get m k)
+                  v (unform (c/or (k->s k) k) cv)]
+              (recur (if (identical? cv v) ret (assoc ret k v))
+                     ks))
+            (recur ret ks))
+          ret))))
+  (explain* [this path via in x]
+    (if-not (map? x)
+      [{:path path :pred 'clojure.core/map? :val x :via via :in in}]
+      (let [reg (registry)
+            k->s (:k->s this)]
+        (apply concat
+               (when-let [probs (->> (map (fn [pred form] (when-not (pred x) form))
+                                          (:pred-exprs this) (:pred-forms this))
+                                     (keep identity)
+                                     seq)]
+                 (map #(identity {:path path :pred % :val x :via via :in in})
+                      probs))
+               (map (fn [[k v]]
+                      (when-not (c/or (not (contains? reg (c/or (k->s k) k)))
+                                      (pvalid? (c/or (k->s k) k) v k))
+                        (explain-1 (c/or (k->s k) k) (c/or (k->s k) k)
+                                   (conj path k) via (conj in k) v)))
+                    (seq x))))))
+  (describe* [this]
+    (cons 'clojure.spec.alpha/keys
+          (cond-> []
+            (:req this) (conj :req (:req this))
+            (:opt this) (conj :opt (:opt this))
+            (:req-un this) (conj :req-un (:req-un this))
+            (:opt-un this) (conj :opt-un (:opt-un this))))))
+
+;; Upstream alpha.clj 1204-1212/1221 (`conform*`/`unform*`/
+;; `explain*`/`describe*`; `gen*`/`with-gen*` unextended).
+(extend-type MergeSpec
+  Spec
+  (conform* [this x]
+    (let [ms (map #(dt %1 x %2) (:preds this) (:forms this))]
+      (if (some invalid? ms)
+        :clojure.spec.alpha/invalid
+        (apply c/merge ms))))
+  (unform* [this x]
+    (apply c/merge (map #(unform % x) (reverse (:preds this)))))
+  (explain* [this path via in x]
+    (apply concat
+           (map #(explain-1 %1 %2 path via in x)
+                (:forms this) (:preds this))))
+  (describe* [this]
+    (apply list 'clojure.spec.alpha/merge (:forms this))))
 
 ;; Upstream alpha.clj 52.
 (defonce ^:private registry-ref (atom {}))
@@ -427,6 +515,91 @@ if value does not match spec, else the (possibly destructured) value."
         (list 'quote (mapv res pred-forms))
         (vec pred-forms)))
 
+;; Upstream alpha.clj 414-474, narrowed: no `:gen` kwarg
+;; (generators are a later slice; one passed in is ignored).
+;; Built with `list` (no syntax-quote: see the file header),
+;; `walk/postwalk` is the local `spec-postwalk`, and the
+;; `c/assert` is bare `assert`. The docstring drops the `:gen`
+;; paragraph only.
+(defmacro keys
+  "Creates and returns a map validating spec. :req and :opt are both
+  vectors of namespaced-qualified keywords. The validator will ensure
+  the :req keys are present. The :opt keys serve as documentation and
+  may be used by the generator.
+
+  The :req key vector supports 'and' and 'or' for key groups:
+
+  (s/keys :req [::x ::y (or ::secret (and ::user ::pwd))] :opt [::z])
+
+  There are also -un versions of :req and :opt. These allow
+  you to connect unqualified keys to specs.  In each case, fully
+  qualified keywords are passed, which name the specs, but unqualified
+  keys (with the same name component) are expected and checked at
+  conform-time, and generated during gen:
+
+  (s/keys :req-un [:my.ns/x :my.ns/y])
+
+  The above says keys :x and :y are required, and will be validated
+  and generated by specs (if they exist) named :my.ns/x :my.ns/y
+  respectively.
+
+  In addition, the values of *all* namespace-qualified keys will be validated
+  (and possibly destructured) by any registered specs. Note: there is
+  no support for inline value specification, by design."
+  [& {:keys [req req-un opt opt-un]}]
+  (let [unk (fn [k] (keyword (name k)))
+        req-keys (filterv keyword? (flatten req))
+        req-un-specs (filterv keyword? (flatten req-un))
+        _ (assert (every? (fn [k] (c/and (keyword? k) (namespace k)))
+                          (concat req-keys req-un-specs opt opt-un))
+                  "all keys must be namespace-qualified keywords")
+        req-specs (into req-keys req-un-specs)
+        req-keys (into req-keys (map unk req-un-specs))
+        opt-keys (into (vec opt) (map unk opt-un))
+        opt-specs (into (vec opt) opt-un)
+        gx (gensym)
+        parse-req (fn [rk f]
+                    (map (fn [x]
+                           (if (keyword? x)
+                             (list 'clojure.core/contains? gx (f x))
+                             (spec-postwalk
+                              (fn [y]
+                                (if (keyword? y)
+                                  (list 'clojure.core/contains? gx (f y))
+                                  y))
+                              x)))
+                         rk))
+        pred-exprs (into [(list 'clojure.core/map? gx)]
+                         (parse-req req identity))
+        pred-exprs (into pred-exprs (parse-req req-un unk))
+        keys-pred (list 'fn* [gx] (apply list 'clojure.core/and pred-exprs))
+        pred-exprs (mapv (fn [e] (list 'fn* [gx] e)) pred-exprs)
+        pred-forms (spec-postwalk res pred-exprs)]
+    (list 'clojure.spec.alpha/map-spec-impl
+          {:req (list 'quote req)
+           :opt (list 'quote opt)
+           :req-un (list 'quote req-un)
+           :opt-un (list 'quote opt-un)
+           :req-keys (list 'quote req-keys)
+           :req-specs (list 'quote req-specs)
+           :opt-keys (list 'quote opt-keys)
+           :opt-specs (list 'quote opt-specs)
+           :pred-forms (list 'quote pred-forms)
+           :pred-exprs pred-exprs
+           :keys-pred keys-pred})))
+
+;; Upstream alpha.clj 503-509, narrowed: no `gfn` (generators
+;; are a later slice). Built with `list`, as `and`.
+(defmacro merge
+  "Takes map-validating specs (e.g. 'keys' specs) and
+  returns a spec that returns a conformed map satisfying all of the
+  specs.  Unlike 'and', merge can generate maps satisfying the
+  union of the predicates."
+  [& pred-forms]
+  (list 'clojure.spec.alpha/merge-spec-impl
+        (list 'quote (mapv res pred-forms))
+        (vec pred-forms)))
+
 ;; Upstream alpha.clj 757-768, narrowed: `cpred?` is conformer
 ;; machinery (a later slice). Throw via ex-info, as `reg-resolve!`.
 (defn- dt
@@ -448,6 +621,14 @@ if value does not match spec, else the (possibly destructured) value."
   ([spec x form]
    (let [spec (specize spec form)]
      (not (invalid? (conform* spec x))))))
+
+;; Upstream alpha.clj 779-784 (`dt` is already narrowed: no `cpred?`).
+(defn- pvalid?
+  "internal helper function that returns true when x is valid for spec."
+  ([pred x]
+   (not (invalid? (dt pred x :clojure.spec.alpha/unknown))))
+  ([pred x form]
+   (not (invalid? (dt pred x form)))))
 
 ;; Upstream alpha.clj 786-793.
 (defn- explain-1 [form pred path via in v]
@@ -488,4 +669,21 @@ if value does not match spec, else the (possibly destructured) value."
   "Do not call this directly, use 'and'"
   [forms preds]
   (->AndSpec forms preds (delay (mapv specize preds forms))))
+
+;; Upstream alpha.clj 822-908, narrowed to the argm minus `:gfn`
+;; (generators are a later slice). Builds a MapSpec record (see
+;; the file header); `k->s` is precomputed here, standing in for
+;; the `keys->specnames` closure.
+(defn ^:skip-wiki map-spec-impl
+  "Do not call this directly, use 'keys'"
+  [{:keys [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt]}]
+  (->MapSpec req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt
+             (zipmap (concat req-keys opt-keys) (concat req-specs opt-specs))))
+
+;; Upstream alpha.clj 1195-1221, narrowed to `[forms preds]`
+;; (same reason as `map-spec-impl`). Builds a MergeSpec record.
+(defn ^:skip-wiki merge-spec-impl
+  "Do not call this directly, use 'merge'"
+  [forms preds]
+  (->MergeSpec forms preds))
 
