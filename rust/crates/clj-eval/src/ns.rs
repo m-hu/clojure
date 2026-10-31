@@ -58,6 +58,11 @@ const CORE_CLJ: &str = include_str!("core.clj");
 /// through the ordinary `require` path).
 const SPEC_ALPHA_CLJ: &str = include_str!("spec_alpha.clj");
 
+/// The embedded `clojure.spec.gen.alpha` slice-F1 source (gap-122):
+/// `resolve_source` serves this for `clojure/spec/gen/alpha`, same
+/// on-demand shape as [`SPEC_ALPHA_CLJ`].
+const SPEC_GEN_ALPHA_CLJ: &str = include_str!("gen_alpha.clj");
+
 pub(crate) fn npe(message: &str) -> NativeError {
     NativeError::new(ThrowClass::NullPointerException, message.to_owned())
 }
@@ -1195,8 +1200,9 @@ fn load_dirs(eval: &Evaluator) -> Result<Vec<String>, NativeError> {
 }
 
 /// Resolve a load root (no leading slash) to the `*file*` path and
-/// text: embedded libs first (gap-122 slice 1: `clojure/spec/alpha`
-/// only; the flat set lives here when S5D lands), then `.clj`
+/// text: embedded libs first (gap-122 slices 1+F1:
+/// `clojure/spec/alpha` + `clojure/spec/gen/alpha`; the flat set
+/// lives here when S5D lands), then `.clj`
 /// across every `*load-path*` dir, then `.cljc` (`RT.load` lookup
 /// order).
 fn resolve_source(eval: &Evaluator, root: &str) -> Result<(String, String), NativeError> {
@@ -1204,6 +1210,12 @@ fn resolve_source(eval: &Evaluator, root: &str) -> Result<(String, String), Nati
         return Ok((
             "clojure/spec/alpha.clj".to_owned(),
             SPEC_ALPHA_CLJ.to_owned(),
+        ));
+    }
+    if root == "clojure/spec/gen/alpha" {
+        return Ok((
+            "clojure/spec/gen/alpha.clj".to_owned(),
+            SPEC_GEN_ALPHA_CLJ.to_owned(),
         ));
     }
     let dirs = load_dirs(eval)?;
