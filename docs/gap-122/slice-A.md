@@ -136,7 +136,8 @@ pr-string of the last form (or `explain-str` output).
 
 13. Conform returns the map, invalid stays invalid
     When `(s/conform :user/person {:user/name "n"})`
-    Then `{:user/name "n"}`;
+    Then `#:user{:name "n"}` (namespaced-map print, as on the
+    JVM);
     When `(s/conform :user/person {})`
     Then `:clojure.spec.alpha/invalid`;
     When `(s/conform :user/person {:user/name 42})`
@@ -173,12 +174,13 @@ pr-string of the last form (or `explain-str` output).
     key `:name`; `via` with the spec name `:user/name`).
 19. Missing-key problem-map shape
     When `(s/explain-data :user/person {})`
-    Then `#:clojure.spec.alpha{:problems [{:path [], :pred
+    Then `#:clojure.spec.alpha{:problems ({:path [], :pred
     (clojure.core/fn [%] (clojure.core/contains? %
-    :user/name)), :val {}, :via [:user/person], :in []}],
-    :spec :user/person, :value {}}` (`pred-forms` go through
-    `res`, so `unfn` restores `(fn [%] ...)` with resolved
-    symbols).
+    :user/name)), :val {}, :via [:user/person], :in []}),
+    :spec :user/person, :value {}}` (`:problems` is the
+    `(apply concat ...)` seq, printed with parens;
+    `pred-forms` go through `res`, so `unfn` restores
+    `(fn [%] ...)` with resolved symbols).
 20. Group failure
     Given scenario 10
     When `(s/explain-str :user/ab {})`
@@ -225,7 +227,7 @@ pr-string of the last form (or `explain-str` output).
     Then `:clojure.spec.alpha/invalid`.
 26. Merge explains every branch
     When `(s/explain-str :user/ab {:user/x 1})`
-    Then `"{:user/x 1} - failed: (contains? % :user/y)
+    Then `"#:user{:x 1} - failed: (contains? % :user/y)
     spec: :user/b\n"` (oracle `explain*` 1209-1212: concat
     over branches; the passing branch contributes nothing).
 27. Merge over a non-map explains per branch
