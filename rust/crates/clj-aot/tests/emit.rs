@@ -45,7 +45,7 @@ fn emit_ir_writes_module_and_skips_link() {
     )
     .expect("emit ir");
     let text = std::fs::read_to_string(&ir).expect("read ir");
-    assert!(text.contains("define ptr @cljfn_f_0"), "{text}");
+    assert!(text.contains("define i64 @cljfn_f_0"), "{text}");
     assert!(text.contains("define i32 @main(i32"), "{text}");
     assert!(!out.exists(), "linking must be skipped");
     std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -104,7 +104,7 @@ fn emit_covers_arity_branches_through_the_rlib() {
         .expect("emit arity branch");
         let text = std::fs::read_to_string(&ir).expect("read ir");
         assert!(
-            text.contains("call ptr @rt_arity_error"),
+            text.contains("call i64 @rt_arity_error"),
             "{source}\n{text}"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -132,7 +132,7 @@ fn emit_covers_conditional_let_slot_init_through_the_rlib() {
     )
     .expect("emit conditional lets");
     let text = std::fs::read_to_string(&ir).expect("read ir");
-    assert!(text.contains("call ptr @rt_nil"), "{text}");
+    assert!(text.contains("call i64 @rt_nil"), "{text}");
     assert!(text.contains("call void @rt_drop"), "{text}");
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
@@ -159,7 +159,7 @@ fn emit_covers_keyword_literals_through_the_rlib() {
     .expect("emit keywords");
     let text = std::fs::read_to_string(&ir).expect("read ir");
     assert_eq!(
-        text.match_indices("call ptr @rt_keyword").count(),
+        text.match_indices("call i64 @rt_keyword").count(),
         3,
         "{text}"
     );

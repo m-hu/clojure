@@ -26,6 +26,12 @@ compile_error!("clj-aot requires a 64-bit host (usize FFI widths)");
 pub mod driver;
 pub mod jit;
 pub mod link;
+// Handle-IR ratchet (Z3): no `unsafe` compiles in the lowering
+// (no GEP anywhere — accs and str-ids only). Crate-wide forbid
+// is impossible: `jit` keeps inherent MCJIT unsafety (the `MainFn`
+// entry type plus the entry-lookup-and-call block), and forbid
+// cannot carve out a module — the geiger gate backstops `jit`.
+#[forbid(unsafe_code)]
 pub mod lower;
 pub mod target;
 

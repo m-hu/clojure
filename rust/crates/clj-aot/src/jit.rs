@@ -58,8 +58,9 @@ fn jit_err<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> Result<
 /// exhaustive `Prim` match would trip the complexity gate).
 /// Prim symbols come from [`prim_symbol`], the single source
 /// of truth; `exit` is deliberately absent (declared but never
-/// emitted in JIT mode, so MCJIT never resolves it).
-fn mappings() -> [(&'static str, *const ()); 27] {
+/// emitted in JIT mode, so MCJIT never resolves it), and so are
+/// the test-only `rt_str_finish`/`rt_live_count` (never declared).
+fn mappings() -> [(&'static str, *const ()); 32] {
     [
         (prim_symbol(Prim::Add), cljrt::rt_add as *const ()),
         (prim_symbol(Prim::Sub), cljrt::rt_sub as *const ()),
@@ -78,12 +79,17 @@ fn mappings() -> [(&'static str, *const ()); 27] {
         ("rt_bool", cljrt::rt_bool as *const ()),
         ("rt_int", cljrt::rt_int as *const ()),
         ("rt_double", cljrt::rt_double as *const ()),
-        ("rt_str", cljrt::rt_str as *const ()),
+        ("rt_str_new", cljrt::rt_str_new as *const ()),
+        ("rt_str_chunk", cljrt::rt_str_chunk as *const ()),
+        ("rt_str_register", cljrt::rt_str_register as *const ()),
+        ("rt_str_get", cljrt::rt_str_get as *const ()),
         ("rt_keyword", cljrt::rt_keyword as *const ()),
         ("rt_vec_new", cljrt::rt_vec_new as *const ()),
         ("rt_vec_push", cljrt::rt_vec_push as *const ()),
         ("rt_clone", cljrt::rt_clone as *const ()),
         ("rt_drop", cljrt::rt_drop as *const ()),
+        ("rt_args_new", cljrt::rt_args_new as *const ()),
+        ("rt_args_push", cljrt::rt_args_push as *const ()),
         ("rt_argv", cljrt::rt_argv as *const ()),
         ("rt_print", cljrt::rt_print as *const ()),
         ("rt_arity_error", cljrt::rt_arity_error as *const ()),
@@ -179,7 +185,7 @@ mod tests {
         let source = "(defn f [x] (+ x 1)) (print (f 41) (quot 1 0))";
         let jit = compile_ir_jit(source);
         assert!(jit.contains("ret i32 1"), "{jit}");
-        assert!(jit.contains("ret ptr null"), "{jit}");
+        assert!(jit.contains("ret i64 0"), "{jit}");
         assert!(!jit.contains("call void @exit"), "{jit}");
         let aot = compile_ir_aot(source);
         assert!(aot.contains("call void @exit(i32 1)"), "{aot}");
@@ -210,7 +216,7 @@ mod tests {
             }
             func = f.get_next_function();
         }
-        assert_eq!(decls, 27, "expected all 27 helpers declared");
+        assert_eq!(decls, 32, "expected all 32 helpers declared");
         for prim in PRIM_ORDER {
             let symbol = prim_symbol(prim);
             assert!(

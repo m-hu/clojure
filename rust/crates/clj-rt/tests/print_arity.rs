@@ -6,6 +6,7 @@
 // the terms of this license.
 // You must not remove this notice, or any other, from this software.
 
+#![forbid(unsafe_code)]
 //! `print` and arity-error helpers through the real FFI boundary
 //! (no LLVM): return-shape pins here, exact stdout/stderr bytes in
 //! the S8D corpus replay.
@@ -14,39 +15,27 @@ mod support;
 
 use clj_value::Value;
 use cljrt::{rt_arity_error, rt_print};
-use support::{inbox, render};
+use support::{acc, inbox, render, str_id};
 
 #[test]
 fn print_returns_nil() {
-    let empty: Vec<*mut Value> = Vec::new();
-    assert_eq!(render(unsafe { rt_print(empty.as_ptr(), 0) }), "nil");
-    let one = [inbox(Value::Int(1))];
-    assert_eq!(render(unsafe { rt_print(one.as_ptr(), one.len()) }), "nil");
-    let three = [
-        inbox(Value::Int(1)),
-        inbox(Value::Str("x".into())),
-        inbox(Value::Bool(false)),
-    ];
+    assert_eq!(render(rt_print(acc(Vec::new()))), "nil");
+    assert_eq!(render(rt_print(acc(vec![inbox(Value::Int(1))]))), "nil");
     assert_eq!(
-        render(unsafe { rt_print(three.as_ptr(), three.len()) }),
+        render(rt_print(acc(vec![
+            inbox(Value::Int(1)),
+            inbox(Value::Str("x".into())),
+            inbox(Value::Bool(false)),
+        ]))),
         "nil"
     );
 }
 
 #[test]
-fn arity_error_returns_null() {
-    let display = b"user/f";
-    let path = b"f.clj";
-    let out = unsafe {
-        rt_arity_error(
-            display.as_ptr(),
-            display.len(),
-            0,
-            path.as_ptr(),
-            path.len(),
-            1,
-            16,
-        )
-    };
-    assert!(out.is_null());
+fn arity_error_returns_zero() {
+    let display = str_id("user/f");
+    let path = str_id("f.clj");
+    assert_eq!(rt_arity_error(display, 0, path, 1, 16), 0);
+    // Missing str-ids degrade to a marker (still `0`, never a panic).
+    assert_eq!(rt_arity_error(u64::MAX, 2, u64::MAX, 1, 16), 0);
 }

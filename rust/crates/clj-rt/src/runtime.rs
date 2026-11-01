@@ -24,11 +24,14 @@
 //! (That single-lock argument is the whole model: there is no lock
 //! ordering to check, so a loom model would be vacuous.)
 
+#![forbid(unsafe_code)]
+
+use std::ffi::OsStr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use clj_eval::{Evaluator, NativeError, NativeImpl, as_native, boot};
-use clj_value::{ThrowClass, Value, print_to_string};
+use clj_value::{List, ThrowClass, Value, Vector, print_to_string};
 
 use crate::handles::{self, Slab};
 
@@ -92,11 +95,128 @@ impl Runtime {
         handles::mint_table(handles::TAG_VALUE, index, generation)
     }
 
+    /// Resolve a handle to a value clone (`None` for stale,
+    /// wrong-tag, and invalid handles).
+    pub(crate) fn resolve_handle(&self, handle: u64) -> Option<Value> {
+        if let Some(value) = handles::decode_inline(handle) {
+            return Some(value);
+        }
+        let (tag, index, generation) = handles::split_table(handle)?;
+        if tag != handles::TAG_VALUE {
+            return None;
+        }
+        self.handles.get(index, generation).cloned()
+    }
+
+    /// Clone a handle (inline: identity; table: bump; anything
+    /// else: `0` — fail-stop at the caller's null check).
+    pub(crate) fn clone_handle(&mut self, handle: u64) -> u64 {
+        if handles::decode_inline(handle).is_some() {
+            return handle;
+        }
+        let Some((tag, index, generation)) = handles::split_table(handle) else {
+            return 0;
+        };
+        if tag != handles::TAG_VALUE || !self.handles.clone_ref(index, generation) {
+            return 0;
+        }
+        handle
+    }
+
+    /// Drop a handle (table: dec, free at zero; inline, stale,
+    /// and wrong-tag: silent no-op).
+    pub(crate) fn drop_handle(&mut self, handle: u64) {
+        if handles::decode_inline(handle).is_some() {
+            return;
+        }
+        if let Some((tag, index, generation)) = handles::split_table(handle) {
+            if tag == handles::TAG_VALUE {
+                self.handles.drop_ref(index, generation);
+            }
+        }
+    }
+
+    /// Take a handle (resolve + drop — the consume for truthy
+    /// tests, push operands, keyword parts); `None` for stale,
+    /// wrong-tag, and invalid handles.
+    pub(crate) fn take_handle(&mut self, handle: u64) -> Option<Value> {
+        if let Some(value) = handles::decode_inline(handle) {
+            return Some(value);
+        }
+        let (tag, index, generation) = handles::split_table(handle)?;
+        if tag != handles::TAG_VALUE {
+            return None;
+        }
+        let value = self.handles.get(index, generation)?.clone();
+        self.handles.drop_ref(index, generation);
+        Some(value)
+    }
+
     /// A fresh arg accumulator (linear: pushed, then consumed
     /// exactly once by a prim/print call).
     pub(crate) fn acc_new(&mut self) -> u64 {
         let (index, generation) = self.accs.insert(Vec::new());
         handles::mint_table(handles::TAG_ACC, index, generation)
+    }
+
+    /// Take an acc's arg handles, freeing the slot (`None` for
+    /// stale, wrong-tag, and invalid accs).
+    pub(crate) fn acc_take(&mut self, acc: u64) -> Option<Vec<u64>> {
+        let (tag, index, generation) = handles::split_table(acc)?;
+        if tag != handles::TAG_ACC {
+            return None;
+        }
+        self.accs.take(index, generation)
+    }
+
+    /// Push an owned element onto a live value slot in place
+    /// (non-vectors are overwritten — parity with the old
+    /// wrong-type arm); `Err` returns the element unless the slot
+    /// is live.
+    fn vec_push_live(&mut self, vec: u64, elem: Value) -> Result<u64, Value> {
+        let Some((tag, index, generation)) = handles::split_table(vec) else {
+            return Err(elem);
+        };
+        if tag != handles::TAG_VALUE {
+            return Err(elem);
+        }
+        let Some(slot) = self.handles.get_mut(index, generation) else {
+            return Err(elem);
+        };
+        let old = std::mem::replace(slot, Value::Nil);
+        *slot = match old {
+            Value::Vector(items) => Value::Vector(items.push_back(elem)),
+            _ => Value::Vector(Vector::from_vec(vec![elem])),
+        };
+        Ok(vec)
+    }
+
+    /// Push an owned element onto the `vec` slot (live slots
+    /// update in place — non-vectors are overwritten, parity with
+    /// the old wrong-type arm; dead, slotless, or wrong-tag
+    /// `vec`s degrade to a fresh single-element vector).
+    pub(crate) fn vec_push_value(&mut self, vec: u64, elem: Value) -> u64 {
+        match self.vec_push_live(vec, elem) {
+            Ok(handle) => handle,
+            Err(elem) => self.give(Value::Vector(Vector::from_vec(vec![elem]))),
+        }
+    }
+
+    /// Take print args (infallible: stale accs read empty, stale
+    /// args read nil — print sites carry no null check, so this
+    /// must never fail).
+    pub(crate) fn print_take_args(&mut self, acc: u64) -> Vec<Value> {
+        let Some(arg_handles) = self.acc_take(acc) else {
+            return Vec::new();
+        };
+        let mut owned = Vec::with_capacity(arg_handles.len());
+        for handle in &arg_handles {
+            owned.push(self.resolve_handle(*handle).unwrap_or(Value::Nil));
+        }
+        for handle in &arg_handles {
+            self.drop_handle(*handle);
+        }
+        owned
     }
 
     /// Push a handle onto an acc (ownership transfers — no
@@ -202,13 +322,41 @@ impl Runtime {
 /// The process-global runtime, booted on first helper call.
 pub(crate) static RUNTIME: LazyLock<Mutex<Runtime>> = LazyLock::new(|| Mutex::new(Runtime::boot()));
 
-/// Call primitive `index` (a [`Prim`](clj_eval::Prim) discriminant) on owned
-/// `args`: the SAME native the interpreter would call, with the
-/// SAME [`NativeError`] on failure.
-pub(crate) fn call_prim(index: usize, args: Vec<Value>) -> Result<Value, NativeError> {
-    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+/// Dispatch primitive `index` (a [`Prim`](clj_eval::Prim)
+/// discriminant) on owned `args` against an already-held
+/// runtime: the SAME native the interpreter would call, with the
+/// SAME [`NativeError`] on failure. The FFI entry resolves its
+/// acc under the same hold — one lock, no nesting, no TOCTOU
+/// between arg resolution and dispatch.
+pub(crate) fn call_prim_with(
+    rt: &mut Runtime,
+    index: usize,
+    args: Vec<Value>,
+) -> Result<Value, NativeError> {
     let func = Arc::clone(&rt.prims[index]);
     catch_panic(AssertUnwindSafe(|| func(&mut rt.eval, &args)))
+}
+
+/// The `*command-line-args*` value from program args (T1192 FX1
+/// D-argv, shared by the zero-param `rt_argv` shim): index 0
+/// (the program name) is skipped; no remaining args is nil, else
+/// a list of strings; bytes decode lossy like the JVM's platform
+/// decode.
+pub(crate) fn argv_from<I>(args: I) -> Value
+where
+    I: IntoIterator,
+    I::Item: AsRef<OsStr>,
+{
+    let mut items = Vec::new();
+    for arg in args.into_iter().skip(1) {
+        let text = arg.as_ref().to_string_lossy().into_owned();
+        items.push(Value::Str(Arc::from(text.as_str())));
+    }
+    if items.is_empty() {
+        Value::Nil
+    } else {
+        Value::List(List::from_vec(items))
+    }
 }
 
 /// Run a native call, converting a panic (an internal bug — the
@@ -267,9 +415,11 @@ pub(crate) fn print_join(args: &[Value]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PRIM_NAMES, RUNTIME, Runtime, call_prim, catch_panic, error_line, print_join};
+    use super::{
+        PRIM_NAMES, RUNTIME, Runtime, call_prim_with, catch_panic, error_line, print_join,
+    };
     use clj_eval::{NativeError, Prim};
-    use clj_value::{ThrowClass, Value};
+    use clj_value::{ThrowClass, Value, Vector};
     use std::panic::AssertUnwindSafe;
 
     #[test]
@@ -307,9 +457,14 @@ mod tests {
 
     #[test]
     fn call_prim_reaches_the_shared_native() {
-        let out = call_prim(Prim::Add as usize, vec![Value::Int(1), Value::Int(2)]);
+        let mut rt = Runtime::boot();
+        let out = call_prim_with(
+            &mut rt,
+            Prim::Add as usize,
+            vec![Value::Int(1), Value::Int(2)],
+        );
         assert_eq!(format!("{out:?}"), "Ok(Int(3))");
-        let out = call_prim(Prim::Sub as usize, Vec::new());
+        let out = call_prim_with(&mut rt, Prim::Sub as usize, Vec::new());
         assert!(out.is_err());
     }
 
@@ -509,5 +664,168 @@ mod tests {
         assert_eq!(rt.live_count(), 3);
         rt.give(Value::Nil);
         assert_eq!(rt.live_count(), 3);
+    }
+
+    /// Resolve/clone/drop/take round-trip both inline and table
+    /// handles (clone-then-drop balances; take consumes).
+    #[test]
+    fn value_handles_round_trip() {
+        let mut rt = Runtime::boot();
+        let inline = rt.give(Value::Int(9));
+        assert_eq!(rt.resolve_handle(inline), Some(Value::Int(9)));
+        assert_eq!(rt.clone_handle(inline), inline);
+        assert_eq!(rt.take_handle(inline), Some(Value::Int(9)));
+        rt.drop_handle(inline);
+        assert_eq!(rt.live_count(), 0);
+        let tabled = rt.give(Value::Str("v".into()));
+        assert!(matches!(rt.resolve_handle(tabled), Some(Value::Str(_))));
+        assert_eq!(rt.clone_handle(tabled), tabled);
+        assert_eq!(rt.live_count(), 1);
+        rt.drop_handle(tabled);
+        assert_eq!(rt.live_count(), 1);
+        assert!(matches!(rt.take_handle(tabled), Some(Value::Str(_))));
+        assert_eq!(rt.live_count(), 0);
+    }
+
+    /// Stale, wrong-tag, and invalid handles degrade gracefully:
+    /// clones yield `0`, drops are silent, resolves take `None`.
+    #[test]
+    fn value_handles_degrade_gracefully() {
+        let mut rt = Runtime::boot();
+        let tabled = rt.give(Value::Str("v".into()));
+        rt.drop_handle(tabled);
+        for stale in [0, tabled, u64::MAX] {
+            assert_eq!(rt.resolve_handle(stale), None);
+            assert_eq!(rt.clone_handle(stale), 0);
+            assert_eq!(rt.take_handle(stale), None);
+            rt.drop_handle(stale);
+        }
+        let acc = rt.acc_new();
+        let builder = rt.builder_new();
+        for wrong in [acc, builder] {
+            assert_eq!(rt.resolve_handle(wrong), None);
+            assert_eq!(rt.clone_handle(wrong), 0);
+            assert_eq!(rt.take_handle(wrong), None);
+            rt.drop_handle(wrong);
+        }
+        assert_eq!(rt.live_count(), 2);
+    }
+
+    /// Acc take consumes linearly (payload out, slot freed, old
+    /// handle stale); wrong-tag takes are `None`.
+    #[test]
+    fn acc_take_consumes() {
+        let mut rt = Runtime::boot();
+        let acc = rt.acc_new();
+        let one = rt.give(Value::Int(1));
+        let two = rt.give(Value::Int(2));
+        rt.acc_push(acc, one);
+        rt.acc_push(acc, two);
+        assert_eq!(rt.acc_take(acc), Some(vec![one, two]));
+        assert_eq!(rt.live_count(), 0);
+        assert_eq!(rt.acc_take(acc), None);
+        assert_eq!(rt.acc_take(0), None);
+        assert_eq!(rt.acc_take(one), None);
+    }
+
+    /// Vector push appends in place (same handle back), while a
+    /// non-vector slot is overwritten and stale/wrong-tag vecs
+    /// degrade to fresh single-element vectors.
+    #[test]
+    fn vec_push_appends_or_degrades() {
+        use clj_value::print_to_string;
+        let mut rt = Runtime::boot();
+        let vec = rt.give(Value::Vector(Vector::from_vec(Vec::new())));
+        let one = rt.give(Value::Int(1));
+        let elem = rt.take_handle(one).expect("owned elem");
+        assert_eq!(rt.vec_push_value(vec, elem), vec);
+        let two = rt.give(Value::Int(2));
+        let elem = rt.take_handle(two).expect("owned elem");
+        assert_eq!(rt.vec_push_value(vec, elem), vec);
+        let pushed = rt.resolve_handle(vec).expect("live vec");
+        assert_eq!(print_to_string(&pushed), "[1 2]");
+        let not_vec = rt.give(Value::Str("s".into()));
+        let uno = rt.give(Value::Int(1));
+        let elem = rt.take_handle(uno).expect("owned elem");
+        assert_eq!(rt.vec_push_value(not_vec, elem), not_vec);
+        let degraded = rt.resolve_handle(not_vec).expect("live slot");
+        assert_eq!(print_to_string(&degraded), "[1]");
+        rt.drop_handle(vec);
+        rt.drop_handle(not_vec);
+        let fresh = rt.give(Value::Int(3));
+        let elem = rt.take_handle(fresh).expect("owned elem");
+        let degraded = rt.vec_push_value(vec, elem);
+        assert_ne!(degraded, vec);
+        let rendered = rt.resolve_handle(degraded).expect("fresh vec");
+        assert_eq!(print_to_string(&rendered), "[3]");
+        let acc = rt.acc_new();
+        let last = rt.give(Value::Int(4));
+        let elem = rt.take_handle(last).expect("owned elem");
+        let via_acc = rt.vec_push_value(acc, elem);
+        assert_ne!(via_acc, acc);
+        let rendered = rt.resolve_handle(via_acc).expect("fresh vec");
+        assert_eq!(print_to_string(&rendered), "[4]");
+    }
+
+    /// Print takes args infallibly (stale accs read empty, stale
+    /// args read nil) and always consumes the acc.
+    #[test]
+    fn print_take_args_is_infallible() {
+        use clj_value::print_to_string;
+        let mut rt = Runtime::boot();
+        assert!(rt.print_take_args(0).is_empty());
+        let acc = rt.acc_new();
+        let one = rt.give(Value::Int(1));
+        let tabled = rt.give(Value::Str("s".into()));
+        rt.acc_push(acc, one);
+        rt.acc_push(acc, tabled);
+        rt.drop_handle(tabled);
+        let owned = rt.print_take_args(acc);
+        let rendered: Vec<String> = owned.iter().map(print_to_string).collect();
+        assert_eq!(rendered, vec!["1".to_owned(), "nil".to_owned()]);
+        assert_eq!(rt.live_count(), 0);
+    }
+
+    /// `argv_from` skips the program name, nils when empty, and
+    /// decodes lossy (the T1192 FX1 shape, unit-pinned without
+    /// touching the process environment).
+    #[test]
+    fn argv_from_pins() {
+        use super::argv_from;
+        use clj_value::print_to_string;
+        assert!(matches!(argv_from(["prog"]), Value::Nil));
+        let empty: [&str; 0] = [];
+        assert!(matches!(argv_from(empty), Value::Nil));
+        assert_eq!(print_to_string(&argv_from(["prog", "a", "b"])), "(a b)");
+        let owned = ["prog".to_owned(), "a b".to_owned()];
+        assert_eq!(print_to_string(&argv_from(owned)), "(a b)");
+    }
+
+    /// Non-UTF8 argv bytes decode lossy (Unix-only: only there can
+    /// an `OsStr` hold invalid UTF-8).
+    #[test]
+    #[cfg(unix)]
+    fn argv_from_decodes_lossy() {
+        use super::argv_from;
+        use clj_value::print_to_string;
+        use std::os::unix::ffi::OsStrExt;
+        let prog = std::ffi::OsStr::new("prog");
+        let bad = std::ffi::OsStr::from_bytes(b"a\xffb");
+        assert_eq!(print_to_string(&argv_from([prog, bad])), "(a�b)");
+    }
+
+    /// `call_prim_with` dispatches against a held runtime (the
+    /// FFI entry's single-hold path — success and error arms).
+    #[test]
+    fn call_prim_with_dispatches() {
+        let mut rt = Runtime::boot();
+        let held = call_prim_with(
+            &mut rt,
+            Prim::Add as usize,
+            vec![Value::Int(1), Value::Int(2)],
+        );
+        assert_eq!(format!("{held:?}"), "Ok(Int(3))");
+        let err = call_prim_with(&mut rt, Prim::Sub as usize, Vec::new());
+        assert!(err.is_err());
     }
 }

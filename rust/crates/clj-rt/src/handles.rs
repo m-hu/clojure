@@ -35,17 +35,14 @@
 //! Every function here is total (no panics): invalid handles
 //! resolve to `None`/`false`, and callers degrade gracefully.
 
-// The value-handle consumers (`resolve`, `clone`/`drop`, table
-// `get`) land with the flip commit (ii) — until then they are
-// exercised by the unit tests only, so the rlib build allows
-// the temporary dead code (libtest keeps the full deny).
-#![cfg_attr(not(test), allow(dead_code))]
+#![forbid(unsafe_code)]
 
 use clj_value::Value;
 
 /// Low-3-bit tag mask.
 const TAG_MASK: u64 = 0b111;
 /// Reserved: only `0` (the sentinel) is valid here.
+#[cfg(test)]
 const TAG_RESERVED0: u64 = 0b000;
 /// Value slot (`index || generation`).
 pub(crate) const TAG_VALUE: u64 = 0b001;
@@ -60,12 +57,19 @@ pub(crate) const TAG_ACC: u64 = 0b101;
 /// String-builder slot.
 pub(crate) const TAG_BUILDER: u64 = 0b110;
 /// Reserved (never minted).
+#[cfg(test)]
 const TAG_RESERVED7: u64 = 0b111;
 
 /// Scalar payloads under [`TAG_SCALAR`].
 const SCALAR_NIL: u64 = 0;
 const SCALAR_FALSE: u64 = 1;
 const SCALAR_TRUE: u64 = 2;
+
+/// Inline scalar constants (lock-free shim returns — pinned to
+/// [`encode_inline`] by the round-trip test).
+pub(crate) const NIL_HANDLE: u64 = TAG_SCALAR | (SCALAR_NIL << 3);
+pub(crate) const FALSE_HANDLE: u64 = TAG_SCALAR | (SCALAR_FALSE << 3);
+pub(crate) const TRUE_HANDLE: u64 = TAG_SCALAR | (SCALAR_TRUE << 3);
 
 /// Inline small-int bounds (±2^60 — every smaller magnitude
 /// round-trips through the 61-bit payload).
@@ -87,14 +91,24 @@ const GEN_SHIFT: u32 = 35;
 #[must_use]
 pub(crate) fn encode_inline(value: &Value) -> Option<u64> {
     match value {
-        Value::Nil => Some(TAG_SCALAR | (SCALAR_NIL << 3)),
-        Value::Bool(false) => Some(TAG_SCALAR | (SCALAR_FALSE << 3)),
-        Value::Bool(true) => Some(TAG_SCALAR | (SCALAR_TRUE << 3)),
-        Value::Int(n) if (SMALL_MIN..=SMALL_MAX).contains(n) => {
-            Some((((*n as u64) & PAYLOAD_MASK) << 3) | TAG_INT)
-        }
+        Value::Nil => Some(NIL_HANDLE),
+        Value::Bool(false) => Some(FALSE_HANDLE),
+        Value::Bool(true) => Some(TRUE_HANDLE),
+        Value::Int(n) => encode_int(*n),
         Value::Char(c) => Some((u64::from(*c as u32) << 3) | TAG_CHAR),
         _ => None,
+    }
+}
+
+/// Encode a small-int (`None` for out-of-range ints — the
+/// lock-free half of [`encode_inline`], shared by `rt_int` so
+/// hot ints skip the table lock).
+#[must_use]
+pub(crate) fn encode_int(n: i64) -> Option<u64> {
+    if (SMALL_MIN..=SMALL_MAX).contains(&n) {
+        Some((((n as u64) & PAYLOAD_MASK) << 3) | TAG_INT)
+    } else {
+        None
     }
 }
 
@@ -144,6 +158,7 @@ pub(crate) fn mint_table(tag: u64, index: u32, generation: u32) -> u64 {
 
 /// Use both reserved tags so the encoding table stays greppable
 /// (they are never minted — see the module docs).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn is_reserved_tag(handle: u64) -> bool {
     matches!(handle & TAG_MASK, TAG_RESERVED0 | TAG_RESERVED7)
@@ -283,9 +298,9 @@ impl<T> Default for Slab<T> {
 mod tests {
     use super::Slab;
     use super::{
-        GEN_MASK, SMALL_MAX, SMALL_MIN, TAG_ACC, TAG_BUILDER, TAG_CHAR, TAG_INT, TAG_RESERVED0,
-        TAG_RESERVED7, TAG_SCALAR, TAG_VALUE, decode_inline, encode_inline, is_reserved_tag,
-        mint_table, split_table,
+        FALSE_HANDLE, GEN_MASK, NIL_HANDLE, SMALL_MAX, SMALL_MIN, TAG_ACC, TAG_BUILDER, TAG_CHAR,
+        TAG_INT, TAG_RESERVED0, TAG_RESERVED7, TAG_SCALAR, TAG_VALUE, TRUE_HANDLE, decode_inline,
+        encode_inline, encode_int, is_reserved_tag, mint_table, split_table,
     };
     use clj_value::Value;
 
@@ -331,6 +346,31 @@ mod tests {
         ];
         for value in cases {
             assert_eq!(encode_inline(&value), None, "{value:?}");
+        }
+    }
+
+    /// The scalar constants match the encoder (lock-free shim
+    /// returns stay in sync with the table by construction).
+    #[test]
+    fn scalar_consts_match_the_encoder() {
+        assert_eq!(encode_inline(&Value::Nil), Some(NIL_HANDLE));
+        assert_eq!(encode_inline(&Value::Bool(false)), Some(FALSE_HANDLE));
+        assert_eq!(encode_inline(&Value::Bool(true)), Some(TRUE_HANDLE));
+        assert_ne!(NIL_HANDLE, 0);
+        assert_ne!(FALSE_HANDLE, 0);
+        assert_ne!(TRUE_HANDLE, 0);
+    }
+
+    /// `encode_int` is the `rt_int` fast path (small inline,
+    /// out-of-range table-bound).
+    #[test]
+    fn encode_int_pins_the_range() {
+        for n in [0, 1, -1, SMALL_MIN, SMALL_MAX] {
+            assert_eq!(encode_int(n), encode_inline(&Value::Int(n)));
+            assert!(encode_int(n).is_some());
+        }
+        for n in [SMALL_MIN - 1, SMALL_MAX + 1, i64::MIN, i64::MAX] {
+            assert_eq!(encode_int(n), None);
         }
     }
 

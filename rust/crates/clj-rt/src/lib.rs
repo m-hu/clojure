@@ -8,19 +8,30 @@
 
 //! AOT runtime archive for compiled Clojure binaries (T1174 S8B).
 //!
-//! [`abi`] exposes the `extern "C"` helper ABI over opaque `*mut
-//! Value` boxes; [`runtime`] holds the process-global booted
-//! evaluator the primitive helpers delegate to. The crate links
-//! LLVM-free (`clj-eval + clj-value` only) so built binaries stay
-//! small and link anywhere.
+//! [`abi`] exposes the `extern "C"` helper ABI over `u64` handles
+//! (Z3 — no pointer crosses the boundary); [`runtime`] holds the
+//! process-global booted evaluator the primitive helpers delegate
+//! to, plus the handle table folded in under the single lock. The
+//! crate links LLVM-free (`clj-eval + clj-value` only) so built
+//! binaries stay small and link anywhere.
 //!
 //! Ownership (S8 plan D7/D8): helper arguments are consumed, the
-//! return is owned, [`abi::rt_clone`] borrows, [`abi::rt_drop`]
-//! frees, and generated code clones locals on every use and drops
-//! all frame slots at scope end. Fallible helpers return null on
-//! error (after printing `path:line:col: Class: message`); the
-//! generated code null-checks and exits 1 — the library itself
-//! never exits, so every line stays unit-coverable.
+//! return is owned, [`abi::rt_clone`] bumps (inline scalars:
+//! identity), [`abi::rt_drop`] frees, and generated code clones
+//! locals on every use and drops all frame slots at scope end.
+//! Fallible helpers return `0` on error (after printing
+//! `path:line:col: Class: message`); the generated code
+//! zero-checks and exits 1 — the library itself never exits, so
+//! every line stays unit-coverable.
+
+// Literal-zero ratchet (Z3): `handles` and `runtime` carry
+// `#![forbid(unsafe_code)]` (see those files). The crate root
+// cannot: `#[unsafe(no_mangle)]` counts as `unsafe_code`, so a
+// crate-level forbid rejects the ABI exports themselves (probed
+// both spellings × editions 2021/2024 — all fail). `abi` stays
+// lint-clean by construction instead, backstopped by the geiger
+// gate (any `unsafe` there grows the workspace total and fails
+// CI) plus eyeball review of the `def_prim!` expansion.
 
 // The `usize` FFI widths assume a 64-bit host (R1 finding 8):
 // refuse a 32-bit build at compile time (costs no coverage).
@@ -42,7 +53,7 @@ pub(crate) mod runtime;
 pub use abi::{
     prim_symbol, rt_add, rt_args_new, rt_args_push, rt_argv, rt_arity_error, rt_bool, rt_clone,
     rt_conj, rt_count, rt_double, rt_drop, rt_eq, rt_ge, rt_get, rt_gt, rt_int, rt_is_truthy,
-    rt_keyword, rt_le, rt_live_count, rt_lt, rt_mul, rt_nil, rt_nth, rt_print, rt_quot, rt_str,
+    rt_keyword, rt_le, rt_live_count, rt_lt, rt_mul, rt_nil, rt_nth, rt_print, rt_quot,
     rt_str_chunk, rt_str_finish, rt_str_get, rt_str_new, rt_str_register, rt_sub, rt_vec_new,
-    rt_vec_push,
+    rt_vec_push, test_take,
 };

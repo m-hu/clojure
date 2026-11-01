@@ -6,30 +6,36 @@
 // the terms of this license.
 // You must not remove this notice, or any other, from this software.
 
-//! The audited `unsafe` boundary: `extern "C"` helpers over opaque
-//! `*mut Value` boxes (S8 plan D1/D2/D7).
+//! The safe `extern "C"` boundary: helpers over `u64` handles
+//! (Z3; S8 plan D1/D2/D7 retargeted — no pointer crosses).
 //!
 //! Contract (enforced by S8C codegen, documented per shim):
-//! pointers are non-null and valid; helper arguments are consumed
-//! (each box freed exactly once); the return is owned (null on
-//! error — the generated code null-checks and exits 1); byte
-//! slices are valid for their length. Violating the contract is a
-//! caller bug and instant UB — the shims do not null-check (the
-//! FFI boundary is internal to a built binary, not a public C
-//! API), except [`rt_vec_push`]'s wrong-type arm, which degrades
-//! to a fresh vector so the line stays meaningful.
+//! helper arguments are consumed (each handle dropped exactly
+//! once); the return is owned (`0` on error — the generated code
+//! zero-checks and exits 1, exactly where the old null check ran).
+//! Strings arrive chunked as scalars and live in the startup
+//! registry under str-ids; arg lists ride an accumulator the
+//! prim/print call always consumes, on error paths too.
+//!
+//! Every shim is total: stale, wrong-tag, and invalid handles
+//! degrade gracefully and deterministically (drops are silent,
+//! value positions yield `0` or a substitute — never UB, never a
+//! panic across the boundary). Generations make stale use
+//! fail-stop at the caller's zero check instead of touching a
+//! recycled slot. The shims never panic: unexpected shapes are
+//! caller (codegen) bugs, and the graceful arms keep them loud
+//! (fail-stop `0`) or documented (silent substitutes).
 //!
 //! Every shim is `#[unsafe(no_mangle)]` so the platform link finds the
 //! plain `rt_*` symbols in the static archive.
 
-use std::ffi::{CStr, c_char};
-use std::ptr;
 use std::sync::Arc;
 
 use clj_eval::{NativeError, Prim};
-use clj_value::{Keyword, List, Value, Vector};
+use clj_value::{Keyword, Value, Vector};
 
-use crate::runtime::{RUNTIME, call_prim, error_line, print_join};
+use crate::handles;
+use crate::runtime::{RUNTIME, Runtime, argv_from, call_prim_with, error_line, print_join};
 
 /// The `extern "C"` symbol lowering [`Prim`] calls to (S8C
 /// codegen's single source of truth — no parallel table).
@@ -52,263 +58,220 @@ pub fn prim_symbol(prim: Prim) -> &'static str {
     }
 }
 
-/// Borrow a caller byte slice.
-unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    // Safety: the caller guarantees validity (see module docs).
-    unsafe { std::slice::from_raw_parts(ptr, len) }
+/// Resolve a baked path id for an error line (missing ids —
+/// codegen bugs — degrade to a marker, never panic).
+fn error_path(rt: &Runtime, path_id: u64) -> Arc<str> {
+    rt.str_get(path_id)
+        .unwrap_or_else(|| Arc::from("<bad-str-id>"))
 }
 
-/// Decode a caller byte string (lossy — codegen only ever passes
-/// valid UTF-8, so the lossy arm never fires in practice).
-unsafe fn text(ptr: *const u8, len: usize) -> String {
-    String::from_utf8_lossy(unsafe { bytes(ptr, len) }).into_owned()
-}
-
-/// Box a fresh owned value for the caller.
-fn give(value: Value) -> *mut Value {
-    Box::into_raw(Box::new(value))
-}
-
-/// Take ownership of a caller box.
-unsafe fn take(ptr: *mut Value) -> Value {
-    // Safety: the caller transfers ownership (see module docs).
-    unsafe { *Box::from_raw(ptr) }
-}
-
-/// Take ownership of every box in a caller array (the array
-/// itself stays caller-owned — only the boxes move).
-unsafe fn take_args(args: *const *mut Value, argc: usize) -> Vec<Value> {
-    // Safety: the caller guarantees a valid array (see module docs).
-    let items = unsafe { std::slice::from_raw_parts(args, argc) };
-    items.iter().map(|ptr| unsafe { take(*ptr) }).collect()
-}
-
-/// One `nil` box.
-#[unsafe(no_mangle)]
-pub extern "C" fn rt_nil() -> *mut Value {
-    give(Value::Nil)
-}
-
-/// One boolean box: `0` is false, anything else true.
-#[unsafe(no_mangle)]
-pub extern "C" fn rt_bool(flag: u8) -> *mut Value {
-    give(Value::Bool(flag != 0))
-}
-
-/// One integer box.
-#[unsafe(no_mangle)]
-pub extern "C" fn rt_int(n: i64) -> *mut Value {
-    give(Value::Int(n))
-}
-
-/// One double box.
-#[unsafe(no_mangle)]
-pub extern "C" fn rt_double(x: f64) -> *mut Value {
-    give(Value::Double(x))
-}
-
-/// One string box decoding `len` bytes at `ptr`.
-///
-/// # Safety
-///
-/// `ptr` must be valid for `len` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_str(ptr: *const u8, len: usize) -> *mut Value {
-    give(Value::Str(Arc::from(unsafe { text(ptr, len) }.as_str())))
-}
-
-/// One keyword box: `name` is required; the `ns` slice is read
-/// only when `has_ns` is nonzero (`0` is unqualified — the slice
-/// must still be valid, but is never read).
-///
-/// # Safety
-///
-/// Both byte slices must be valid for their lengths.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_keyword(
-    name_ptr: *const u8,
-    name_len: usize,
-    ns_ptr: *const u8,
-    ns_len: usize,
-    has_ns: u8,
-) -> *mut Value {
-    let name = unsafe { text(name_ptr, name_len) };
-    let ns = if has_ns != 0 {
-        Some(unsafe { text(ns_ptr, ns_len) })
-    } else {
-        None
-    };
-    give(Value::Keyword(Keyword::new(ns.as_deref(), &name)))
-}
-
-/// One empty vector box.
-#[unsafe(no_mangle)]
-pub extern "C" fn rt_vec_new() -> *mut Value {
-    give(Value::Vector(Vector::from_vec(Vec::new())))
-}
-
-/// Push the owned `elem` box onto the owned `vec` box in place
-/// and return `vec` for chaining (a non-vector `vec` is a caller
-/// bug — it degrades to a fresh single-element vector).
-///
-/// # Safety
-///
-/// Both boxes must be valid; `elem` is consumed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_vec_push(vec: *mut Value, elem: *mut Value) -> *mut Value {
-    let elem = unsafe { take(elem) };
-    // Safety: the caller guarantees a valid box (see module docs).
-    let slot = unsafe { &mut *vec };
-    let old = std::mem::replace(slot, Value::Nil);
-    *slot = match old {
-        Value::Vector(items) => Value::Vector(items.push_back(elem)),
-        _ => Value::Vector(Vector::from_vec(vec![elem])),
-    };
-    vec
-}
-
-/// The `*command-line-args*` value from C `argc`/`argv` (T1192
-/// FX1 D-argv): `argv[0]` (the program name) is skipped; no
-/// remaining args is nil, else a list of strings — the JVM
-/// shape (fx1-argv probe). Bytes decode lossy (like the JVM's
-/// platform decode).
-///
-/// # Safety
-///
-/// `argv` must be valid for `argc` entries (`argc >= 0`), each a
-/// valid NUL-terminated C string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_argv(argv: *const *const c_char, argc: i32) -> *mut Value {
-    let mut items = Vec::new();
-    // Safety: the caller guarantees validity (see module docs).
-    for i in 1..argc {
-        let entry = unsafe { *argv.offset(i as isize) };
-        let text = unsafe { CStr::from_ptr(entry) }
-            .to_string_lossy()
-            .into_owned();
-        items.push(Value::Str(Arc::from(text.as_str())));
-    }
-    if items.is_empty() {
-        give(Value::Nil)
-    } else {
-        give(Value::List(List::from_vec(items)))
+/// Take a keyword part handle into text (stale handles and
+/// non-`Str` parts degrade to empty — codegen always passes
+/// interned strings).
+fn keyword_part(rt: &mut Runtime, handle: u64) -> String {
+    match rt.take_handle(handle) {
+        Some(Value::Str(text)) => text.to_string(),
+        _ => String::new(),
     }
 }
 
-/// Clone the borrowed box into a fresh owned box.
-///
-/// # Safety
-///
-/// `value` must be a valid box (borrowed, never freed here).
+/// One `nil` handle (inline constant — no lock, no table).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_clone(value: *const Value) -> *mut Value {
-    // Safety: the caller guarantees a valid box (see module docs).
-    give(unsafe { (*value).clone() })
+pub extern "C" fn rt_nil() -> u64 {
+    handles::NIL_HANDLE
 }
 
-/// Free the owned box.
-///
-/// # Safety
-///
-/// `value` must be a valid box, freed exactly once.
+/// One boolean handle: `0` is false, anything else true (inline
+/// constant — no lock, no table).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_drop(value: *mut Value) {
-    drop(unsafe { take(value) });
+pub extern "C" fn rt_bool(flag: u8) -> u64 {
+    if flag != 0 {
+        handles::TRUE_HANDLE
+    } else {
+        handles::FALSE_HANDLE
+    }
 }
 
-/// Consume the box and report Clojure truthiness: `0` for nil
-/// and false, `1` for everything else (the `if` test).
-///
-/// # Safety
-///
-/// `value` must be a valid box, consumed.
+/// One integer handle (small ints inline lock-free; out-of-range
+/// ints ride a value slot — same `Value::Int` either way).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_is_truthy(value: *mut Value) -> u8 {
-    u8::from(unsafe { take(value) }.is_truthy())
+pub extern "C" fn rt_int(n: i64) -> u64 {
+    match handles::encode_int(n) {
+        Some(handle) => handle,
+        None => RUNTIME
+            .lock()
+            .expect("clj-rt evaluator lock")
+            .give(Value::Int(n)),
+    }
 }
 
-/// The `print` intrinsic: consume the boxes, write the
+/// One double handle (doubles ride value slots — a full `i64`
+/// beside them leaves no tag room inline).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_double(x: f64) -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .give(Value::Double(x))
+}
+
+/// One keyword handle from two string handles (the L1 pick):
+/// `name` is required; the `ns` handle is consumed but only read
+/// when `has_ns` is nonzero (`0` is unqualified — codegen passes
+/// the registered empty string, mirroring the old slice shape).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_keyword(name: u64, ns: u64, has_ns: u8) -> u64 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    let name = keyword_part(&mut rt, name);
+    let namespace = keyword_part(&mut rt, ns);
+    let keyword = if has_ns != 0 {
+        Keyword::new(Some(namespace.as_str()), name.as_str())
+    } else {
+        Keyword::new(None, name.as_str())
+    };
+    rt.give(Value::Keyword(keyword))
+}
+
+/// One empty vector handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_vec_new() -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .give(Value::Vector(Vector::from_vec(Vec::new())))
+}
+
+/// Push the owned `elem` handle onto the owned `vec` slot in
+/// place and return `vec` for chaining (a live non-vector slot
+/// is overwritten, parity with the old wrong-type arm; a dead,
+/// slotless, or wrong-tag `vec` is a caller bug — it degrades to
+/// a fresh single-element vector).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_vec_push(vec: u64, elem: u64) -> u64 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    let elem = rt.take_handle(elem).unwrap_or(Value::Nil);
+    rt.vec_push_value(vec, elem)
+}
+
+/// The `*command-line-args*` value, read from the process
+/// environment (T1192 FX1 D-argv via [`argv_from`]): `argv[0]`
+/// is skipped; no remaining args is nil, else a list of strings.
+/// Zero params — generated `main` ignores its C `argc`/`argv`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_argv() -> u64 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    let value = argv_from(std::env::args_os());
+    rt.give(value)
+}
+
+/// Clone a handle (inline: identity; table: refcount bump;
+/// stale: `0` — fail-stop at the caller's null check).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_clone(handle: u64) -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .clone_handle(handle)
+}
+
+/// Drop a handle (table: dec, free at zero; inline and stale:
+/// silent no-op).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_drop(handle: u64) {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .drop_handle(handle);
+}
+
+/// Consume the handle and report Clojure truthiness: `0` for nil
+/// and false, `1` for everything else (the `if` test; stale
+/// handles read false).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_is_truthy(handle: u64) -> u8 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    u8::from(
+        rt.take_handle(handle)
+            .is_some_and(|value| value.is_truthy()),
+    )
+}
+
+/// The `print` intrinsic: consume the acc, write the
 /// space-joined rendering with NO trailing newline, return nil.
-///
-/// # Safety
-///
-/// `args` must be a valid array of `argc` valid boxes, consumed.
+/// Infallible (stale accs read empty, stale args read nil —
+/// print sites carry no null check, so this must never fail).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_print(args: *const *mut Value, argc: usize) -> *mut Value {
-    let owned = unsafe { take_args(args, argc) };
+pub extern "C" fn rt_print(acc: u64) -> u64 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    let owned = rt.print_take_args(acc);
     print!("{}", print_join(&owned));
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    give(Value::Nil)
+    rt.give(Value::Nil)
 }
 
 /// A sibling call with the wrong arg count: always fails with the
-/// shared arity text over the stable `user/name` display.
-///
-/// # Safety
-///
-/// Both byte slices must be valid for their lengths.
+/// shared arity text over the stable `user/name` display (both
+/// baked as str-ids), returning `0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_arity_error(
-    display: *const u8,
-    display_len: usize,
-    got: usize,
-    path: *const u8,
-    path_len: usize,
+pub extern "C" fn rt_arity_error(
+    display_id: u64,
+    got: u64,
+    path_id: u64,
     line: u32,
     col: u32,
-) -> *mut Value {
-    let err = NativeError::arity(&unsafe { text(display, display_len) }, got);
-    let path = unsafe { text(path, path_len) };
+) -> u64 {
+    let rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    let display = error_path(&rt, display_id);
+    let path = error_path(&rt, path_id);
+    let err = NativeError::arity(&display, usize::try_from(got).unwrap_or(usize::MAX));
     eprintln!("{}", error_line(&path, line, col, &err));
-    ptr::null_mut()
+    0
 }
 
-/// The shared primitive body: consume the boxes, call the shared
-/// native, box the result — or print `path:line:col: Class:
-/// message` and return null.
-///
-/// # Safety
-///
-/// `args` must be a valid array of `argc` valid boxes,
-/// consumed; the path slice must be valid for its length.
-unsafe fn prim_call(
-    index: usize,
-    args: *const *mut Value,
-    argc: usize,
-    path: *const u8,
-    path_len: usize,
-    line: u32,
-    col: u32,
-) -> *mut Value {
-    let owned = unsafe { take_args(args, argc) };
-    match call_prim(index, owned) {
-        Ok(value) => give(value),
+/// The shared primitive body: take the acc, resolve every arg,
+/// drop every arg handle (on every path — the leak counter never
+/// trips), call the shared native, give the result — or print
+/// `path:line:col: Class: message` and return `0`.
+fn prim_call(index: usize, acc: u64, path_id: u64, line: u32, col: u32) -> u64 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    let Some(arg_handles) = rt.acc_take(acc) else {
+        let path = error_path(&rt, path_id);
+        eprintln!("{path}:{line}:{col}: internal error: stale arg accumulator");
+        return 0;
+    };
+    let mut owned = Vec::with_capacity(arg_handles.len());
+    for handle in &arg_handles {
+        match rt.resolve_handle(*handle) {
+            Some(value) => owned.push(value),
+            None => {
+                for handle in &arg_handles {
+                    rt.drop_handle(*handle);
+                }
+                let path = error_path(&rt, path_id);
+                eprintln!("{path}:{line}:{col}: internal error: stale arg handle");
+                return 0;
+            }
+        }
+    }
+    for handle in &arg_handles {
+        rt.drop_handle(*handle);
+    }
+    match call_prim_with(&mut rt, index, owned) {
+        Ok(value) => rt.give(value),
         Err(err) => {
-            let path = unsafe { text(path, path_len) };
+            let path = error_path(&rt, path_id);
             eprintln!("{}", error_line(&path, line, col, &err));
-            ptr::null_mut()
+            0
         }
     }
 }
 
 macro_rules! def_prim {
     ($shim:ident, $index:expr) => {
-        #[doc = "One closed-set primitive (see `prim_call`): consume the boxes, call the shared native."]
-        #[doc = ""]
-        #[doc = " # Safety"]
-        #[doc = ""]
-        #[doc = " `args` must be a valid array of `argc` valid boxes, consumed;"]
-        #[doc = " the path slice must be valid for its length."]
+        #[doc = "One closed-set primitive (see `prim_call`): take the acc, call the shared native."]
         #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $shim(
-            args: *const *mut Value,
-            argc: usize,
-            path: *const u8,
-            path_len: usize,
-            line: u32,
-            col: u32,
-        ) -> *mut Value {
-            unsafe { prim_call($index, args, argc, path, path_len, line, col) }
+        pub extern "C" fn $shim(acc: u64, path_id: u64, line: u32, col: u32) -> u64 {
+            prim_call($index, acc, path_id, line, col)
         }
     };
 }
@@ -327,10 +290,9 @@ def_prim!(rt_nth, 10);
 def_prim!(rt_get, 11);
 def_prim!(rt_conj, 12);
 
-// The handle-table shims (Z3 step 1, additive): integer-only
-// signatures, safe bodies — no pointer crosses the boundary.
-// They coexist with the pointer shims above; the flip commit
-// deletes the pointer half and retargets codegen here.
+// The handle-table construction shims (landed additive in Z3
+// step 1): integer-only signatures, safe bodies — no pointer
+// crosses the boundary.
 
 /// A fresh arg accumulator (pushed, then consumed exactly once
 /// by a prim/print call — the call drops it on every path
@@ -402,4 +364,16 @@ pub extern "C" fn rt_str_finish(builder: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_live_count() -> u64 {
     RUNTIME.lock().expect("clj-rt evaluator lock").live_count()
+}
+
+/// Take a handle into an owned value for the FFI tests (panics
+/// on stale handles — test-loud by design). Test support only:
+/// plain Rust, not `extern`, never emitted by codegen.
+#[doc(hidden)]
+pub fn test_take(handle: u64) -> Value {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .take_handle(handle)
+        .expect("test handle resolves")
 }

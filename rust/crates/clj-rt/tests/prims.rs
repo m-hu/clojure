@@ -6,6 +6,7 @@
 // the terms of this license.
 // You must not remove this notice, or any other, from this software.
 
+#![forbid(unsafe_code)]
 //! Primitive helpers, called through the real FFI boundary (no
 //! LLVM): every case runs BOTH the helper and the interpreter on
 //! the same form — the renders must match each other AND the
@@ -20,19 +21,17 @@ use cljrt::{
     prim_symbol, rt_add, rt_conj, rt_count, rt_eq, rt_ge, rt_get, rt_gt, rt_le, rt_lt, rt_mul,
     rt_nth, rt_quot, rt_sub,
 };
-use support::{inbox, render};
+use support::{acc, inbox, render, str_id};
 
-type Shim =
-    unsafe extern "C" fn(*const *mut Value, usize, *const u8, usize, u32, u32) -> *mut Value;
+type Shim = extern "C" fn(u64, u64, u32, u32) -> u64;
 
 /// Call a helper exactly like generated code does (error renders
 /// as `ERROR`; the `path:line:col:` prefix is pinned by the
 /// `error_line` unit tests and the S8D replay).
 fn ffi(shim: Shim, args: Vec<Value>) -> String {
-    let boxes: Vec<*mut Value> = args.into_iter().map(inbox).collect();
-    let path = b"f.clj";
-    let out = unsafe { shim(boxes.as_ptr(), boxes.len(), path.as_ptr(), path.len(), 3, 9) };
-    if out.is_null() {
+    let handles: Vec<u64> = args.into_iter().map(inbox).collect();
+    let out = shim(acc(handles), str_id("f.clj"), 3, 9);
+    if out == 0 {
         "ERROR".to_owned()
     } else {
         render(out)
