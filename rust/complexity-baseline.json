@@ -65,55 +65,6 @@
    "justification": "pure enum-to-name string table, one arm per ThrowClass variant; fence 4b F8b adds the IllegalMonitorStateException arm, tripping the 15-arm threshold"
   },
   {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "aset_direct",
-   "cyclomatic": 25.0,
-   "cognitive": 2.0,
-   "justification": "S15: one arm per (BaseType, dims, val-shape) overload match; the direct-aset shape table stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "aset_raw",
-   "cyclomatic": 16.0,
-   "cognitive": 7.0,
-   "justification": "S15: one arm per BaseType unbox rule; the Array.set tail table stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "ctor_init",
-   "cyclomatic": 35.0,
-   "cognitive": 22.0,
-   "justification": "S15: one arm per (ctor, scalar-vs-seq-vs-size) shape incl. per-base narrowing/cast rules; the ctor dispatch stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "native_vector_of",
-   "cyclomatic": 18.0,
-   "cognitive": 5.0,
-   "justification": "S15: keyword dispatch plus per-Elem8 validation; the vector-of front stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "setx_coerce",
-   "cyclomatic": 16.0,
-   "cognitive": 1.0,
-   "justification": "S15: one arm per SetX coercion; the def-aset table stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "store_raw_ref",
-   "cyclomatic": 16.0,
-   "cognitive": 12.0,
-   "justification": "S15: ref-tail assignability per store shape; the narrow/dims>1 matrix stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/arrays.rs",
-   "function": "vector_coerce",
-   "cyclomatic": 16.0,
-   "cognitive": 1.0,
-   "justification": "S15: one arm per Elem8 ArrayManager coercion; the vector-of table stays exhaustive"
-  },
-  {
    "file": "crates/clj-eval/src/coll.rs",
    "function": "conj_one",
    "cyclomatic": 16.0,
