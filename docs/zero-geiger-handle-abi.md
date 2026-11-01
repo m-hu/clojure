@@ -149,7 +149,12 @@ Pointers are banned from every signature — including the byte slices
   `rt_args_new() → u64`, `rt_args_push(acc: u64, h: u64)`,
   consumed by the prim/print call. No `alloca [N x ptr]`, no GEP,
   no `take_args` deref chain. Args resolve to `Vec<Value>` under one
-  table lock hold (§4.3).
+  table lock hold (§4.3). Ownership: prim/print entry points take
+  acc ownership and drop the acc — with every arg handle — on
+  every path including errors, so the test-mode leak counter
+  never trips on error paths; codegen creates the acc only after
+  all args lower, so no acc is ever live across a possibly-
+  diverging arg lowering.
 - `argv`: `rt_argv(argc: i32, argv: ptr)` cannot survive either.
   Replacement: **`rt_argv() → u64`, zero params**, reading
   `std::env::args_os()` (lossy decode, skip index 0 — same
@@ -340,3 +345,90 @@ residual risks each have a check (§6). The one must-verify spike
 before committing: an inkwell-emitted handle-shaped module compiled
 under `#![forbid(unsafe_code)]` (risk 4). Estimated ~1300–1500 lines
 over 2–4 stacked PRs, std-only, no `Value`/planner/corpus changes.
+## 10. Kickoff resolutions (implementation, Z3-impl)
+
+Recorded at implementation kickoff; binding on the migration
+commits. (§2.5/§6.6 L2, M1, and both L1s close here.)
+
+### M1 — strings: startup-registration wins, per-use stays fallback
+
+Codegen registers each unique literal once in the `main`
+prologue (chunked `rt_str_new` + N× `rt_str_chunk` +
+`rt_str_register(id)`); use sites become single
+`rt_str_get(id)` calls. Rationale: (a) hot-path cost — a use
+site is 1 call regardless of literal size (vs 1+ceil(L/8) per
+execution under per-use chunking, paid every loop iteration);
+(b) it composes with the existing `Lower::strings` interning
+(the map becomes literal → str-id); (c) retention parity —
+today's LLVM string globals are also process-lifetime; (d) it
+synergizes with the L1 keyword pick (two `rt_str_get` + one
+`rt_keyword`). Ordering is safe: all execution flows from
+`main` (tops, then `-main`), and defns only run when called
+from that flow, so the prologue always precedes every use
+(AOT and JIT alike). Per-use chunking stays available through
+`rt_str_finish` (tests use it; it is the accepted fallback if
+prologue insertion ever misbehaves).
+
+### L1 — keywords: two str-handles (reviewer's recommendation)
+
+`rt_keyword(name: u64, ns: u64, has_ns: u8)` consumes two
+`rt_str_get` handles (the `ns` handle is consumed — dropped —
+even when `has_ns` is 0; unqualified keywords pass the
+registered empty string, mirroring today's `const_str("")`).
+One symbol instead of a `new/push_part` pair.
+
+### L1 — accumulator ownership on error paths (spec line)
+
+Prim/print entry points take acc ownership and drop the acc —
+with every arg handle — on every path including errors, so
+the test-mode leak counter never trips on error paths;
+codegen creates the acc only after all args lower, so no acc
+is ever live across a possibly-diverging arg lowering. (The
+impl test pins `live_count` across a prim arity-error, a
+prim domain-error, a print call, and a sibling arity-error.)
+
+### Risk 4 — inkwell safe-API coverage: SPIKE PASS
+
+A handle-shaped module (i64 decls/calls/slots/phis,
+zero-sentinel `icmp`, no GEP) compiled AND ran under
+`#![forbid(unsafe_code)]` (throwaway
+`clj-aot/tests/risk4_spike.rs`, 2026-11-01). Every builder
+call the flip needs (`build_alloca/load/store/call/return/
+branch/phi/int_compare/is_null/unreachable/position_at`) is a
+safe `fn`; only the GEP family is `unsafe fn`, and the flip
+deletes all GEP use. Side note: `JitFunction::call` is
+`unsafe fn` (inkwell 0.10.0 `execution_engine.rs`), so
+`jit.rs` keeps inherent unsafety — see the geiger note below.
+
+### L2 — geiger reconciliation (fresh run, 2026-11-01)
+
+`cargo geiger` workspace-wide (0.13.0, per-member own counts
+as the gate sums them): clj-rt 110 + clj-aot 16 + clj-eval 8
++ clj-value/core/reader/repl 0 + clojure-rs rollup 134 =
+**268**, exactly matching `geiger-baseline.json` (no drift;
+the §2.5/§6.6 figures 252/260 were stale/pre-G1 trees). The
+§2.5 table is superseded by this run: the clj-rt 110 is the
+§2.1 shim surface, the clj-aot 16 covers the §2.2 GEP pair
+plus the `jit.rs` EE surface (Gap-121 slice 1, landed after
+the spec survey — the `MainFn` type plus the
+entry-lookup-and-call block), and the clj-eval 8 is the
+Gap-124 env-helper edition-2024 sites (G1's track).
+Consequence per open question 6: Z3 zeroes its own surface
+(clj-rt lib + lower.rs + rewritten FFI tests); the ledger
+lands at the measured floor (jit.rs inherent + G1 env
+remainder) and hits literal 0 only after G1's subprocess
+form and a JIT follow-up. The step-2 commit message records
+the achieved number with this per-crate split.
+
+### Inline-range correction (spec §3.1/OQ3 deviation)
+
+"Int (full i64 fits)" is unimplementable: a full `i64` alone
+consumes all 2^64 codepoints, so no tagged scheme with a `0`
+sentinel can inline it (nor `Double` beside it) — and
+NaN-boxing stays out per the spec. Implemented instead:
+61-bit small-int inline (±2^60, tag `100`), out-of-range
+ints and doubles ride value slots (semantics identical —
+`Value::Int`/`Value::Double` either way). Scalar payloads
+under tag `010` (nil/false/true) and `char` under `011` are
+as specified. `rt_double` keeps its `f64` parameter (safe,
+by-value — no unsafety to remove).

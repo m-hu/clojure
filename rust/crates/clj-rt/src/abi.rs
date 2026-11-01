@@ -29,7 +29,7 @@ use std::sync::Arc;
 use clj_eval::{NativeError, Prim};
 use clj_value::{Keyword, List, Value, Vector};
 
-use crate::runtime::{call_prim, error_line, print_join};
+use crate::runtime::{RUNTIME, call_prim, error_line, print_join};
 
 /// The `extern "C"` symbol lowering [`Prim`] calls to (S8C
 /// codegen's single source of truth — no parallel table).
@@ -326,3 +326,80 @@ def_prim!(rt_count, 9);
 def_prim!(rt_nth, 10);
 def_prim!(rt_get, 11);
 def_prim!(rt_conj, 12);
+
+// The handle-table shims (Z3 step 1, additive): integer-only
+// signatures, safe bodies — no pointer crosses the boundary.
+// They coexist with the pointer shims above; the flip commit
+// deletes the pointer half and retargets codegen here.
+
+/// A fresh arg accumulator (pushed, then consumed exactly once
+/// by a prim/print call — the call drops it on every path
+/// including errors, so the leak counter never trips).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_args_new() -> u64 {
+    RUNTIME.lock().expect("clj-rt evaluator lock").acc_new()
+}
+
+/// Push a value handle onto an acc (ownership transfers);
+/// returns the acc, `0`-propagating on stale accs.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_args_push(acc: u64, handle: u64) -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .acc_push(acc, handle)
+}
+
+/// A fresh string builder (chunked scalar construction).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_str_new() -> u64 {
+    RUNTIME.lock().expect("clj-rt evaluator lock").builder_new()
+}
+
+/// Append the low `nbytes` of `chunk` (little-endian, clamped
+/// to 8); returns the builder, `0`-propagating on stale ones.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_str_chunk(builder: u64, chunk: u64, nbytes: u8) -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .builder_chunk(builder, chunk, nbytes)
+}
+
+/// Intern built text under a startup str-id (the `main`
+/// prologue path); returns the id for chaining.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_str_register(id: u64, builder: u64) -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .str_register(id, builder)
+}
+
+/// Fetch interned text as a fresh owned string (`0` for
+/// missing ids — fail-stop at the caller's null check).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_str_get(id: u64) -> u64 {
+    let mut rt = RUNTIME.lock().expect("clj-rt evaluator lock");
+    match rt.str_get(id) {
+        Some(text) => rt.give(Value::Str(text)),
+        None => 0,
+    }
+}
+
+/// Finish a builder into an owned string value (the per-use
+/// fallback); stale builders yield `0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_str_finish(builder: u64) -> u64 {
+    RUNTIME
+        .lock()
+        .expect("clj-rt evaluator lock")
+        .str_finish(builder)
+}
+
+/// Live handle occupancy for the leak-counter tests (test
+/// support — codegen never emits it).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_live_count() -> u64 {
+    RUNTIME.lock().expect("clj-rt evaluator lock").live_count()
+}

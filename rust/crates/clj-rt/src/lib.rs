@@ -35,11 +35,14 @@ compile_error!("clj-rt requires a 64-bit host (usize FFI widths)");
 // tests link the normal rlib, where the shims exist.
 #[cfg(not(test))]
 pub mod abi;
+pub(crate) mod handles;
 pub(crate) mod runtime;
 
 #[cfg(not(test))]
 pub use abi::{
-    prim_symbol, rt_add, rt_argv, rt_arity_error, rt_bool, rt_clone, rt_conj, rt_count, rt_double,
-    rt_drop, rt_eq, rt_ge, rt_get, rt_gt, rt_int, rt_is_truthy, rt_keyword, rt_le, rt_lt, rt_mul,
-    rt_nil, rt_nth, rt_print, rt_quot, rt_str, rt_sub, rt_vec_new, rt_vec_push,
+    prim_symbol, rt_add, rt_args_new, rt_args_push, rt_argv, rt_arity_error, rt_bool, rt_clone,
+    rt_conj, rt_count, rt_double, rt_drop, rt_eq, rt_ge, rt_get, rt_gt, rt_int, rt_is_truthy,
+    rt_keyword, rt_le, rt_live_count, rt_lt, rt_mul, rt_nil, rt_nth, rt_print, rt_quot, rt_str,
+    rt_str_chunk, rt_str_finish, rt_str_get, rt_str_new, rt_str_register, rt_sub, rt_vec_new,
+    rt_vec_push,
 };
