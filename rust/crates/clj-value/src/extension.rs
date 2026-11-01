@@ -277,9 +277,6 @@ fn throw_parent(jvm_name: &str) -> Option<&'static str> {
         "java.lang.Throwable" => None,
         "java.lang.Exception" | "java.lang.Error" => Some("java.lang.Throwable"),
         "java.lang.RuntimeException" => Some("java.lang.Exception"),
-        "java.util.concurrent.ExecutionException" => Some("java.lang.Exception"),
-        "java.util.concurrent.CancellationException" => Some("java.lang.IllegalStateException"),
-        "java.util.concurrent.RejectedExecutionException" => Some("java.lang.RuntimeException"),
         "java.lang.NumberFormatException" => Some("java.lang.IllegalArgumentException"),
         "java.io.FileNotFoundException" => Some("java.io.IOException"),
         "java.io.IOException" => Some("java.lang.Exception"),
@@ -300,6 +297,17 @@ fn throw_parent(jvm_name: &str) -> Option<&'static str> {
         | "clojure.lang.ExceptionInfo"
         | "clojure.lang.Compiler$CompilerException"
         | "clojure.lang.LispReader$ReaderException" => Some("java.lang.RuntimeException"),
+        _ => throw_parent_concurrent(jvm_name),
+    }
+}
+
+/// The `java.util.concurrent` branch of [`throw_parent`] (split
+/// for the complexity budget; chains into [`throw_parent_rest`]).
+fn throw_parent_concurrent(jvm_name: &str) -> Option<&'static str> {
+    match jvm_name {
+        "java.util.concurrent.ExecutionException" => Some("java.lang.Exception"),
+        "java.util.concurrent.CancellationException" => Some("java.lang.IllegalStateException"),
+        "java.util.concurrent.RejectedExecutionException" => Some("java.lang.RuntimeException"),
         _ => throw_parent_rest(jvm_name),
     }
 }

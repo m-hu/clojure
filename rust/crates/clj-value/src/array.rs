@@ -251,11 +251,7 @@ impl Array {
     pub fn snapshot(&self) -> Vec<Value> {
         match &*self.lock() {
             ArrayStore::Bools(v) => v.iter().map(|b| Value::Bool(*b)).collect(),
-            ArrayStore::Bytes(v) => v.iter().map(|b| Value::Int(i64::from(*b))).collect(),
             ArrayStore::Chars(v) => v.iter().map(|c| Value::Char(*c)).collect(),
-            ArrayStore::Shorts(v) => v.iter().map(|s| Value::Int(i64::from(*s))).collect(),
-            ArrayStore::Ints(v) => v.iter().map(|i| Value::Int(i64::from(*i))).collect(),
-            ArrayStore::Longs(v) => v.iter().map(|l| Value::Int(*l)).collect(),
             ArrayStore::Floats(v) | ArrayStore::Doubles(v) => {
                 v.iter().map(|d| Value::Double(*d)).collect()
             }
@@ -264,6 +260,9 @@ impl Array {
                 .iter()
                 .map(|o| o.clone().map(Value::Array).unwrap_or(Value::Nil))
                 .collect(),
+            // The integer stores box through `snapshot_int_store`
+            // (split for the complexity budget).
+            other => snapshot_int_store(other),
         }
     }
 
@@ -272,5 +271,19 @@ impl Array {
     #[must_use]
     pub fn shallow_clone(&self) -> Self {
         Self::new(self.desc.clone(), self.lock().clone())
+    }
+}
+
+/// The integer-store arms of [`Array::snapshot`] (split for the
+/// complexity budget): every slot widened to `Int`.
+fn snapshot_int_store(store: &ArrayStore) -> Vec<Value> {
+    match store {
+        ArrayStore::Bytes(v) => v.iter().map(|b| Value::Int(i64::from(*b))).collect(),
+        ArrayStore::Shorts(v) => v.iter().map(|s| Value::Int(i64::from(*s))).collect(),
+        ArrayStore::Ints(v) => v.iter().map(|i| Value::Int(i64::from(*i))).collect(),
+        ArrayStore::Longs(v) => v.iter().map(|l| Value::Int(*l)).collect(),
+        // All other stores are handled upstream (the single
+        // caller partitions the variants).
+        _ => unreachable!("snapshot partition"),
     }
 }

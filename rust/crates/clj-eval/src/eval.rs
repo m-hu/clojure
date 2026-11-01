@@ -1741,11 +1741,11 @@ impl Evaluator {
             ))),
             Value::Extension(_) => self.invoke_extension(callee, args),
             Value::Keyword(_) | Value::Symbol(_) => self.invoke_keyed_name(callee, args),
-            Value::Vector(v) => self.invoke_vector(v, args),
-            Value::PrimitiveVector(p) => self.invoke_pv(p, args),
-            Value::MapEntry { key, val, .. } => self.invoke_mapentry(key, val, args),
-            Value::Map(_) => self.invoke_map(callee, args),
-            Value::Set(s) => self.invoke_set(s, args),
+            Value::Vector(_)
+            | Value::PrimitiveVector(_)
+            | Value::MapEntry { .. }
+            | Value::Map(_)
+            | Value::Set(_) => self.invoke_coll(callee, args),
             Value::Var(v) => self.invoke_var(v, args),
             Value::Unbound(u) => Err(self.throw(NativeError::new(
                 ThrowClass::IllegalStateException,
@@ -1758,6 +1758,19 @@ impl Evaluator {
                 self.invoke(&value, args)
             }
             _ => Err(self.throw(NativeError::cast(&jvm_class_of(callee), "clojure.lang.IFn"))),
+        }
+    }
+
+    /// Invoke a collection as a function (split from
+    /// [`invoke`](Self::invoke) for the complexity budget).
+    fn invoke_coll(&mut self, callee: &Value, args: &[Value]) -> Result<Value, Signal> {
+        match callee {
+            Value::Vector(v) => self.invoke_vector(v, args),
+            Value::PrimitiveVector(p) => self.invoke_pv(p, args),
+            Value::MapEntry { key, val, .. } => self.invoke_mapentry(key, val, args),
+            Value::Map(_) => self.invoke_map(callee, args),
+            Value::Set(s) => self.invoke_set(s, args),
+            _ => unreachable!("invoke collection partition"),
         }
     }
 
@@ -2504,21 +2517,26 @@ impl Evaluator {
                 ))),
             },
             Value::MapEntry { key, val, .. } => Ok(map.insert(*key, *val)),
-            other => match self.seq_opt(&other)? {
-                None => Ok(map),
-                Some(l) => {
-                    // One pair per entry (Oracle FX2
-                    // `conj-seq-entries`); the first non-entry is
-                    // the `Map$Entry` cast error.
-                    for head in l.iter() {
-                        let Value::MapEntry { key, val, .. } = head else {
-                            return Err(self.throw(cast_entry(head)));
-                        };
-                        map = map.insert((**key).clone(), (**val).clone());
-                    }
-                    Ok(map)
+            other => self.conj_map_seq(map, other),
+        }
+    }
+
+    /// `conj` a seqable element onto a map (split from
+    /// [`conj_map`](Self::conj_map) for the complexity budget):
+    /// one pair per entry (Oracle FX2 `conj-seq-entries`); the
+    /// first non-entry is the `Map$Entry` cast error.
+    fn conj_map_seq(&mut self, mut map: Map, elem: Value) -> Result<Map, Signal> {
+        match self.seq_opt(&elem)? {
+            None => Ok(map),
+            Some(l) => {
+                for head in l.iter() {
+                    let Value::MapEntry { key, val, .. } = head else {
+                        return Err(self.throw(cast_entry(head)));
+                    };
+                    map = map.insert((**key).clone(), (**val).clone());
                 }
-            },
+                Ok(map)
+            }
         }
     }
 

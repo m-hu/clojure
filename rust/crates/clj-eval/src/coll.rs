@@ -18,9 +18,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use clj_value::{
-    ConsValue, List, Map, PrimitiveVector, Set, SortSpec, SubVectorValue, ThrowClass, Transient,
-    TransientError, TransientKind, TransientMap, TransientSet, TransientVector, Value, Vector,
-    new_map, new_set,
+    Array, ConsValue, List, Map, PrimitiveVector, Set, SortSpec, SubVectorValue, ThrowClass,
+    Transient, TransientError, TransientKind, TransientMap, TransientSet, TransientVector, Value,
+    Vector, new_map, new_set,
 };
 
 use crate::core::{cce_err, cce_message, is_counted, jvm_compare, nth_index};
@@ -93,31 +93,62 @@ pub(crate) fn lookup_present(
     }
     match coll {
         Value::Nil => Ok(None),
-        Value::Map(m) if m.is_sorted() => sorted_lookup_map(eval, m, key),
-        Value::Map(m) => Ok(m.get(key).cloned()),
+        Value::Map(m) => lookup_map_slot(eval, m, key),
         Value::Vector(x) => Ok(lookup_vector_slot(x, key)),
         Value::MapEntry {
             key: ek, val: ev, ..
         } => Ok(lookup_entry_slot(ek, ev, key)),
-        // Arrays narrow any `Number` key (`intValue`, lenient —
-        // OOB/non-`Number`/nil miss; S15 oracles `b-get`,
-        // `f-get-*`, `e-get-*`).
-        Value::Array(a) => Ok(crate::arrays::array_intvalue_key(key).and_then(|i| {
-            usize::try_from(i).ok().and_then(|idx| {
-                if idx < a.len() {
-                    Some(crate::arrays::array_read(a, idx))
-                } else {
-                    None
-                }
-            })
-        })),
+        Value::Array(a) => Ok(lookup_array_slot(a, key)),
         Value::PrimitiveVector(p) => Ok(lookup_pv_slot(p, key)),
-        Value::Set(s) if s.is_sorted() => Ok(sorted_lookup_set(eval, s, key)?),
-        Value::Set(s) => Ok(s.get(key).cloned()),
+        Value::Set(s) => lookup_set_slot(eval, s, key),
         Value::Str(s) => Ok(lookup_str_slot(s, key)),
         Value::Transient(t) => transient_get(t, key),
         other => lookup_present_fallback(other, key),
     }
+}
+
+/// A map slot (sorted maps resolve through the comparator; split
+/// from [`lookup_present`] for the complexity budget).
+fn lookup_map_slot(
+    eval: &mut Evaluator,
+    m: &Map,
+    key: &Value,
+) -> Result<Option<Value>, NativeError> {
+    if m.is_sorted() {
+        sorted_lookup_map(eval, m, key)
+    } else {
+        Ok(m.get(key).cloned())
+    }
+}
+
+/// A set slot (sorted sets resolve through the comparator; split
+/// from [`lookup_present`] for the complexity budget).
+fn lookup_set_slot(
+    eval: &mut Evaluator,
+    s: &Set,
+    key: &Value,
+) -> Result<Option<Value>, NativeError> {
+    if s.is_sorted() {
+        Ok(sorted_lookup_set(eval, s, key)?)
+    } else {
+        Ok(s.get(key).cloned())
+    }
+}
+
+/// An array slot (split from [`lookup_present`] for the complexity
+/// budget): any `Number` key narrows (`intValue`, lenient —
+/// OOB/non-`Number`/nil miss; S15 oracles `b-get`, `f-get-*`,
+/// `e-get-*`).
+fn lookup_array_slot(a: &Array, key: &Value) -> Option<Value> {
+    crate::arrays::array_intvalue_key(key).and_then(|i| {
+        usize::try_from(i).ok().and_then(|idx| {
+            if idx < a.len() {
+                Some(crate::arrays::array_read(a, idx))
+            } else {
+                None
+            }
+        })
+    })
 }
 
 fn lookup_vector_slot(x: &Vector, key: &Value) -> Option<Value> {
@@ -458,16 +489,21 @@ fn conj_one(eval: &mut Evaluator, coll: &Value, x: Value) -> Result<Value, Nativ
         Value::HostType(_) => conj_maplike(eval, coll, &x),
         Value::Set(s) if s.is_sorted() => Ok(Value::Set(sorted_conj_set(eval, s, x)?)),
         Value::Set(s) => Ok(Value::Set(s.clone().insert(x))),
-        _ => {
-            if let Some(sv) = as_subvector(coll) {
-                return Ok(subvector_conj(sv, x));
-            }
-            if is_seq_value(coll) {
-                return Ok(Value::Extension(Arc::new(ConsValue::new(x, coll.clone()))));
-            }
-            Err(cce_err(coll, "clojure.lang.IPersistentCollection"))
-        }
+        _ => conj_one_fallback(coll, x),
     }
+}
+
+/// Conj onto anything else (split from [`conj_one`] for the
+/// complexity budget): subvectors stay subvectors, seqs cons,
+/// anything else takes the collection cast.
+fn conj_one_fallback(coll: &Value, x: Value) -> Result<Value, NativeError> {
+    if let Some(sv) = as_subvector(coll) {
+        return Ok(subvector_conj(sv, x));
+    }
+    if is_seq_value(coll) {
+        return Ok(Value::Extension(Arc::new(ConsValue::new(x, coll.clone()))));
+    }
+    Err(cce_err(coll, "clojure.lang.IPersistentCollection"))
 }
 
 /// Conj onto a map-like host value (split from [`conj_one`] for
@@ -1252,32 +1288,37 @@ fn native_contains(eval: &mut Evaluator, args: &[Value]) -> Result<Value, Native
         Value::Nil => Ok(Value::Bool(false)),
         Value::Map(m) => contains_map(eval, m, key),
         Value::Vector(x) => Ok(Value::Bool(contains_vector(x, key))),
-        // Entries contain integer keys 0 and 1 (Oracle FX2 `contains`).
-        Value::MapEntry { .. } => {
-            Ok(Value::Bool(int_key(key).is_some_and(|i| {
-                usize::try_from(i as i32).is_ok_and(|idx| idx < 2)
-            })))
-        }
+        Value::MapEntry { .. } => Ok(Value::Bool(contains_entry(key))),
         Value::Set(s) => contains_set(eval, s, key),
         Value::Str(s) => contains_str(s, coll, key),
         Value::Transient(t) => Ok(Value::Bool(transient_get(t, key)?.is_some())),
-        // Arrays: `Number` keys narrow (`intValue`) to a bounds
-        // check, anything else is unsupported (S15 oracles
-        // `b-contains`, `f-contains-*`, `e-contains-nil`).
-        Value::Array(a) => {
-            let Some(i) = crate::arrays::array_intvalue_key(key) else {
-                return Err(NativeError::new(
-                    ThrowClass::IllegalArgumentException,
-                    format!("contains? not supported on type: {}", jvm_class_of(coll)),
-                ));
-            };
-            Ok(Value::Bool(
-                usize::try_from(i).is_ok_and(|idx| idx < a.len()),
-            ))
-        }
+        Value::Array(a) => contains_array(a, coll, key),
         Value::PrimitiveVector(p) => Ok(Value::Bool(contains_pv(p, key))),
         _ => contains_fallback(coll, key),
     }
+}
+
+/// `contains?` over an entry (split from [`native_contains`] for
+/// the complexity budget): integer keys 0 and 1 (Oracle FX2
+/// `contains`).
+fn contains_entry(key: &Value) -> bool {
+    int_key(key).is_some_and(|i| usize::try_from(i as i32).is_ok_and(|idx| idx < 2))
+}
+
+/// `contains?` over an array (split from [`native_contains`] for
+/// the complexity budget): `Number` keys narrow (`intValue`) to a
+/// bounds check, anything else is unsupported (S15 oracles
+/// `b-contains`, `f-contains-*`, `e-contains-nil`).
+fn contains_array(a: &Array, coll: &Value, key: &Value) -> Result<Value, NativeError> {
+    let Some(i) = crate::arrays::array_intvalue_key(key) else {
+        return Err(NativeError::new(
+            ThrowClass::IllegalArgumentException,
+            format!("contains? not supported on type: {}", jvm_class_of(coll)),
+        ));
+    };
+    Ok(Value::Bool(
+        usize::try_from(i).is_ok_and(|idx| idx < a.len()),
+    ))
 }
 
 fn native_find(eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeError> {
@@ -1371,6 +1412,28 @@ fn nth_walk(
     first_value(eval, &cur).map_err(signal_to_native)
 }
 
+/// `nth` over an array (split from [`native_nth`] for the
+/// complexity budget): `not-found` on OOB, else the empty
+/// `AIOOBE` (S15 oracles `a-nth`, `a-nth-nf`, `a-nth-oob`,
+/// `e-nth-float`, `n-arr-str`, `n-arr-nil`).
+fn nth_array(a: &Array, n: i32, not_found: Option<&Value>) -> Result<Value, NativeError> {
+    let found = usize::try_from(n).ok().and_then(|idx| {
+        if idx < a.len() {
+            Some(crate::arrays::array_read(a, idx))
+        } else {
+            None
+        }
+    });
+    match (found, not_found) {
+        (Some(v), _) => Ok(v),
+        (None, Some(nf)) => Ok(nf.clone()),
+        (None, None) => Err(NativeError::new(
+            ThrowClass::ArrayIndexOutOfBoundsException,
+            String::new(),
+        )),
+    }
+}
+
 /// `nth` over a string (chars; `StringIndexOutOfBounds` without `not-found`).
 fn nth_str(s: &str, n: i32, not_found: Option<&Value>) -> Result<Value, NativeError> {
     let found = usize::try_from(n)
@@ -1419,25 +1482,8 @@ pub(crate) fn native_nth(eval: &mut Evaluator, args: &[Value]) -> Result<Value, 
     {
         return nth_indexed(coll, n, not_found);
     }
-    // Arrays: `not-found` on OOB, else the empty `AIOOBE` (S15
-    // oracles `a-nth`, `a-nth-nf`, `a-nth-oob`, `e-nth-float`,
-    // `n-arr-str`, `n-arr-nil`).
     if let Value::Array(a) = coll {
-        let found = usize::try_from(n).ok().and_then(|idx| {
-            if idx < a.len() {
-                Some(crate::arrays::array_read(a, idx))
-            } else {
-                None
-            }
-        });
-        return match (found, not_found) {
-            (Some(v), _) => Ok(v),
-            (None, Some(nf)) => Ok(nf.clone()),
-            (None, None) => Err(NativeError::new(
-                ThrowClass::ArrayIndexOutOfBoundsException,
-                String::new(),
-            )),
-        };
+        return nth_array(a, n, not_found);
     }
     if let Value::Str(s) = coll {
         return nth_str(s, n, not_found);

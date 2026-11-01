@@ -1538,6 +1538,16 @@ impl Hash for Value {
     }
 }
 
+/// A primitive vector hashes exactly like its item vector
+/// (split from [`hash_value_mid`] for the complexity budget).
+fn hash_pv<H: Hasher>(p: &PrimitiveVector, state: &mut H) {
+    state.write_u8(8);
+    state.write_usize(p.len());
+    for v in p.iter() {
+        v.hash(state);
+    }
+}
+
 /// Length-prefixed magnitude bytes (ambiguity-free across
 /// adjacent fields).
 fn hash_bigint_bytes<H: Hasher>(n: &num_bigint::BigInt, state: &mut H) {
@@ -1559,13 +1569,7 @@ fn hash_value_mid<H: Hasher>(v: &Value, state: &mut H) {
         }
         // Primitive vectors hash exactly like their item vector
         // (they are `=` to it).
-        Value::PrimitiveVector(p) => {
-            state.write_u8(8);
-            state.write_usize(p.len());
-            for v in p.iter() {
-                v.hash(state);
-            }
-        }
+        Value::PrimitiveVector(p) => hash_pv(p, state),
         // A map entry hashes exactly like its 2-vector (they
         // are `=`, so the `Eq`/`Hash` contract requires it;
         // Oracle FX2 `hash-eq`, `distinct`, `frequencies`).
@@ -1609,25 +1613,23 @@ fn hash_value_mid<H: Hasher>(v: &Value, state: &mut H) {
             state.write_u8(15);
             state.write_u64(u.var_id);
         }
-        Value::Throwable(t) => {
-            state.write_u8(16);
-            state.write_u64(t.id);
-        }
-        Value::Transient(t) => {
-            state.write_u8(17);
-            state.write_u64(t.id());
-        }
+        // Throwables and transients are id-hashed cells (tags
+        // 16/17 live in `id_cell_tag`, reached via
+        // `hash_value_rest`).
         other => hash_value_rest(other, state),
     }
 }
 
-/// The tag byte plus minted id for id-hashed cells (atoms,
-/// delays, futures, promises, agents, volatiles, refs — each
-/// hashes its tag plus its id), or `None` for every other
-/// variant (split from [`hash_value_rest`] for the complexity
-/// budget, like [`hash_value_scalars`]).
+/// The tag byte plus minted id for id-hashed cells (throwables,
+/// transients, atoms, delays, futures, promises, agents,
+/// volatiles, refs, executors — each hashes its tag plus its id),
+/// or `None` for every other variant (split from
+/// [`hash_value_rest`] for the complexity budget, like
+/// [`hash_value_scalars`]).
 fn id_cell_tag(v: &Value) -> Option<(u8, u64)> {
     match v {
+        Value::Throwable(t) => Some((16, t.id)),
+        Value::Transient(t) => Some((17, t.id())),
         Value::Atom(a) => Some((18, a.id())),
         Value::Delay(d) => Some((19, d.id())),
         Value::Future(f) => Some((20, f.id())),

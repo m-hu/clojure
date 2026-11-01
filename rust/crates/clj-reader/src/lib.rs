@@ -297,8 +297,7 @@ impl Reader {
         hook: &mut dyn ReadHooks,
     ) -> Result<Option<Value>, ReaderError> {
         match ch {
-            '"' => self.string_reader(),
-            ';' => self.comment_reader(),
+            '"' | ';' | '\\' => self.invoke_macro_scalar(ch),
             '\'' => self.wrapping_reader(Symbol::new(None, "quote"), hook),
             '@' => self.wrapping_reader(Symbol::new(Some("clojure.core"), "deref"), hook),
             '^' => self.meta_reader(hook),
@@ -311,10 +310,21 @@ impl Reader {
             }),
             '[' => self.vector_reader(hook),
             '{' => self.map_reader(hook),
-            '\\' => self.char_reader(),
             '%' => self.arg_reader(hook),
             '#' => self.dispatch_reader(top, hook),
             _ => unreachable!("macro table covers every macro char"),
+        }
+    }
+
+    /// The scalar macro readers (strings, comments, chars take no
+    /// hook; split from [`invoke_macro`](Self::invoke_macro) for the
+    /// complexity budget).
+    fn invoke_macro_scalar(&mut self, ch: char) -> Result<Option<Value>, ReaderError> {
+        match ch {
+            '"' => self.string_reader(),
+            ';' => self.comment_reader(),
+            '\\' => self.char_reader(),
+            _ => unreachable!("scalar macro partition"),
         }
     }
 

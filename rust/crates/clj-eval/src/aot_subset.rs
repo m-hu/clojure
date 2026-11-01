@@ -81,15 +81,25 @@ impl Prim {
             "-" => Some(Self::Sub),
             "*" => Some(Self::Mul),
             "quot" => Some(Self::Quot),
+            "count" => Some(Self::Count),
+            "nth" => Some(Self::Nth),
+            "get" => Some(Self::Get),
+            "conj" => Some(Self::Conj),
+            // Comparisons live in `resolve_cmp` (split for the
+            // complexity budget).
+            _ => Self::resolve_cmp(name),
+        }
+    }
+
+    /// The comparison heads of [`Prim::resolve`] (split for the
+    /// complexity budget).
+    fn resolve_cmp(name: &str) -> Option<Self> {
+        match name {
             "<" => Some(Self::Lt),
             "<=" => Some(Self::Le),
             ">" => Some(Self::Gt),
             ">=" => Some(Self::Ge),
             "=" => Some(Self::Eq),
-            "count" => Some(Self::Count),
-            "nth" => Some(Self::Nth),
-            "get" => Some(Self::Get),
-            "conj" => Some(Self::Conj),
             _ => None,
         }
     }
@@ -1215,12 +1225,6 @@ fn head_hint(name: &str) -> &'static str {
         "defmacro" | "macroexpand" | "macroexpand-1" | "eval" => {
             "macros at runtime are outside the subset"
         }
-        "future" | "delay" | "force" | "promise" | "deliver" | "atom" | "swap!" | "reset!"
-        | "compare-and-set!" | "send" | "send-off" | "await" | "agent" | "deref" | "add-watch"
-        | "locking" | "pmap" | "pcalls" => "concurrency is outside the AOT subset",
-        "lazy-seq" => "laziness is outside the AOT subset",
-        "println" | "pr" | "prn" | "newline" | "read-string" | "read" | "read-line"
-        | "line-seq" | "slurp" | "spit" | "format" => "only print writes in the AOT subset",
         "ns" | "in-ns" | "require" | "use" | "refer" | "load" | "load-file" | "load-string" => {
             "AOT programs are single-file, without namespaces"
         }
@@ -1230,7 +1234,23 @@ fn head_hint(name: &str) -> &'static str {
             "macros are not expanded in the AOT subset"
         }
         "quote" => "quoted values are outside the value flow",
-        _ => "not in the closed call set",
+        // Effects (concurrency, laziness, I/O) live in
+        // `head_hint_effect` (split for the complexity budget).
+        _ => head_hint_effect(name).unwrap_or("not in the closed call set"),
+    }
+}
+
+/// The effect-category hints of [`head_hint`] (split for the
+/// complexity budget): concurrency, laziness, and I/O heads.
+fn head_hint_effect(name: &str) -> Option<&'static str> {
+    match name {
+        "future" | "delay" | "force" | "promise" | "deliver" | "atom" | "swap!" | "reset!"
+        | "compare-and-set!" | "send" | "send-off" | "await" | "agent" | "deref" | "add-watch"
+        | "locking" | "pmap" | "pcalls" => Some("concurrency is outside the AOT subset"),
+        "lazy-seq" => Some("laziness is outside the AOT subset"),
+        "println" | "pr" | "prn" | "newline" | "read-string" | "read" | "read-line"
+        | "line-seq" | "slurp" | "spit" | "format" => Some("only print writes in the AOT subset"),
+        _ => None,
     }
 }
 

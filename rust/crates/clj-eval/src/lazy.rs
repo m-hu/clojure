@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex};
 use num_traits::ToPrimitive;
 
 use clj_value::{
-    CHUNK_SIZE, ConsValue, CycleValue, ExtensionValue, IterateValue, KeySeqValue, List, Map,
-    RangeNum, RangeValue, RealizedSeq, RepeatValue, Seq, SeqKind, Set, SubVectorValue, ThrowClass,
-    ValSeqValue, Value, Vector,
+    Array, CHUNK_SIZE, ConsValue, CycleValue, ExtensionValue, IterateValue, KeySeqValue, List, Map,
+    PrimitiveVector, RangeNum, RangeValue, RealizedSeq, RepeatValue, Seq, SeqKind, Set,
+    SubVectorValue, ThrowClass, ValSeqValue, Value, Vector,
 };
 
 use crate::core::Num;
@@ -693,21 +693,36 @@ pub(crate) fn step_unit(eval: &mut Evaluator, v: &Value) -> Result<StepUnit, Sig
         Value::Map(m) => step_map_unit(m),
         Value::Set(s) => step_set_unit(s),
         Value::Str(s) => step_str_unit(s),
-        Value::Array(a) => step_realized(&a.snapshot(), false).map_or_else(
-            || Ok(StepUnit::Empty),
-            |s| step_seq(&s, true, false, SeqKind::Array, None),
-        ),
-        Value::PrimitiveVector(p) => step_realized(&p.items(), true).map_or_else(
-            || Ok(StepUnit::Empty),
-            |s| step_seq(&s, true, true, SeqKind::Chunked, None),
-        ),
-        // Map-like hosts step their content entries (like
-        // `seq_value`; anything else host has no seq).
-        Value::HostType(_) => match crate::types::maplike_inst(v) {
-            Some(i) => step_map_unit(&i.content),
-            None => Err(eval.throw(iseq_err(v))),
-        },
+        Value::Array(a) => step_array_unit(a),
+        Value::PrimitiveVector(p) => step_pv_unit(p),
+        Value::HostType(_) => step_maplike_unit(eval, v),
         _ => Err(eval.throw(iseq_err(v))),
+    }
+}
+
+/// Step an array (eager snapshot).
+fn step_array_unit(a: &Array) -> Result<StepUnit, Signal> {
+    step_realized(&a.snapshot(), false).map_or_else(
+        || Ok(StepUnit::Empty),
+        |s| step_seq(&s, true, false, SeqKind::Array, None),
+    )
+}
+
+/// Step a primitive vector (chunked, like vectors).
+fn step_pv_unit(p: &PrimitiveVector) -> Result<StepUnit, Signal> {
+    step_realized(&p.items(), true).map_or_else(
+        || Ok(StepUnit::Empty),
+        |s| step_seq(&s, true, true, SeqKind::Chunked, None),
+    )
+}
+
+/// Step a map-like host (split from [`step_unit`] for the
+/// complexity budget): content entries like `seq_value`; anything
+/// else host has no seq.
+fn step_maplike_unit(eval: &mut Evaluator, v: &Value) -> Result<StepUnit, Signal> {
+    match crate::types::maplike_inst(v) {
+        Some(i) => step_map_unit(&i.content),
+        None => Err(eval.throw(iseq_err(v))),
     }
 }
 
@@ -2761,14 +2776,19 @@ pub(crate) fn seq_value(eval: &mut Evaluator, v: &Value) -> Result<Value, Signal
             true,
             SeqKind::Chunked,
         )),
-        // Records seq their content entries (oracle `rec-seq`);
-        // structs likewise (S12 oracle `sm-seq`); anything else
-        // host has no seq (oracle `i-seq`).
-        Value::HostType(_) => match crate::types::maplike_inst(v) {
-            Some(i) => Ok(seq_map(&i.content)),
-            None => Err(eval.throw(iseq_err(v))),
-        },
+        Value::HostType(_) => seq_maplike(eval, v),
         _ => Err(eval.throw(iseq_err(v))),
+    }
+}
+
+/// `seq` of a map-like host (split from [`seq_value`] for the
+/// complexity budget): records seq their content entries (oracle
+/// `rec-seq`); structs likewise (S12 oracle `sm-seq`); anything
+/// else host has no seq (oracle `i-seq`).
+fn seq_maplike(eval: &mut Evaluator, v: &Value) -> Result<Value, Signal> {
+    match crate::types::maplike_inst(v) {
+        Some(i) => Ok(seq_map(&i.content)),
+        None => Err(eval.throw(iseq_err(v))),
     }
 }
 
@@ -2787,6 +2807,18 @@ fn first_direct(v: &Value) -> Option<Value> {
         ),
         Value::Set(s) => Some(s.iter().next().cloned().unwrap_or(Value::Nil)),
         Value::Str(s) => Some(s.chars().next().map(Value::Char).unwrap_or(Value::Nil)),
+        // Arrays, primitive vectors, map-like hosts, and
+        // subvectors live in `first_direct_wide` (split for the
+        // complexity budget).
+        other => first_direct_wide(other),
+    }
+}
+
+/// The wide arms of [`first_direct`] (split for the complexity
+/// budget): arrays, primitive vectors, map-like hosts, and
+/// subvectors.
+fn first_direct_wide(v: &Value) -> Option<Value> {
+    match v {
         Value::Array(a) => Some(if a.is_empty() {
             Value::Nil
         } else {

@@ -9,20 +9,6 @@
    "justification": "S8A: one arm per special form plus sibling/prim dispatch; the subset call classifier stays exhaustive"
   },
   {
-   "file": "crates/clj-eval/src/aot_subset.rs",
-   "function": "Prim::resolve",
-   "cyclomatic": 17.0,
-   "cognitive": 2.0,
-   "justification": "S8A: one arm per closed primitive; the name table stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/aot_subset.rs",
-   "function": "head_hint",
-   "cyclomatic": 16.0,
-   "cognitive": 1.0,
-   "justification": "S8A: one arm per unsupported head; the hint table stays exhaustive"
-  },
-  {
    "file": "crates/clj-eval/src/eval.rs",
    "function": "Evaluator::eval",
    "cyclomatic": 44.0,
@@ -42,20 +28,6 @@
    "cyclomatic": 37.0,
    "cognitive": 1.0,
    "justification": "one arm per class name; load-error class table stays exhaustive. S5D extends the table with the core/format throw-site classes (ArithmeticException, format exceptions, IO, IllegalState, FileNotFound). S6B adds ExecutionException/CancellationException. S6C adds RejectedExecutionException. S-instream adds the ReaderException spellings. S7 adds ClassNotFoundException. S12 adds the chunk array exceptions (ArrayIndexOutOfBoundsException, NegativeArraySizeException). S15 adds the ArrayStore/OutOfMemory arms (ArrayIndexOutOfBounds/NegativeArraySize already covered by S12). Fence 4b F8b adds the IllegalMonitorStateException arm (unmatched monitor-exit)."
-  },
-  {
-   "file": "crates/clj-reader/src/lib.rs",
-   "function": "Reader::invoke_macro",
-   "cyclomatic": 16.0,
-   "cognitive": 1.0,
-   "justification": "pure macro-char dispatch table, one arm per char"
-  },
-  {
-   "file": "crates/clj-value/src/extension.rs",
-   "function": "throw_parent",
-   "cyclomatic": 17.0,
-   "cognitive": 1.0,
-   "justification": "S7: one arm per JVM parent link; the catch-chain table stays exhaustive (ClassNotFoundException/ReflectiveOperationException links)"
   },
   {
    "file": "crates/clj-value/src/extension.rs",
@@ -114,102 +86,11 @@
    "justification": "S15: one arm per Elem8 ArrayManager coercion; the vector-of table stays exhaustive"
   },
   {
-   "file": "crates/clj-eval/src/coll.rs",
-   "function": "conj_one",
-   "cyclomatic": 16.0,
-   "cognitive": 5.0,
-   "justification": "S15 adds the Array/PV arms; one arm per conj target kind"
-  },
-  {
-   "file": "crates/clj-eval/src/coll.rs",
-   "function": "lookup_present",
-   "cyclomatic": 20.0,
-   "cognitive": 7.0,
-   "justification": "S15 adds the Array/PV arms; one arm per lookup kind"
-  },
-  {
-   "file": "crates/clj-eval/src/coll.rs",
-   "function": "native_contains",
-   "cyclomatic": 17.0,
-   "cognitive": 3.0,
-   "justification": "S15 adds the Array/PV arms; one arm per contains kind"
-  },
-  {
-   "file": "crates/clj-eval/src/coll.rs",
-   "function": "native_nth",
-   "cyclomatic": 19.0,
-   "cognitive": 16.0,
-   "justification": "S15 adds the Array/PV arms; one arm per nth kind. Wave-2 landing: the S12 chunk pre-dispatch also lands here (19/16 measured under rca 0.0.25)"
-  },
-  {
-   "file": "crates/clj-eval/src/eval.rs",
-   "function": "Evaluator::conj_map",
-   "cyclomatic": 16.0,
-   "cognitive": 13.0,
-   "justification": "S15 adds the Array/PV arms; one arm per conj kind"
-  },
-  {
-   "file": "crates/clj-eval/src/lazy.rs",
-   "function": "first_direct",
-   "cyclomatic": 17.0,
-   "cognitive": 4.0,
-   "justification": "S15 adds the Array/PV arms; one arm per first kind"
-  },
-  {
-   "file": "crates/clj-eval/src/lazy.rs",
-   "function": "seq_value",
-   "cyclomatic": 16.0,
-   "cognitive": 6.0,
-   "justification": "S15 adds the Array/PV/SeqKind arms; one arm per seqable kind"
-  },
-  {
-   "file": "crates/clj-eval/src/lazy.rs",
-   "function": "step_unit",
-   "cyclomatic": 19.0,
-   "cognitive": 3.0,
-   "justification": "S15 adds the Array/PV chunk arms; one arm per step kind"
-  },
-  {
-   "file": "crates/clj-value/src/array.rs",
-   "function": "Array::snapshot",
-   "cyclomatic": 18.0,
-   "cognitive": 1.0,
-   "justification": "S15: one arm per ArrayStore; the box-on-read table stays exhaustive"
-  },
-  {
-   "file": "crates/clj-value/src/value.rs",
-   "function": "hash_value_mid",
-   "cyclomatic": 16.0,
-   "cognitive": 3.0,
-   "justification": "S15 adds the Array/PV arms; one arm per hash kind"
-  },
-  {
-   "file": "crates/clj-eval/src/error.rs",
-   "function": "jvm_class_of_host",
-   "cyclomatic": 17.0,
-   "cognitive": 3.0,
-   "justification": "one arm per Value variant; the class-name table stays exhaustive. Wave-2 landing: S15 Array/PV arms tip it over (S9 scalars + S12 struct/volatile arms already here; 17/3 measured under rca 0.0.25)"
-  },
-  {
-   "file": "crates/clj-eval/src/eval.rs",
-   "function": "Evaluator::invoke",
-   "cyclomatic": 16.0,
-   "cognitive": 2.0,
-   "justification": "one arm per invocable kind, each delegating to a helper. Wave-2 landing: S15 adds the PrimitiveVector arm (S12 deliberately kept structs a pre-dispatch; 16/2 measured under rca 0.0.25)"
-  },
-  {
    "file": "crates/clj-eval/src/concurrency.rs",
    "function": "monitor_key",
    "cyclomatic": 42.0,
    "cognitive": 1.0,
    "justification": "fence 3b: one arm per Value variant plus scalar shapes; the content-hash table stays exhaustive so Box clones of the same value share a monitor. Fence 3c rebase: Executor arm (41->42, forced by the new variant; same minted-id shape as Agent)"
-  },
-  {
-   "file": "crates/clj-value/src/hasheq.rs",
-   "function": "hash_code_rest",
-   "cyclomatic": 16.0,
-   "cognitive": 1.0,
-   "justification": "fence 3c rebase: flat one-arm-per-variant hash table tipped 15->16 on the Executor arm (forced by the new variant; same id_hash shape as cells). Flat-table precedent per reviewer concurrence."
   }
  ]
 }

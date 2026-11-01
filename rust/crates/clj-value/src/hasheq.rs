@@ -389,6 +389,16 @@ fn hash_code_rest(v: &Value) -> i32 {
         Value::Volatile(v) => id_hash(v.id()),
         Value::Ref(r) => id_hash(r.id()),
         Value::Executor(x) => id_hash(x.id()),
+        // Numerics and extensions live in `hash_code_rest_num`
+        // (split for the complexity budget).
+        other => hash_code_rest_num(other),
+    }
+}
+
+/// The numeric and extension arms of [`hash_code_rest`] (split for
+/// the complexity budget).
+fn hash_code_rest_num(v: &Value) -> i32 {
+    match v {
         // JVM `.hashCode`s: in-range `BigInt` uses the `Long`
         // bit mix (`BigInt.hashCode`), `BigInteger` always uses
         // `BigInteger.hashCode`, decimals use the UNstripped
