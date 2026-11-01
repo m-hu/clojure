@@ -17,12 +17,6 @@
 //! in-process through an execution engine (no object, no link,
 //! no temp files).
 
-// The FFI declarations assume 64-bit `usize` (R1 finding 8): a
-// 32-bit host would silently miscompile, so refuse to build one
-// (a compile-time gate costs no coverage lines).
-#[cfg(not(target_pointer_width = "64"))]
-compile_error!("clj-aot requires a 64-bit host (usize FFI widths)");
-
 pub mod driver;
 pub mod jit;
 pub mod link;

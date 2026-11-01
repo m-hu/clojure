@@ -33,11 +33,6 @@
 // gate (any `unsafe` there grows the workspace total and fails
 // CI) plus eyeball review of the `def_prim!` expansion.
 
-// The `usize` FFI widths assume a 64-bit host (R1 finding 8):
-// refuse a 32-bit build at compile time (costs no coverage).
-#[cfg(not(target_pointer_width = "64"))]
-compile_error!("clj-rt requires a 64-bit host (usize FFI widths)");
-
 // The shims stay out of the libtest binary: their `#[no_mangle]`
 // names would collide with the rlib copies linked into the
 // integration binaries (same symbol, different compilation), and

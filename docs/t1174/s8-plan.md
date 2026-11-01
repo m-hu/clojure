@@ -38,22 +38,23 @@ naming the first unsupported form). TDD: subset corpus first
 
 - `crate-type = ["staticlib", "rlib"]`, deps
   `clj-eval + clj-value` only (never inkwell): the
-  `extern "C"` helper ABI over opaque `*mut Value` boxes.
+  `extern "C"` helper ABI over `u64` handles (Z3 — no
+  pointer crosses the boundary; was opaque `*mut Value`).
 - Zero semantic drift by construction: every primitive
   helper resolves its `clojure.core` native from a
   process-global booted evaluator and calls THE SAME
   `NativeImpl` (`chain_cmp` order, `quot` zero/NFE rules,
   `nth`/`get`/`conj` edges, arity texts — all shared).
 - Ownership: args consumed, return owned; `rt_clone`
-  borrows; `rt_drop` frees; locals are owned slots.
-  Single-threaded binaries; no shadow stack. Errors
-  (D7): helpers print `path:line:col: Class: message`
-  (spans baked at the call site) and return null — the
-  generated code null-checks and exits 1. No unwinding
-  across FFI, every shim wrapped in `catch_unwind`.
-  The one `unsafe` module is the audited FFI shim
-  (geiger 0→73: 11+1 unsafe fns, 53+8 unsafe exprs —
-  the whole `extern "C"` boundary, every line covered).
+  bumps (inline scalars: identity); `rt_drop` frees;
+  locals are owned slots. Single-threaded binaries;
+  no shadow stack. Errors (D7): helpers print
+  `path:line:col: Class: message` (spans baked at the
+  call site) and return `0` — the generated code
+  zero-checks and exits 1. No unwinding across FFI,
+  every shim wrapped in `catch_unwind`. The FFI shim
+  is safe end to end (Z3 retarget: was the one
+  `unsafe` module, geiger 0→73 at the time).
 - Unit tests call the `extern "C"` fns directly (no LLVM).
 
 ## S8C. Lowering + link (`clj-aot`, inkwell)
