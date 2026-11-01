@@ -819,28 +819,21 @@ impl Evaluator {
             Expr::Global(var) => Ok(self.deref_var(var.id, &var.sym)),
             Expr::Local(idx) => Ok(env.get(*idx)),
             Expr::VarRef(var) => Ok(Value::Var(var.clone())),
-            Expr::Def {
-                sym,
-                doc,
-                init,
-                span,
-            } => self.eval_def(sym, doc.clone(), init.as_deref(), *span, env),
+            Expr::Fn(fun) => Ok(Value::Extension(Arc::new(self.make_closure(fun, env)))),
+            other => self.eval_control(other, env),
+        }
+    }
+
+    /// Control-flow forms (C1: an `eval` sub-dispatch; every arm
+    /// delegates to a small-step helper, like `eval` itself).
+    fn eval_control(&mut self, expr: &Expr, env: &Env) -> Result<Value, Signal> {
+        match expr {
             Expr::If { test, then, els } => self.eval_if(test, then, els, env),
             Expr::Do(exprs) => self.eval_body(exprs, env),
-            Expr::Let { bindings, body } => {
-                let env = self.bind_all(bindings, env)?;
-                self.eval_body(body, &env)
-            }
+            Expr::Let { bindings, body } => self.eval_let(bindings, body, env),
             Expr::Loop { bindings, body } => self.eval_loop(bindings, body, env),
             Expr::LetFn { fns, body } => self.eval_letfn(fns, body, env),
-            Expr::Fn(fun) => Ok(Value::Extension(Arc::new(self.make_closure(fun, env)))),
-            Expr::Recur(args) => {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, env)?);
-                }
-                Err(Signal::Recur(values))
-            }
+            Expr::Recur(args) => self.eval_recur(args, env),
             Expr::Throw(inner) => self.eval_throw(inner, env),
             Expr::NewThrowable { class, message } => Ok(Value::Throwable(Throwable {
                 id: self.next_id(),
@@ -854,6 +847,19 @@ impl Evaluator {
                 catches,
                 finally_body,
             } => self.eval_try(body, catches, finally_body, env),
+            other => self.eval_var(other, env),
+        }
+    }
+
+    /// Var/binding definition forms (C1: an `eval` sub-dispatch).
+    fn eval_var(&mut self, expr: &Expr, env: &Env) -> Result<Value, Signal> {
+        match expr {
+            Expr::Def {
+                sym,
+                doc,
+                init,
+                span,
+            } => self.eval_def(sym, doc.clone(), init.as_deref(), *span, env),
             Expr::Set { var, val } => self.eval_set(var, val, env),
             Expr::Binding { pairs, body } => self.eval_binding(pairs, body, env),
             Expr::WithRedefs { pairs, body } => self.eval_with_redefs(pairs, body, env),
@@ -884,6 +890,15 @@ impl Evaluator {
                 attr,
                 clauses,
             } => crate::ns::eval_ns_form(self, name, doc.as_deref(), attr.as_ref(), clauses),
+            other => self.eval_effect(other, env),
+        }
+    }
+
+    /// Effect/utility forms plus invocation (C1: an `eval`
+    /// sub-dispatch; the tail of the chain, so the only arms left
+    /// are the effect ones).
+    fn eval_effect(&mut self, expr: &Expr, env: &Env) -> Result<Value, Signal> {
+        match expr {
             Expr::Assert {
                 test,
                 message,
@@ -910,20 +925,53 @@ impl Evaluator {
                 skip,
                 test,
             } => self.eval_case_star(expr, *shift, *mask, default, cases, skip, *test, env),
-            Expr::Invoke { head, args, span } => {
-                let callee = self.eval(head, env)?;
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, env)?);
-                }
-                // The call site stays visible to natives for the
-                // duration of the call (nesting saves/restores).
-                let saved = self.native_call_span.replace(*span);
-                let out = self.invoke(&callee, &values);
-                self.native_call_span = saved;
-                out
-            }
+            Expr::Invoke { head, args, span } => self.eval_invoke(head, args, *span, env),
+            // Literal, control-flow, and var forms dispatch through
+            // `eval`/`eval_control`/`eval_var` above.
+            _ => unreachable!("eval_effect: non-effect expr"),
         }
+    }
+
+    /// A `let` block (bind, then run the body in the extended env).
+    fn eval_let(
+        &mut self,
+        bindings: &[(Pattern, Expr)],
+        body: &[Expr],
+        env: &Env,
+    ) -> Result<Value, Signal> {
+        let env = self.bind_all(bindings, env)?;
+        self.eval_body(body, &env)
+    }
+
+    /// A `recur` (evaluate the args, then unwind to the loop frame).
+    fn eval_recur(&mut self, args: &[Expr], env: &Env) -> Result<Value, Signal> {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg, env)?);
+        }
+        Err(Signal::Recur(values))
+    }
+
+    /// A call (evaluate the head and args, then invoke with the
+    /// call-site span visible to natives).
+    fn eval_invoke(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+        span: Span,
+        env: &Env,
+    ) -> Result<Value, Signal> {
+        let callee = self.eval(head, env)?;
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg, env)?);
+        }
+        // The call site stays visible to natives for the
+        // duration of the call (nesting saves/restores).
+        let saved = self.native_call_span.replace(span);
+        let out = self.invoke(&callee, &values);
+        self.native_call_span = saved;
+        out
     }
 
     /// A var id, interning on first reference. Only synthesized

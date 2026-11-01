@@ -910,74 +910,136 @@ impl Planner {
                 hint: "higher-order calls are outside the subset".to_owned(),
             }));
         }
-        if ns.is_none() {
-            match name {
-                "if" => return self.classify_if(args, scope, next, span),
-                "do" => {
-                    let mut out = Vec::with_capacity(args.len());
-                    for arg in args.iter().copied() {
-                        out.push(self.classify_expr(arg, scope, next, span)?);
-                    }
-                    return Ok(SubsetExpr::Do(out));
-                }
-                "let" => return self.classify_let(args, scope, next, span),
-                "defn" => {
-                    return Err(PlanError::Subset(SubsetError {
-                        span,
-                        form: "defn".to_owned(),
-                        hint: "defn is top-level only".to_owned(),
-                    }));
-                }
-                "print" => return self.classify_print(args, scope, next, span),
-                _ => {}
-            }
-        } else if ns == Some("clojure.core") && name == "print" {
-            return self.classify_print(args, scope, next, span);
+        if let Some(out) = self.classify_builtin_head(ns, name, args, scope, next, span)? {
+            return Ok(out);
         }
-        // Sibling `defn` calls (validation-first: a same-named
-        // resolved referent is the sibling — resolution order
-        // guarantees it).
-        let sibling = match ns {
-            None | Some("user") => self.by_name.get(name).copied(),
-            _ => None,
-        };
-        if let Some(index) = sibling {
-            let mut out = Vec::with_capacity(args.len());
-            for arg in args.iter().copied() {
-                out.push(self.classify_expr(arg, scope, next, span)?);
-            }
-            let arity = self.fns[index].arity;
-            if out.len() != arity {
-                return Ok(SubsetExpr::ArityError {
-                    display: format!("user/{}", self.fns[index].name),
-                    expected: arity,
-                    got: out.len(),
-                    span,
-                });
-            }
-            return Ok(SubsetExpr::CallFn {
-                index,
-                args: out,
-                span,
-            });
+        if let Some(out) = self.classify_sibling_call(ns, name, args, scope, next, span)? {
+            return Ok(out);
         }
-        // Closed primitives.
-        if let Some(prim) = Prim::resolve(ns, name) {
-            let mut out = Vec::with_capacity(args.len());
-            for arg in args.iter().copied() {
-                out.push(self.classify_expr(arg, scope, next, span)?);
-            }
-            return Ok(SubsetExpr::CallPrim {
-                prim,
-                args: out,
-                span,
-            });
+        if let Some(out) = self.classify_prim_call(ns, name, args, scope, next, span)? {
+            return Ok(out);
         }
         // Everything else names its head.
         Err(PlanError::Subset(SubsetError {
             span,
             form: display_sym(sym),
             hint: head_hint(name).to_owned(),
+        }))
+    }
+
+    /// A builtin head (`if`/`do`/`let`/`defn`/`print`, bare or
+    /// `clojure.core/`-qualified): `None` when the head is not a
+    /// builtin (C1: a `classify_call` sub-dispatch).
+    fn classify_builtin_head(
+        &mut self,
+        ns: Option<&str>,
+        name: &str,
+        args: &[&Value],
+        scope: &mut Scope,
+        next: &mut usize,
+        span: Span,
+    ) -> Result<Option<SubsetExpr>, PlanError> {
+        if ns.is_none() {
+            return self.classify_unqualified_head(name, args, scope, next, span);
+        }
+        if ns == Some("clojure.core") && name == "print" {
+            return Ok(Some(self.classify_print(args, scope, next, span)?));
+        }
+        Ok(None)
+    }
+
+    /// A bare head: the builtin forms, `None` for anything else
+    /// (C1: a `classify_call` sub-dispatch).
+    fn classify_unqualified_head(
+        &mut self,
+        name: &str,
+        args: &[&Value],
+        scope: &mut Scope,
+        next: &mut usize,
+        span: Span,
+    ) -> Result<Option<SubsetExpr>, PlanError> {
+        match name {
+            "if" => Ok(Some(self.classify_if(args, scope, next, span)?)),
+            "do" => {
+                let mut out = Vec::with_capacity(args.len());
+                for arg in args.iter().copied() {
+                    out.push(self.classify_expr(arg, scope, next, span)?);
+                }
+                Ok(Some(SubsetExpr::Do(out)))
+            }
+            "let" => Ok(Some(self.classify_let(args, scope, next, span)?)),
+            "defn" => Err(PlanError::Subset(SubsetError {
+                span,
+                form: "defn".to_owned(),
+                hint: "defn is top-level only".to_owned(),
+            })),
+            "print" => Ok(Some(self.classify_print(args, scope, next, span)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// A sibling `defn` call (validation-first: a same-named
+    /// resolved referent is the sibling — resolution order
+    /// guarantees it): `None` when no sibling matches (C1: a
+    /// `classify_call` sub-dispatch).
+    fn classify_sibling_call(
+        &mut self,
+        ns: Option<&str>,
+        name: &str,
+        args: &[&Value],
+        scope: &mut Scope,
+        next: &mut usize,
+        span: Span,
+    ) -> Result<Option<SubsetExpr>, PlanError> {
+        let sibling = match ns {
+            None | Some("user") => self.by_name.get(name).copied(),
+            _ => None,
+        };
+        let Some(index) = sibling else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(args.len());
+        for arg in args.iter().copied() {
+            out.push(self.classify_expr(arg, scope, next, span)?);
+        }
+        let arity = self.fns[index].arity;
+        if out.len() != arity {
+            return Ok(Some(SubsetExpr::ArityError {
+                display: format!("user/{}", self.fns[index].name),
+                expected: arity,
+                got: out.len(),
+                span,
+            }));
+        }
+        Ok(Some(SubsetExpr::CallFn {
+            index,
+            args: out,
+            span,
+        }))
+    }
+
+    /// A closed-primitive call: `None` when the head is not a
+    /// primitive (C1: a `classify_call` sub-dispatch).
+    fn classify_prim_call(
+        &mut self,
+        ns: Option<&str>,
+        name: &str,
+        args: &[&Value],
+        scope: &mut Scope,
+        next: &mut usize,
+        span: Span,
+    ) -> Result<Option<SubsetExpr>, PlanError> {
+        let Some(prim) = Prim::resolve(ns, name) else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(args.len());
+        for arg in args.iter().copied() {
+            out.push(self.classify_expr(arg, scope, next, span)?);
+        }
+        Ok(Some(SubsetExpr::CallPrim {
+            prim,
+            args: out,
+            span,
         }))
     }
 

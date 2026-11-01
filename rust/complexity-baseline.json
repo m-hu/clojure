@@ -3,13 +3,6 @@
  "violations": [
   {
    "file": "crates/clj-eval/src/aot_subset.rs",
-   "function": "Planner::classify_call",
-   "cyclomatic": 23.0,
-   "cognitive": 19.0,
-   "justification": "S8A: one arm per special form plus sibling/prim dispatch; the subset call classifier stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/aot_subset.rs",
    "function": "Prim::resolve",
    "cyclomatic": 17.0,
    "cognitive": 2.0,
@@ -21,20 +14,6 @@
    "cyclomatic": 16.0,
    "cognitive": 1.0,
    "justification": "S8A: one arm per unsupported head; the hint table stays exhaustive"
-  },
-  {
-   "file": "crates/clj-eval/src/eval.rs",
-   "function": "Evaluator::eval",
-   "cyclomatic": 44.0,
-   "cognitive": 8.0,
-   "justification": "one arm per Expr variant; arms delegate to small-step helpers. S5B adds the WithRedefs/WithBindings/BoundFn arms; S5C the DefMacro/Declare/Ns arms. S5D adds the Assert/CaseStar/LazySeqStar/Time/WithOutStr arms. S6A adds the DelayStar arm. S6D adds the Locking arm. S-instream adds the WithInStr arm."
-  },
-  {
-   "file": "crates/clj-eval/src/expr.rs",
-   "function": "Analyzer<'a>::analyze_special",
-   "cyclomatic": 34.0,
-   "cognitive": 1.0,
-   "justification": "one arm per special form; dispatch to per-form parsers. S5B adds the with-redefs/with-bindings/bound-fn arms; S5C the defmacro/declare/ns arms. S5D adds the assert/time/with-out-str/lazy-seq*/case* arms. S6A adds the delay* arm. S6D adds the locking arm. S-instream adds the with-in-str arm."
   },
   {
    "file": "crates/clj-eval/src/ns.rs",

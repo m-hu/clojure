@@ -1436,6 +1436,20 @@ impl<'a> Analyzer<'a> {
             SpecialOp::Throw => self.parse_throw(items, span),
             SpecialOp::Recur => self.parse_recur(items, span, tail),
             SpecialOp::Set => self.parse_set(items, span),
+            other => self.analyze_special_bind(other, items, span, tail),
+        }
+    }
+
+    /// Binding/fn special forms (C1: an `analyze_special`
+    /// sub-dispatch; one arm per form, like `analyze_special`).
+    fn analyze_special_bind(
+        &mut self,
+        op: SpecialOp,
+        items: &[&Value],
+        span: Span,
+        tail: bool,
+    ) -> Result<Expr, CompileError> {
+        match op {
             SpecialOp::Try => self.parse_try(items, span, tail),
             SpecialOp::Let => self.parse_let("let", items, span, tail),
             SpecialOp::LetStar => self.parse_let("let*", items, span, tail),
@@ -1444,6 +1458,20 @@ impl<'a> Analyzer<'a> {
             SpecialOp::LetFn => self.parse_letfn("letfn", items, span, tail),
             SpecialOp::Fn => self.parse_fn(items, span),
             SpecialOp::FnStar => self.parse_fn_star(items, span),
+            other => self.analyze_special_scope(other, items, span, tail),
+        }
+    }
+
+    /// Dynamic-scope/ns special forms (C1: an `analyze_special`
+    /// sub-dispatch).
+    fn analyze_special_scope(
+        &mut self,
+        op: SpecialOp,
+        items: &[&Value],
+        span: Span,
+        tail: bool,
+    ) -> Result<Expr, CompileError> {
+        match op {
             SpecialOp::Binding => self.parse_binding(items, span, tail),
             SpecialOp::WithRedefs => self.parse_with_redefs(items, span, tail),
             SpecialOp::WithBindings => self.parse_with_bindings(items, span, tail),
@@ -1452,6 +1480,20 @@ impl<'a> Analyzer<'a> {
             SpecialOp::Declare => self.parse_declare(items, span),
             SpecialOp::Ns => self.parse_ns(items, span),
             SpecialOp::Assert => self.parse_assert(items, span),
+            other => self.analyze_special_effect(other, items, span, tail),
+        }
+    }
+
+    /// Effect/utility special forms (C1: an `analyze_special`
+    /// sub-dispatch; the tail of the chain).
+    fn analyze_special_effect(
+        &mut self,
+        op: SpecialOp,
+        items: &[&Value],
+        span: Span,
+        tail: bool,
+    ) -> Result<Expr, CompileError> {
+        match op {
             SpecialOp::Time => self.parse_time(items, span),
             SpecialOp::WithOutStr => self.parse_with_out_str(items, span),
             SpecialOp::WithInStr => self.parse_with_in_str(items, span),
@@ -1461,6 +1503,10 @@ impl<'a> Analyzer<'a> {
                 self.parse_locking_or_tx(op, items, span, tail)
             }
             SpecialOp::CaseStar => self.parse_case_star(items, span, tail),
+            // Core, binding, and scope forms dispatch through
+            // `analyze_special`/`analyze_special_bind`/
+            // `analyze_special_scope` above.
+            _ => unreachable!("analyze_special_effect: non-effect op"),
         }
     }
 
