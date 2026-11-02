@@ -269,7 +269,10 @@ pub struct Vector {
 pub struct Map {
     inner: RpdsMap,
     meta: Option<Arc<Map>>,
-    keys: Vec<Value>,
+    // `Arc`-shared (writes copy-on-write via `Arc::make_mut`):
+    // evaluating a bound map clones it, and a deep `keys` copy
+    // per lookup dominates read-heavy workloads.
+    keys: Arc<Vec<Value>>,
     hashy: bool,
     sort: Option<SortSpec>,
     id: u64,
@@ -296,7 +299,8 @@ pub enum SortSpec {
 pub struct Set {
     inner: RpdsSet,
     meta: Option<Arc<Map>>,
-    members: Vec<Value>,
+    // `Arc`-shared like [`Map`]'s `keys` (same read-clone cost).
+    members: Arc<Vec<Value>>,
     sort: Option<SortSpec>,
     id: u64,
 }
@@ -525,7 +529,7 @@ impl Map {
         let size = self.inner.size();
         let promote = !self.hashy && (size >= 64 || (size >= 8 && !matches!(k, Value::Keyword(_))));
         let mut keys = self.keys;
-        keys.push(k.clone());
+        Arc::make_mut(&mut keys).push(k.clone());
         Self {
             inner: self.inner.insert(k, v),
             meta: self.meta,
@@ -545,7 +549,7 @@ impl Map {
         if self.inner.get(k).is_none() {
             return self;
         }
-        self.keys.retain(|key| key != k);
+        Arc::make_mut(&mut self.keys).retain(|key| key != k);
         Self {
             inner: self.inner.remove(k),
             meta: self.meta,
@@ -594,7 +598,7 @@ impl Map {
     /// order when sorted).
     #[must_use]
     pub fn ordered_keys(&self) -> &[Value] {
-        &self.keys
+        self.keys.as_slice()
     }
 
     /// Rebuild from explicitly ordered entries, preserving metadata
@@ -610,7 +614,7 @@ impl Map {
         Self {
             inner,
             meta: self.meta,
-            keys,
+            keys: Arc::new(keys),
             hashy: self.hashy,
             sort: self.sort,
             id: next_map_id(),
@@ -694,7 +698,7 @@ impl Set {
             self
         } else {
             let mut members = self.members;
-            members.push(v.clone());
+            Arc::make_mut(&mut members).push(v.clone());
             Self {
                 inner: self.inner.insert(v),
                 meta: self.meta,
@@ -726,7 +730,7 @@ impl Set {
         if !self.inner.contains(v) {
             return self;
         }
-        self.members.retain(|m| m != v);
+        Arc::make_mut(&mut self.members).retain(|m| m != v);
         Self {
             inner: self.inner.remove(v),
             meta: self.meta,
@@ -778,7 +782,7 @@ impl Set {
     /// order when sorted).
     #[must_use]
     pub fn ordered_members(&self) -> &[Value] {
-        &self.members
+        self.members.as_slice()
     }
 
     /// Rebuild from explicitly ordered members, preserving metadata
@@ -792,7 +796,7 @@ impl Set {
         Self {
             inner,
             meta: self.meta,
-            members,
+            members: Arc::new(members),
             sort: self.sort,
             id: next_set_id(),
         }
@@ -902,7 +906,7 @@ pub fn new_map() -> Map {
     Map {
         inner: RpdsMap::new_with_hasher_and_ptr_kind(FxBuildHasher::default()),
         meta: None,
-        keys: Vec::new(),
+        keys: Arc::new(Vec::new()),
         hashy: false,
         sort: None,
         id: next_map_id(),
@@ -915,7 +919,7 @@ pub fn new_set() -> Set {
     Set {
         inner: RpdsSet::new_with_hasher_with_ptr_kind(FxBuildHasher::default()),
         meta: None,
-        members: Vec::new(),
+        members: Arc::new(Vec::new()),
         sort: None,
         id: next_set_id(),
     }
