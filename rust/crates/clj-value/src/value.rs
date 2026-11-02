@@ -317,16 +317,20 @@ impl List {
     pub fn from_vec(items: Vec<Value>) -> Self {
         let mut list = Self::new_sync();
         for v in items.into_iter().rev() {
-            list = list.push_front(v);
+            list.inner.push_front_mut(v);
         }
         list
     }
 
     /// Prepend a value.
     #[must_use]
-    pub fn push_front(self, v: Value) -> Self {
+    pub fn push_front(mut self, v: Value) -> Self {
+        // Owned `self`: mutate the spine in place (same rationale as
+        // `Vector::push_back` — `push_front_mut` only allocates a new
+        // head node, so tails shared with *other* versions stay intact).
+        self.inner.push_front_mut(v);
         Self {
-            inner: self.inner.push_front(v),
+            inner: self.inner,
             meta: self.meta,
             id: next_list_id(),
         }
