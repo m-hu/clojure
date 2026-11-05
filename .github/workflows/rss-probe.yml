@@ -6,33 +6,23 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install GNU time
-        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y time
-      - name: Build (default, as the h2h gate)
-        working-directory: rust
-        run: cargo build --release --locked --no-default-features && cp target/release/clojure-rs /tmp/rs-default
-      - name: Build without mimalloc
-        working-directory: rust
-        run: |
-          sed -i '/^#\[global_allocator\]$/,/^static GLOBAL/d' src/bin/clojure-rs/main.rs
-          cargo build --release --locked --no-default-features && cp target/release/clojure-rs /tmp/rs-sysalloc
-          git checkout src/bin/clojure-rs/main.rs
-      - name: Build non-PIE
-        working-directory: rust
-        continue-on-error: true
-        run: RUSTFLAGS="-C relocation-model=static" cargo build --release --locked --no-default-features --target x86_64-unknown-linux-gnu --target-dir /tmp/t-static && cp /tmp/t-static/x86_64-unknown-linux-gnu/release/clojure-rs /tmp/rs-static
+      - name: Install tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time valgrind
       - name: Probe
-        if: always()
-        run: probe/rss.sh $(ls /tmp/rs-default /tmp/rs-sysalloc /tmp/rs-static 2>/dev/null) 2>&1 | tee probe-out.txt
+        run: |
+          rustc -vV; uname -a; cat /proc/cpuinfo | grep 'model name' | head -1
+          probe/run3.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rss-probe
-          path: probe-out.txt
+          name: rss-probe3
+          path: |
+            probe-out.txt
+            /tmp/out/
