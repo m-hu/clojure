@@ -1,0 +1,35 @@
+name: rss-probe
+on:
+  push:
+    branches: [probe/rss-226]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install GNU time
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y time
+      - name: Build (default, as the h2h gate)
+        working-directory: rust
+        run: cargo build --release --locked --no-default-features && cp target/release/clojure-rs /tmp/rs-default
+      - name: Build without mimalloc
+        working-directory: rust
+        run: |
+          sed -i '/^#\[global_allocator\]$/,/^static GLOBAL/d' src/bin/clojure-rs/main.rs
+          cargo build --release --locked --no-default-features && cp target/release/clojure-rs /tmp/rs-sysalloc
+          git checkout src/bin/clojure-rs/main.rs
+      - name: Build non-PIE
+        working-directory: rust
+        run: RUSTFLAGS="-C relocation-model=static" cargo build --release --locked --no-default-features --target-dir /tmp/t-static && cp /tmp/t-static/release/clojure-rs /tmp/rs-static
+      - name: Probe
+        run: probe/rss.sh /tmp/rs-default /tmp/rs-sysalloc /tmp/rs-static 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rss-probe
+          path: probe-out.txt
