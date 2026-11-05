@@ -10,6 +10,8 @@ OUT_PREFIX.ld (an INSERT BEFORE .text script with hash-free globs).
 import collections, re, subprocess, sys
 
 binary, prefix, files = sys.argv[1], sys.argv[2], sys.argv[3:]
+import os
+BASE = os.path.basename(binary)
 sizes = {}
 for line in subprocess.run(['nm', '-S', '--defined-only', binary], capture_output=True, text=True, check=True).stdout.splitlines():
     p = line.split(None, 3)
@@ -49,7 +51,7 @@ for path in files:
                 skip = False
                 continue
             parts = line.split()
-            if fn and ob and ob.endswith('clojure-rs') and len(parts) > 1:
+            if fn and ob and ob.endswith(BASE) and len(parts) > 1:
                 ir[fn] += int(parts[1])
                 if fn not in seen:
                     seen.add(fn)
@@ -83,6 +85,10 @@ with open(prefix + '.ld', 'w') as out:
         out.write(f'    *(.text.{g} .text.unlikely.{g})\n')
     out.write('  }\n}\nINSERT BEFORE .text;\n')
 tot = sum(sizes[f] for f in known)
+big = sorted(known, key=lambda f: -sizes[f])[:25]
+print('  biggest executed functions:')
+for f in big:
+    print(f'    {sizes[f]:7d} B  runs {runs[f]:2d}  Ir {ir[f]:10d}  {f[:150]}')
 print(f'  executed functions: {len(order)} ({len(known)} sized), total size {tot // 1024} KB; {len(pats)} globs')
 for n in sorted(set(runs.values()), reverse=True)[:6]:
     fs = [f for f in known if runs[f] == n]
