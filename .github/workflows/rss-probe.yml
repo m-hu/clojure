@@ -26,10 +26,13 @@ jobs:
           git checkout src/bin/clojure-rs/main.rs
       - name: Build non-PIE
         working-directory: rust
-        run: RUSTFLAGS="-C relocation-model=static" cargo build --release --locked --no-default-features --target-dir /tmp/t-static && cp /tmp/t-static/release/clojure-rs /tmp/rs-static
+        continue-on-error: true
+        run: RUSTFLAGS="-C relocation-model=static" cargo build --release --locked --no-default-features --target x86_64-unknown-linux-gnu --target-dir /tmp/t-static && cp /tmp/t-static/x86_64-unknown-linux-gnu/release/clojure-rs /tmp/rs-static
       - name: Probe
-        run: probe/rss.sh /tmp/rs-default /tmp/rs-sysalloc /tmp/rs-static 2>&1 | tee probe-out.txt
+        if: always()
+        run: probe/rss.sh $(ls /tmp/rs-default /tmp/rs-sysalloc /tmp/rs-static 2>/dev/null) 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: rss-probe
           path: probe-out.txt
