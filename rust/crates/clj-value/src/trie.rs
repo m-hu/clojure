@@ -359,6 +359,134 @@ impl<T: Clone> FromIterator<T> for PVec<T> {
     }
 }
 
+/// Longest flat packed run: past it packed items live in the trie.
+/// A shared update clones a flat run whole (`Arc::make_mut`), and
+/// loop-threaded vectors are shared at update time, so an unbounded
+/// flat run turns `conj`/`assoc` chains quadratic (#227); at or below
+/// this a shared update copies at most 8 KB, and reads index directly.
+pub(crate) const FLAT_MAX: usize = 1024;
+
+/// Packed scalar storage (`i64`/`char` vector items, #226): a flat
+/// run up to [`FLAT_MAX`] items (direct reads, in-place writes when
+/// unique), the trie past it (log-time shared updates, still 8 or 4
+/// bytes per item).
+#[derive(Clone, Debug)]
+pub(crate) enum Packed<T> {
+    Flat(Arc<Vec<T>>),
+    Trie(PVec<T>),
+}
+
+impl<T: Copy> Packed<T> {
+    /// Packed storage over `items` in order.
+    pub(crate) fn from_vec(items: Vec<T>) -> Self {
+        if items.len() <= FLAT_MAX {
+            Packed::Flat(Arc::new(items))
+        } else {
+            Packed::Trie(PVec::from_vec(items))
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Packed::Flat(a) => a.len(),
+            Packed::Trie(t) => t.len(),
+        }
+    }
+
+    pub(crate) fn get(&self, i: usize) -> Option<T> {
+        match self {
+            Packed::Flat(a) => a.get(i).copied(),
+            Packed::Trie(t) => t.get(i).copied(),
+        }
+    }
+
+    /// Append (a full flat run moves into the trie first).
+    pub(crate) fn push(&mut self, x: T) {
+        match self {
+            Packed::Flat(a) if a.len() < FLAT_MAX => Arc::make_mut(a).push(x),
+            Packed::Flat(a) => {
+                let mut t: PVec<T> = a.iter().copied().collect();
+                t.push_back_mut(x);
+                *self = Packed::Trie(t);
+            }
+            Packed::Trie(t) => t.push_back_mut(x),
+        }
+    }
+
+    /// Replace the item at `i` (`false` when out of bounds).
+    pub(crate) fn set(&mut self, i: usize, x: T) -> bool {
+        match self {
+            Packed::Flat(a) => match Arc::make_mut(a).get_mut(i) {
+                Some(slot) => {
+                    *slot = x;
+                    true
+                }
+                None => false,
+            },
+            Packed::Trie(t) => t.set_mut(i, x),
+        }
+    }
+
+    /// Drop the last item (`false` when empty).
+    pub(crate) fn pop(&mut self) -> bool {
+        match self {
+            Packed::Flat(a) => !a.is_empty() && Arc::make_mut(a).pop().is_some(),
+            Packed::Trie(t) => t.drop_last_mut(),
+        }
+    }
+
+    /// The items from `i` to the end of its 32-item chunk.
+    pub(crate) fn chunk_from(&self, i: usize) -> &[T] {
+        match self {
+            Packed::Flat(a) => {
+                let end = ((i / WIDTH + 1) * WIDTH).min(a.len());
+                a.get(i..end).unwrap_or(&[])
+            }
+            Packed::Trie(t) => t.chunk_from(i),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> PackedIter<'_, T> {
+        match self {
+            Packed::Flat(a) => PackedIter::Flat(a.iter()),
+            Packed::Trie(t) => PackedIter::Trie(t.iter()),
+        }
+    }
+}
+
+/// Front-to-back (double-ended) iteration over [`Packed`] storage.
+pub(crate) enum PackedIter<'a, T> {
+    Flat(std::slice::Iter<'a, T>),
+    Trie(Iter<'a, T>),
+}
+
+impl<'a, T: Clone> Iterator for PackedIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<&'a T> {
+        match self {
+            PackedIter::Flat(it) => it.next(),
+            PackedIter::Trie(it) => it.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            PackedIter::Flat(it) => it.size_hint(),
+            PackedIter::Trie(it) => it.size_hint(),
+        }
+    }
+}
+
+impl<T: Clone> DoubleEndedIterator for PackedIter<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            PackedIter::Flat(it) => it.next_back(),
+            PackedIter::Trie(it) => it.next_back(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +575,38 @@ mod tests {
         assert_eq!(v.chunk_from(32).len(), 32);
         assert_eq!(v.chunk_from(65).len(), 5);
         assert!(v.chunk_from(70).is_empty());
+    }
+
+    /// [`Packed`]: flat up to `FLAT_MAX` items, the trie past it —
+    /// every operation on both shapes, and the move between them.
+    #[test]
+    fn packed_runs_go_flat_then_trie() {
+        let mut p: Packed<i64> = Packed::from_vec((0..FLAT_MAX as i64).collect());
+        assert!(matches!(p, Packed::Flat(_)));
+        assert_eq!(p.get(5), Some(5));
+        assert!(p.set(5, -5) && p.get(5) == Some(-5));
+        assert!(!p.set(FLAT_MAX, 0));
+        assert_eq!(p.chunk_from(30), &[30, 31][..]);
+        assert!(p.chunk_from(FLAT_MAX).is_empty());
+        assert_eq!(p.iter().size_hint(), (FLAT_MAX, Some(FLAT_MAX)));
+        assert_eq!(p.iter().next_back(), Some(&(FLAT_MAX as i64 - 1)));
+        assert!(p.pop() && p.len() == FLAT_MAX - 1);
+        p.push(7);
+        p.push(8);
+        assert!(matches!(p, Packed::Trie(_)));
+        assert_eq!(p.len(), FLAT_MAX + 1);
+        assert_eq!(p.get(FLAT_MAX), Some(8));
+        assert!(p.set(0, 9) && p.get(0) == Some(9));
+        assert_eq!(p.chunk_from(FLAT_MAX - 1).len(), 1);
+        assert_eq!(p.chunk_from(FLAT_MAX).len(), 1);
+        assert_eq!(p.iter().size_hint().0, FLAT_MAX + 1);
+        assert_eq!(p.iter().next_back(), Some(&8));
+        assert_eq!(p.iter().next(), Some(&9));
+        p.push(10);
+        assert!(p.pop() && p.len() == FLAT_MAX + 1);
+        let big: Packed<char> = Packed::from_vec(vec!['x'; FLAT_MAX + 1]);
+        assert!(matches!(big, Packed::Trie(_)));
+        let mut empty: Packed<char> = Packed::from_vec(Vec::new());
+        assert!(!empty.pop());
     }
 }

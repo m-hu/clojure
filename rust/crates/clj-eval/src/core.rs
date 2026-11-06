@@ -2793,6 +2793,12 @@ fn str_push(out: &mut String, eval: &mut Evaluator, v: &Value) -> Result<(), Nat
         Value::Nil => {}
         Value::Str(s) => out.push_str(s),
         Value::Char(c) => out.push(*c),
+        // A long's `toString` is its decimal digits (the printer's
+        // rendering, without the print machinery).
+        Value::Int(n) => {
+            use std::fmt::Write;
+            write!(out, "{n}").expect("writing to a String cannot fail");
+        }
         _ => out.push_str(&str_of_one(eval, v)?),
     }
     Ok(())

@@ -316,6 +316,21 @@ const JVM_ROWS: &[(&str, &str)] = &[
         r#"[(conj (vec "abc") \d) (conj (vec "ab") 1) (assoc (vec "ab") 0 \z) (assoc (vec "ab") 1 :x) (pop (vec "ab")) (conj (pop [\a]) 1) (= (vec "ab") [\a \b]) (hash (vec "ab"))]"#,
         r#"[[\a \b \c \d] [\a \b 1] [\z \b] [\a :x] [\a] [1] true -338459411]"#,
     ),
+    // Maps and keywords called as fns answer inline as the `get` they
+    // are; the promoting ops share `+`/`-`/`*` until a long overflows;
+    // `str` of a long writes its digits.
+    (
+        r#"((fn [m k s] [(m :a) (m :z) (m :z 9) (m :a 9) (:a m) (:z m 7) (:a nil) (:a nil 5) (:a [1 2]) (m k) (k {:b 2}) (s 2) (s 9) (try (m) (catch Exception e :arity))]) {:a 1} :b #{2})"#,
+        r#"[1 nil 9 1 1 7 nil 5 nil nil 2 2 nil :arity]"#,
+    ),
+    (
+        r#"[(+' 1 2) (+' Long/MAX_VALUE 1) (-' Long/MIN_VALUE 1) (*' 3037000500 3037000500) (inc' Long/MAX_VALUE) (dec' Long/MIN_VALUE) (-' Long/MIN_VALUE) (-' 5) (+' 1 2 3) (+' Long/MAX_VALUE 1 1) (*' 2 3 4) (-' 10 1 2) (+' 1.5 2) (*' 1/2 4) (-' 2.5)]"#,
+        r#"[3 9223372036854775808N -9223372036854775809N 9223372037000250000N 9223372036854775808N -9223372036854775809N 9223372036854775808N -5 6 9223372036854775809N 24 7 3.5 2N -2.5]"#,
+    ),
+    (
+        r#"[(str 1) (str -42 " " 0) (str Long/MIN_VALUE) (apply str (range 5)) (str 1 \a nil "b" 2.5 :k)]"#,
+        r#"["1" "-42 0" "-9223372036854775808" "01234" "1ab2.5:k"]"#,
+    ),
 ];
 
 const PORT_ROWS: &[(&str, &str)] = &[

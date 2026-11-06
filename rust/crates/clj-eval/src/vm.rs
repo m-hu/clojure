@@ -416,7 +416,25 @@ fn call_value(
             return apply_moved(ev, closure, code, args);
         }
     }
+    if let Some(v) = invoke_lookup(callee, args) {
+        return Ok(v);
+    }
     ev.invoke_args(callee, std::mem::take(args), span)
+}
+
+/// `(m k)`, `(m k nf)`, `(:k m)` and `(:k m nf)` as the `get` they
+/// are, inline (`None` leaves whatever the inline lookup does not
+/// cover — other shapes, arities and their errors — to the general
+/// invoke).
+fn invoke_lookup(callee: &Value, args: &[Value]) -> Option<Value> {
+    use crate::vm_intrinsics::get_of;
+    match (callee, args) {
+        (Value::Map(_), [k]) => get_of(callee, k, None),
+        (Value::Map(_), [k, nf]) => get_of(callee, k, Some(nf)),
+        (Value::Keyword(_), [m]) => get_of(m, callee, None),
+        (Value::Keyword(_), [m, nf]) => get_of(m, callee, Some(nf)),
+        _ => None,
+    }
 }
 
 /// A fresh VM closure value over `fun`.

@@ -258,8 +258,8 @@ pub struct Vector {
 #[derive(Clone, Debug)]
 enum VectorInner {
     Generic(RpdsVector),
-    Ints(crate::trie::PVec<i64>),
-    Chars(crate::trie::PVec<char>),
+    Ints(crate::trie::Packed<i64>),
+    Chars(crate::trie::Packed<char>),
 }
 
 /// Owned-value vector iteration (typed items box on read).
@@ -269,8 +269,8 @@ pub struct VectorIter<'a> {
 
 enum VectorIterInner<'a> {
     Generic(crate::trie::Iter<'a>),
-    Ints(crate::trie::Iter<'a, i64>),
-    Chars(crate::trie::Iter<'a, char>),
+    Ints(crate::trie::PackedIter<'a, i64>),
+    Chars(crate::trie::PackedIter<'a, char>),
 }
 
 impl Iterator for VectorIter<'_> {
@@ -610,7 +610,7 @@ impl Vector {
     /// `Int`s or chars stay packed from the first push).
     #[must_use]
     pub fn new_sync() -> Self {
-        Self::of(VectorInner::Ints(crate::trie::PVec::new_sync()))
+        Self::of(VectorInner::Ints(crate::trie::Packed::from_vec(Vec::new())))
     }
 
     fn of(inner: VectorInner) -> Self {
@@ -659,13 +659,13 @@ impl Vector {
     /// callers that already know, like ranges and packed transients).
     #[must_use]
     pub fn from_ints(ints: Vec<i64>) -> Self {
-        Self::of(VectorInner::Ints(crate::trie::PVec::from_vec(ints)))
+        Self::of(VectorInner::Ints(crate::trie::Packed::from_vec(ints)))
     }
 
     /// Build a packed char vector from `char`s in order (no scan).
     #[must_use]
     pub fn from_chars(chars: Vec<char>) -> Self {
-        Self::of(VectorInner::Chars(crate::trie::PVec::from_vec(chars)))
+        Self::of(VectorInner::Chars(crate::trie::Packed::from_vec(chars)))
     }
 
     /// Whether this vector rides on packed `i64` or `char` storage.
@@ -691,10 +691,10 @@ impl Vector {
         }
         match (&self.inner, v) {
             (VectorInner::Ints(_), Value::Char(_)) => {
-                self.inner = VectorInner::Chars(crate::trie::PVec::new_sync());
+                self.inner = VectorInner::Chars(crate::trie::Packed::from_vec(Vec::new()));
             }
             (VectorInner::Chars(_), Value::Int(_)) => {
-                self.inner = VectorInner::Ints(crate::trie::PVec::new_sync());
+                self.inner = VectorInner::Ints(crate::trie::Packed::from_vec(Vec::new()));
             }
             _ => {}
         }
@@ -714,11 +714,11 @@ impl Vector {
                 None
             }
             (VectorInner::Ints(t), Value::Int(n)) => {
-                t.push_back_mut(n);
+                t.push(n);
                 None
             }
             (VectorInner::Chars(t), Value::Char(c)) => {
-                t.push_back_mut(c);
+                t.push(c);
                 None
             }
             (VectorInner::Ints(t), v) => Some(boxed(t, Value::Int, |g| g.push_back_mut(v))),
@@ -762,11 +762,11 @@ impl Vector {
                 None
             }
             (VectorInner::Ints(t), Value::Int(n)) => {
-                t.set_mut(index, n);
+                t.set(index, n);
                 None
             }
             (VectorInner::Chars(t), Value::Char(c)) => {
-                t.set_mut(index, c);
+                t.set(index, c);
                 None
             }
             (VectorInner::Ints(t), v) => Some(boxed(t, Value::Int, |g| {
@@ -805,8 +805,8 @@ impl Vector {
     pub fn drop_last_owned(mut self) -> Option<Self> {
         let popped = match &mut self.inner {
             VectorInner::Generic(t) => t.drop_last_mut(),
-            VectorInner::Ints(t) => t.drop_last_mut(),
-            VectorInner::Chars(t) => t.drop_last_mut(),
+            VectorInner::Ints(t) => t.pop(),
+            VectorInner::Chars(t) => t.pop(),
         };
         if !popped {
             return None;
@@ -832,8 +832,8 @@ impl Vector {
     pub fn get(&self, index: usize) -> Option<Value> {
         match &self.inner {
             VectorInner::Generic(t) => t.get(index).cloned(),
-            VectorInner::Ints(t) => t.get(index).map(|n| Value::Int(*n)),
-            VectorInner::Chars(t) => t.get(index).map(|c| Value::Char(*c)),
+            VectorInner::Ints(t) => t.get(index).map(Value::Int),
+            VectorInner::Chars(t) => t.get(index).map(Value::Char),
         }
     }
 
@@ -905,7 +905,7 @@ fn vector_inner_len(inner: &VectorInner) -> usize {
 /// then `then` applied: the one-time conversion when a foreign value
 /// meets packed storage.
 fn boxed<T: Copy>(
-    t: &crate::trie::PVec<T>,
+    t: &crate::trie::Packed<T>,
     box_item: fn(T) -> Value,
     then: impl FnOnce(&mut RpdsVector),
 ) -> RpdsVector {

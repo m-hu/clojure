@@ -426,6 +426,9 @@ const NARY: &[RowN] = &[
     ("+", fold_n::<Add, AsValue>, None),
     ("-", fold_n::<Sub, AsValue>, None),
     ("*", fold_n::<Mul, AsValue>, None),
+    ("+'", fold_n::<Add, AsValue>, None),
+    ("-'", fold_n::<Sub, AsValue>, None),
+    ("*'", fold_n::<Mul, AsValue>, None),
     ("min", fold_n::<Min, AsValue>, None),
     ("max", fold_n::<Max, AsValue>, None),
     ("bit-and", fold_n::<BitAnd, AsValue>, None),
@@ -457,6 +460,12 @@ const BINARY: &[Row2] = &[
     ("+", shape2::<Add, AsValue>, None),
     ("-", shape2::<Sub, AsValue>, None),
     ("*", shape2::<Mul, AsValue>, None),
+    // The promoting ops answer exactly like `+`/`-`/`*` until a long
+    // overflows — where the inline op misses and the call's own
+    // native promotes.
+    ("+'", shape2::<Add, AsValue>, None),
+    ("-'", shape2::<Sub, AsValue>, None),
+    ("*'", shape2::<Mul, AsValue>, None),
     ("<", shape2::<Lt, AsValue>, Some(shape2::<Lt, AsTest>)),
     ("<=", shape2::<Lte, AsValue>, Some(shape2::<Lte, AsTest>)),
     (">", shape2::<Gt, AsValue>, Some(shape2::<Gt, AsTest>)),
@@ -498,6 +507,9 @@ const UNARY: &[Row1] = &[
     ("inc", shape1::<Inc, AsValue>, None),
     ("-", shape1::<Negate, AsValue>, None),
     ("dec", shape1::<Dec, AsValue>, None),
+    ("inc'", shape1::<Inc, AsValue>, None),
+    ("-'", shape1::<Negate, AsValue>, None),
+    ("dec'", shape1::<Dec, AsValue>, None),
     (
         "zero?",
         shape1::<Zero, AsValue>,
