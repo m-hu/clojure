@@ -11,18 +11,15 @@ total about 1 MB, but the linker scatters them over most of the 6 MB
 functions (most workloads first) as input-section globs, so the linker
 places them in one `.text.hot` output section ahead of `.text`.
 
-Each glob keeps the symbol's path identifiers as mangled (length
-prefix included) and wildcards everything between them, so the crate
-disambiguators (which hash the compiler version), v0 backreference
-offsets and the legacy hash suffix drop out and the script survives
-toolchain updates:
+Each glob is the mangled name with the parts that change across
+compiler releases or unrelated edits wildcarded: v0 crate hashes,
+disambiguators and backreference offsets (the legacy scheme's hash
+suffix), so the script survives toolchain updates:
 
     _RNvMs_NtCscx6VyDXTacY_8clj_eval4exprNtB4_8Analyzer15analyze_special
-    -> .text.*8clj_eval*4expr*8Analyzer*15analyze_special*
+    -> .text._RNvMs*_NtCs*_8clj_eval4exprNtB*_8Analyzer15analyze_special*
 
-A glob can also match other instantiations of a generic function; they
-join the hot section too (small, and harmless). Functions that a
-workload never ran stay in `.text`.
+Functions that no workload ran (or renamed since) stay in `.text`.
 """
 import collections
 import os
@@ -39,7 +36,10 @@ class Bad(Exception):
 
 class V0:
     def __init__(self, s):
-        self.s, self.i, self.out = s, 0, []
+        # `out`: identifiers as mangled; `wild`: the spans that vary
+        # across compilers or edits (base-62 disambiguators, crate
+        # hashes and backreference offsets).
+        self.s, self.i, self.out, self.wild = s, 0, [], []
 
     def peek(self):
         return self.s[self.i] if self.i < len(self.s) else ''
@@ -50,21 +50,24 @@ class V0:
             return True
         return False
 
-    def b62(self):
+    def b62(self, wild=False):
         # <base-62-number> = { [0-9a-zA-Z] } "_"
+        start = self.i
         while self.peek() and self.peek() != '_':
             if self.peek() not in B62:
                 raise Bad('b62')
             self.i += 1
         if not self.eat('_'):
             raise Bad('b62 end')
+        if wild:
+            self.wild.append((start, self.i - 1))
 
     def disambiguator(self):
         # Only called where a path or identifier starts, which never
         # begin with `s` themselves (the `i16` basic type `s` only
         # appears in type position).
         if self.eat('s'):
-            self.b62()
+            self.b62(wild=True)
 
     def ident(self):
         self.disambiguator()
@@ -113,7 +116,7 @@ class V0:
             while not self.eat('E'):
                 self.generic_arg()
         elif c == 'B':
-            self.b62()
+            self.b62(wild=True)
         else:
             raise Bad('path ' + c)
 
@@ -129,7 +132,7 @@ class V0:
         if self.eat('p'):
             return
         if self.eat('B'):
-            self.b62()
+            self.b62(wild=True)
             return
         self.type_()
         self.eat('n')
@@ -159,7 +162,7 @@ class V0:
             self.path()
         elif c == 'B':
             self.i += 1
-            self.b62()
+            self.b62(wild=True)
         elif c == 'A':
             self.i += 1
             self.type_()
@@ -198,8 +201,11 @@ class V0:
             raise Bad('type ' + c)
 
 
-def tokens(sym):
-    """The path identifiers of a mangled symbol, as mangled (or None)."""
+def glob(sym):
+    """The toolchain-stable glob for `sym`: the mangled name with its
+    base-62 disambiguators, crate hashes and backreference offsets
+    (v0), or its hash (legacy), wildcarded, plus any suffix (`.llvm.N`
+    promoted locals). Exact when the name does not parse."""
     base = re.sub(r'\.llvm\.\d+$', '', sym)
     if base.startswith('_R'):
         p = V0(base[2:])
@@ -211,30 +217,17 @@ def tokens(sym):
             if p.i < len(p.s) and p.peek() in 'CMXYNIB':
                 p.path()  # instantiating crate
         except (Bad, IndexError, RecursionError):
-            return None
-        return p.out
-    if base.startswith('_ZN'):
-        s = re.sub(r'17h[0-9a-f]{16}E$', '', base[3:])
-        out, i = [], 0
-        while i < len(s):
-            m = re.match(r'\d+', s[i:])
-            if not m:
-                return None
-            n = int(m.group(0))
-            j = i + m.end()
-            out.append(s[i:j + n])
-            i = j + n
-        return out
-    return None
-
-
-def glob(sym):
-    """The toolchain-stable glob for `sym` (exact when unparsed, or
-    when one identifier alone would match a whole crate)."""
-    t = tokens(sym)
-    if not t or len(t) < 2:
-        return sym
-    return '*' + '*'.join(t) + '*'
+            return sym
+        out, at = ['_R'], 0
+        for a, b in p.wild:
+            out.append(p.s[at:a])
+            out.append('*')
+            at = b
+        out.append(p.s[at:])
+        return ''.join(out) + '*'
+    if base.startswith('_ZN') and re.search(r'17h[0-9a-f]{16}E$', base):
+        return base[:-17] + '*'
+    return sym
 
 
 def resolve(table, spec):
@@ -297,7 +290,7 @@ def main():
         f.write('   profiles; see scripts/bench/hot-text/hot_text.py. Do not edit. */\n')
         f.write('SECTIONS\n{\n  .text.hot :\n  {\n')
         for g in globs:
-            f.write('    *(.text.%s)\n' % g)
+            f.write('    *(.text.%s .text.unlikely.%s)\n' % (g, g))
         f.write('  }\n}\nINSERT BEFORE .text;\n')
     print('%d functions from %d profiles -> %d globs in %s' % (len(names), len(profiles), len(globs), out))
 

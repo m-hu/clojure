@@ -18,11 +18,11 @@ jobs:
       - name: Probe
         run: |
           rustc -vV; uname -a; cat /proc/cpuinfo | grep 'model name' | head -1
-          probe/run5.sh 2>&1 | tee probe-out.txt
+          probe/run6.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rss-probe5
+          name: rss-probe6
           path: |
             probe-out.txt
             /tmp/out/
