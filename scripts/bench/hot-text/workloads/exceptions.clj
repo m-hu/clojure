@@ -1,0 +1,5 @@
+(defn risky [x] (if (neg? x) (throw (ex-info "negative" {:x x})) (/ 10 x)))
+(println (try (risky -1) (catch clojure.lang.ExceptionInfo e (str (ex-message e) (ex-data e)))))
+(println (try (risky 0) (catch ArithmeticException e (.getMessage e)) (finally (print ""))))
+(println (try (nth [1] 5) (catch IndexOutOfBoundsException _ :oob)) (try (Long/parseLong "x") (catch NumberFormatException _ :nfe)))
+(println (try (throw (Exception. "boom")) (catch Exception e (.getMessage e))))

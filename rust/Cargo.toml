@@ -33,6 +33,9 @@ clj-aot = { path = "crates/clj-aot", optional = true }
 clj-eval = { path = "crates/clj-eval" }
 clj-repl = { path = "crates/clj-repl" }
 clj-value = { path = "crates/clj-value" }
+
+# The global allocator off Linux (see `main.rs`).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
 
 [features]

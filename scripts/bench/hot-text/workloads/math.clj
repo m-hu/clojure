@@ -1,0 +1,6 @@
+(println (Math/sqrt 2.0) (Math/abs -3) (Math/pow 2 10) (Math/floor 2.7) (Math/ceil 2.1) (Math/round 2.5))
+(println (quot 17 5) (rem -17 5) (mod -17 5) (bit-and 12 10) (bit-or 12 10) (bit-xor 12 10) (bit-shift-left 1 40) (bit-shift-right 1024 3))
+(println (+' Long/MAX_VALUE 1) (*' 3037000500 3037000500) (* 1.5 2) (/ 10 4) (/ 10.0 4) (inc 1N) (bigint 5) (rationalize 0.75))
+(println (Long/parseLong "123") (Integer/parseInt "-45") (Double/parseDouble "2.5") (parse-double "1e3") (parse-long "77"))
+(println (max 1 2.0) (min 3 1) (abs -5) (int 3.9) (long 2.2) (double 3) (Math/log 10) (Math/exp 1) (Math/sin 0.5) (Math/cos 0.5))
+(println (reduce + (map #(* % %) (range 1000))) (zero? 0) (pos? 1) (neg? -1) (even? 4) (odd? 3) (compare 1 2) (num 5))

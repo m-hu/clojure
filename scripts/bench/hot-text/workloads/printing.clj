@@ -1,0 +1,7 @@
+(println 1 2.5 1/3 "s" \c :k 'sym nil true [1 2] {:a 1} #{1} '(1 2))
+(prn "s" \c [1 "x"] {:a "b"})
+(print "no newline ") (println)
+(println (pr-str [1 "a" \b]) (with-out-str (print "captured")))
+(printf "%s=%d%n" "x" 5)
+(println (str 1.0 " " 0.1 " " 100.0 " " 1e10 " " 1.5e-7 " " (/ 1 3) " " (double 2/3)))
+(println (apply str (interpose ", " (map #(format "%.3f" (double %)) [1 2 3]))))

@@ -12,9 +12,14 @@
 //! `docs/spec/t1174/`), `jit` in gap-121 slice 1 (spec
 //! `docs/spec/gap-121/slice-1.md`).
 
-/// mimalloc (#226): the interpreter allocates many small, short-lived
-/// blocks (reader lists, analyzed forms, seq steps), where it is
-/// markedly cheaper than the platform allocators.
+/// mimalloc (#226) off Linux: the interpreter allocates many small,
+/// short-lived blocks (reader lists, analyzed forms, seq steps), where
+/// it is markedly cheaper than the platform allocators. Linux keeps
+/// glibc's allocator for peak RSS: under the default `madvise`
+/// transparent-huge-page mode mimalloc's arenas take huge pages (a
+/// trivial run peaked at 19 MB instead of 9), and even without them a
+/// trivial run peaks 0.7 MB higher and data-heavy runs 20-30% higher.
+#[cfg(not(target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
