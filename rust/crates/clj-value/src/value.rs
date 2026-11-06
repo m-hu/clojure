@@ -871,6 +871,21 @@ impl Vector {
         }
     }
 
+    /// The items from `index` to the end of its 32-item chunk (the
+    /// JVM `ChunkedSeq` chunk; empty past the end): borrowed from
+    /// generic storage, boxed from packed.
+    #[must_use]
+    pub fn chunk_from(&self, index: usize) -> std::borrow::Cow<'_, [Value]> {
+        match &self.inner {
+            VectorInner::Generic(inner) => std::borrow::Cow::Borrowed(inner.chunk_from(index)),
+            VectorInner::Packed(ints) => {
+                let end = ((index / crate::CHUNK_SIZE + 1) * crate::CHUNK_SIZE).min(ints.len());
+                let items = ints.get(index..end).unwrap_or(&[]);
+                std::borrow::Cow::Owned(items.iter().map(|n| Value::Int(*n)).collect())
+            }
+        }
+    }
+
     /// The element count.
     #[must_use]
     pub fn len(&self) -> usize {

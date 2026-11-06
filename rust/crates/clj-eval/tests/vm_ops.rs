@@ -229,6 +229,75 @@ const JVM_ROWS: &[(&str, &str)] = &[
         r#"((fn [a b c d e] [(loop [i 0 a a b b c c] (if (< i 3) (recur (inc i) (+ a 1) (+ b 2) (+ c 3)) [a b c])) (loop [i 0 a a b b c c d d] (if (< i 2) (recur (inc i) (inc a) (inc b) (inc c) (inc d)) [a b c d])) (loop [i 0 a a b b c c d d e e] (if (< i 2) (recur (inc i) a b c d (inc e)) e))]) 1 2 3 4 5)"#,
         r#"[[4 8 12] [3 4 5 6] 7]"#,
     ),
+    // Seq ops (#226): `first`/`empty?`/`seq` over each shape (and in
+    // test position), `next`/`rest` over owned operands (a last-use
+    // seq steps in place, a shared one gets a fresh tail; metadata
+    // stays on string seqs only), O(1) vector/string seqs and their
+    // 32-item chunks.
+    (
+        r#"((fn [l v s e] [(first nil) (first l) (first ()) (first v) (first []) (first s) (first "") (first (seq v)) (first (rest v)) (first e) (if (first v) :y :n) (if (first [false]) :y :n)]) '(1 2) [3 4] "ab" (map inc [1]))"#,
+        r#"[nil 1 nil 3 nil \a nil 3 4 2 :y :n]"#,
+    ),
+    (
+        r#"((fn [e] [(empty? nil) (empty? '(1)) (empty? ()) (empty? [1]) (empty? []) (empty? {:a 1}) (empty? {}) (empty? #{1}) (empty? #{}) (empty? "a") (empty? "") (empty? (seq [1])) (empty? (rest [1])) (empty? e) (if (empty? []) :y :n) (if (empty? "x") :y :n)]) (map inc [1]))"#,
+        r#"[true false true false true false true false true false true false true false :y :n]"#,
+    ),
+    (
+        r#"((fn [e] [(seq nil) (seq ()) (seq '(1)) (seq []) (seq [1 2]) (seq "") (seq "ab") (seq (seq [1])) (seq (rest [1 2])) (seq {}) (seq e) (if (seq []) :y :n) (if (seq "a") :y :n) (if (seq (rest [1])) :y :n) (if (seq {:a 1}) :y :n)]) (map inc [1]))"#,
+        r#"[nil nil (1) nil (1 2) nil (\a \b) (1) (2) nil (2) :n :y :n :y]"#,
+    ),
+    (
+        r#"((fn [e m] [(next nil) (next ()) (next '(1)) (next '(1 2)) (next []) (next [1]) (next [1 2 3]) (next "") (next "a") (next "ab") (next "aé") (next e) (next m) (rest nil) (rest ()) (rest '(1)) (rest [1]) (rest "a") (rest "abc") (rest e)]) (map inc [1 2]) {:a 1})"#,
+        r#"[nil nil nil (2) nil nil (2 3) nil nil (\b) (\é) (3) nil () () () () () (\b \c) (3)]"#,
+    ),
+    (
+        r#"(loop [s (seq [1 2 3]) n 0] (if s (recur (next s) (inc n)) n))"#,
+        r#"3"#,
+    ),
+    (
+        r#"(loop [s (seq "aéz") acc []] (if s (let [c (first s)] (recur (next s) (conj acc c))) acc))"#,
+        r#"[\a \é \z]"#,
+    ),
+    (
+        r#"(loop [s (seq [1 2 3]) acc []] (if (seq s) (let [x (first s)] (recur (rest s) (conj acc x))) acc))"#,
+        r#"[1 2 3]"#,
+    ),
+    (
+        r#"(let [s (seq [1 2 3]) t (next s)] [s t (next t) (next (next t)) (rest (rest t)) (rest (rest (rest t)))])"#,
+        r#"[(1 2 3) (2 3) (3) nil () ()]"#,
+    ),
+    (
+        r#"(let [s (seq "xyz") t (rest s)] [s t (rest t) (next (rest t)) (rest (rest (rest t)))])"#,
+        r#"[(\x \y \z) (\y \z) (\z) nil ()]"#,
+    ),
+    (
+        r#"[(let [s (with-meta (seq "abc") {:a 1})] (meta (next s))) (let [s (with-meta (seq [1 2 3]) {:a 1})] (meta (next s))) (let [s (with-meta (seq "abc") {:a 1})] [(meta (rest s)) (meta s)])]"#,
+        r#"[{:a 1} nil [{:a 1} {:a 1}]]"#,
+    ),
+    (
+        r#"(let [s (with-meta (seq [1 2 3]) {:a 1}) t (rest s)] [(meta s) (meta t)])"#,
+        r#"[{:a 1} nil]"#,
+    ),
+    (
+        r#"[(count (chunk-first (seq (vec (range 40))))) (count (chunk-first (rest (seq (vec (range 40)))))) (count (chunk-first (seq (vec (map str (range 40)))))) (first (chunk-rest (seq (vec (range 40))))) (count (chunk-first (rest (seq (vec (map str (range 40)))))))]"#,
+        r#"[32 31 32 32 31]"#,
+    ),
+    (
+        r#"[(count (map inc (vec (range 70)))) (last (map str (vec (map str (range 70))))) (apply str (map identity "the quick brown fox jumps over the lazy dog!")) (count (seq "aéz")) (count (rest (seq "abc"))) (count (seq [1 2 3])) (count (rest (seq [1 2 3])))]"#,
+        r#"[70 "69" "the quick brown fox jumps over the lazy dog!" 3 2 3 2]"#,
+    ),
+    (
+        r#"(let [v (vec (range 3))] (loop [s v acc 0] (if (empty? s) acc (recur (rest s) (+ acc (first s))))))"#,
+        r#"3"#,
+    ),
+    (
+        r#"(let [w "hello"] (loop [cs (seq w) n 0] (if (nil? cs) n (recur (next cs) (inc n)))))"#,
+        r#"5"#,
+    ),
+    (
+        r#"[(chunked-seq? (seq [1 2])) (chunked-seq? (seq "ab")) (chunked-seq? (rest (seq [1 2]))) (class (seq "ab")) (class (next (seq "ab"))) (class (seq [1])) (class (rest (seq [1 2])))]"#,
+        r#"[true false true clojure.lang.StringSeq clojure.lang.StringSeq clojure.lang.PersistentVector$ChunkedSeq clojure.lang.PersistentVector$ChunkedSeq]"#,
+    ),
 ];
 
 const PORT_ROWS: &[(&str, &str)] = &[
@@ -255,6 +324,14 @@ const PORT_ROWS: &[(&str, &str)] = &[
     (
         r#"(do (defn r-lt [a b] (if (< a b) :lt :ge)) (with-redefs [< >] (r-lt 1 2)))"#,
         r#":ge"#,
+    ),
+    (
+        r#"(do (defn r-next [s] (next s)) (with-redefs [next (fn [s] [:redef s])] (r-next [1 2])))"#,
+        r#"[:redef [1 2]]"#,
+    ),
+    (
+        r#"(do (defn r-rest [s] [(rest s) (first s)]) (with-redefs [rest (fn [s] :redef)] (r-rest [1 2])))"#,
+        r#"[:redef 1]"#,
     ),
 ];
 

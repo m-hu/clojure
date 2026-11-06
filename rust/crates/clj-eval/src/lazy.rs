@@ -859,30 +859,10 @@ fn step_list_unit(l: &List) -> Result<StepUnit, Signal> {
 /// Step a vector (chunked-lazy: 32 items realize per step, like
 /// strings — the old code collected every item eagerly, twice).
 fn step_vector_unit(x: &Vector) -> Result<StepUnit, Signal> {
-    if x.is_empty() {
-        return Ok(StepUnit::Empty);
+    match Seq::vector_from(x.clone(), 0) {
+        None => Ok(StepUnit::Empty),
+        Some(s) => step_seq(&s, true, true, SeqKind::Chunked, None),
     }
-    let s = vec_chunk_seq(x.clone(), 0).expect("non-empty vector yields a first chunk");
-    step_seq(&s, true, true, SeqKind::Chunked, None)
-}
-
-/// The [`CHUNK_SIZE`]-item chunk at `pos` plus a lazy tail (`None`
-/// past the end). Dropped chunks free, so walking a vector-seq
-/// holds O(1) items no matter the vector's size.
-fn vec_chunk_seq(v: Vector, pos: usize) -> Option<Seq> {
-    // `pos < len`, so the chunk below always holds at least one
-    // item (no empty tail — the boundary check above is the only
-    // `None`).
-    if pos >= v.len() {
-        return None;
-    }
-    let end = (pos + CHUNK_SIZE).min(v.len());
-    let mut chunk = Vec::with_capacity(end - pos);
-    for i in pos..end {
-        chunk.push(v.get(i).expect("chunk index within bounds"));
-    }
-    let tail = Seq::lazy(move || vec_chunk_seq(v.clone(), end));
-    Some(Seq::chunk_cons(chunk, tail))
 }
 
 /// Step a map (small maps keep `Map` kind).
@@ -907,39 +887,13 @@ fn step_set_unit(s: &Set) -> Result<StepUnit, Signal> {
     )
 }
 
-/// Step a string.
-fn step_str_unit(s: &str) -> Result<StepUnit, Signal> {
-    if s.is_empty() {
-        return Ok(StepUnit::Empty);
+/// Step a string (its 32-char chunks realize on demand, O(1) per
+/// step over the shared string, like the JVM's `StringSeq`).
+fn step_str_unit(s: &Arc<str>) -> Result<StepUnit, Signal> {
+    match Seq::string_from(Arc::clone(s), 0, 0) {
+        None => Ok(StepUnit::Empty),
+        Some(seq) => step_seq(&seq, true, true, SeqKind::Str, None),
     }
-    // One shared copy of the string; chunks realize 32 chars on
-    // demand (like the JVM's `StringSeq`, O(1) per step — the old
-    // code materialized every char eagerly, 72 bytes each).
-    let shared: Arc<str> = Arc::from(s);
-    let seq = str_chunk_seq(shared, 0).expect("non-empty string yields a first chunk");
-    step_seq(&seq, true, true, SeqKind::Str, None)
-}
-
-/// The [`CHUNK_SIZE`]-char chunk at byte `pos` plus a lazy tail
-/// (`None` past the end). Steps advance through the chunk, then
-/// force the tail thunk for the next chunk; dropped chunks free,
-/// so walking a string holds O(1) chars.
-fn str_chunk_seq(s: Arc<str>, pos: usize) -> Option<Seq> {
-    let rest = s.get(pos..)?;
-    let mut chunk = Vec::new();
-    let mut next = pos;
-    for (i, ch) in rest.char_indices() {
-        if chunk.len() == CHUNK_SIZE {
-            break;
-        }
-        chunk.push(Value::Char(ch));
-        next = pos + i + ch.len_utf8();
-    }
-    if chunk.is_empty() {
-        return None;
-    }
-    let tail = Seq::lazy(move || str_chunk_seq(Arc::clone(&s), next));
-    Some(Seq::chunk_cons(chunk, tail))
 }
 
 /// Step one input: empty, one head, or a whole chunk (chunked
@@ -991,10 +945,13 @@ fn step_seq(
         // `chunk_next` never yields empty chunks (`Seq::chunked`
         // rejects empties; `next` keeps `pos < len`).
         let tail = Value::Extension(Arc::new(seq_tail(rest, counted, idrop, kind, meta)));
-        return Ok(StepUnit::Chunk {
-            items: Arc::from(chunk),
-            tail,
-        });
+        // One copy into the chunk (a borrowed vector leaf clones its
+        // items; a string or packed chunk is already owned).
+        let items: Arc<[Value]> = match chunk {
+            std::borrow::Cow::Borrowed(b) => Arc::from(b),
+            std::borrow::Cow::Owned(v) => Arc::from(v),
+        };
+        return Ok(StepUnit::Chunk { items, tail });
     }
     match s.first() {
         None => Ok(StepUnit::Empty),
@@ -2957,7 +2914,7 @@ fn chunked_realized_parts(s: &RealizedSeq) -> Option<(crate::collmisc::ChunkValu
                 s.kind(),
             ))))
         };
-        return Some((crate::collmisc::head_chunk(items.to_vec()), tail));
+        return Some((crate::collmisc::head_chunk(items.into_owned()), tail));
     }
     // Defensive: chunked kind over an eager shape (no constructor
     // builds this today) — split the first 32 items off.
@@ -3188,16 +3145,15 @@ pub(crate) fn check_seqable(eval: &mut Evaluator, v: &Value) -> Result<(), Signa
 
 /// `seq` of a vector (chunked).
 fn seq_vector(x: &Vector) -> Value {
-    if x.is_empty() {
-        return Value::Nil;
+    match Seq::vector_from(x.clone(), 0) {
+        None => Value::Nil,
+        Some(seq) => Value::Extension(Arc::new(RealizedSeq::flagged(
+            seq,
+            true,
+            true,
+            SeqKind::Chunked,
+        ))),
     }
-    let seq = vec_chunk_seq(x.clone(), 0).expect("non-empty vector yields a first chunk");
-    Value::Extension(Arc::new(RealizedSeq::flagged(
-        seq,
-        true,
-        true,
-        SeqKind::Chunked,
-    )))
 }
 
 /// `seq` of a map (small maps keep `Map` kind).
@@ -3226,20 +3182,18 @@ fn seq_set(s: &Set) -> Value {
     )
 }
 
-/// `seq` of a string (chunked-lazy: the first 32 chars realize
-/// now, the rest on demand — same flags as the old eager seq).
-fn seq_str(s: &str) -> Value {
-    if s.is_empty() {
-        return Value::Nil;
+/// `seq` of a string: O(1) over the shared string, like the JVM's
+/// `StringSeq` (same flags as the old eager seq).
+fn seq_str(s: &Arc<str>) -> Value {
+    match Seq::string_from(Arc::clone(s), 0, 0) {
+        None => Value::Nil,
+        Some(seq) => Value::Extension(Arc::new(RealizedSeq::flagged(
+            seq,
+            true,
+            true,
+            SeqKind::Str,
+        ))),
     }
-    let shared: Arc<str> = Arc::from(s);
-    let seq = str_chunk_seq(shared, 0).expect("non-empty string yields a first chunk");
-    Value::Extension(Arc::new(RealizedSeq::flagged(
-        seq,
-        true,
-        true,
-        SeqKind::Str,
-    )))
 }
 
 /// Nil-punning `seq`: nil for empties, the seq value otherwise.
@@ -3579,6 +3533,115 @@ fn rest_of_seq(eval: &mut Evaluator, s: &Value) -> Result<Value, Signal> {
             .unwrap_or_else(empty_list_value));
     }
     rest_extension(eval, s)
+}
+
+/// A fresh realized seq of `seq` (counted, `IDrop`), as `seq` of a
+/// vector or string builds it.
+fn realized_of(seq: Seq, kind: SeqKind) -> Value {
+    Value::Extension(Arc::new(RealizedSeq::flagged(seq, true, true, kind)))
+}
+
+/// `first` without the evaluator (#226 VM op): the native's answer
+/// for nil, lists, vectors, strings and realized seqs (`None` runs
+/// the native).
+pub(crate) fn first_fast(v: &Value) -> Option<Value> {
+    match v {
+        Value::Nil => Some(Value::Nil),
+        Value::List(l) => Some(l.first().cloned().unwrap_or(Value::Nil)),
+        Value::Vector(x) => Some(x.get(0).unwrap_or(Value::Nil)),
+        Value::Str(s) => Some(s.chars().next().map_or(Value::Nil, Value::Char)),
+        _ => as_realized(v).map(|r| r.seq().first().cloned().unwrap_or(Value::Nil)),
+    }
+}
+
+/// `empty?` without the evaluator (#226 VM op): the native's answer
+/// for nil, the counted collections, strings and realized seqs — a
+/// realized seq answers from its head, never by counting (`None`
+/// runs the native).
+pub(crate) fn empty_fast(v: &Value) -> Option<bool> {
+    match v {
+        Value::Nil => Some(true),
+        Value::List(l) => Some(l.is_empty()),
+        Value::Vector(x) => Some(x.is_empty()),
+        Value::Map(m) => Some(m.is_empty()),
+        Value::Set(s) => Some(s.is_empty()),
+        Value::Str(s) => Some(s.is_empty()),
+        _ => as_realized(v).map(|r| r.seq().is_empty()),
+    }
+}
+
+/// `seq` without the evaluator (#226 VM op): nil, lists, vectors,
+/// strings and realized seqs (`None` runs the native).
+pub(crate) fn seq_fast(v: &Value) -> Option<Value> {
+    match v {
+        Value::Nil => Some(Value::Nil),
+        Value::List(l) => Some(if l.is_empty() { Value::Nil } else { v.clone() }),
+        Value::Vector(x) => Some(seq_vector(x)),
+        Value::Str(s) => Some(seq_str(s)),
+        _ => as_realized(v).map(|r| seq_realized(v, r)),
+    }
+}
+
+/// `next` (`rest` when `rest`) without the evaluator, over an owned
+/// operand (#226 VM op; `None` leaves it for the native): a realized
+/// seq held once steps in place, with no new seq value; vectors and
+/// strings seq from their second item without a copy.
+pub(crate) fn next_owned(coll: &mut Value, rest: bool) -> Option<Value> {
+    let end = || if rest { empty_list_value() } else { Value::Nil };
+    match std::mem::replace(coll, Value::Nil) {
+        Value::Nil => Some(end()),
+        Value::List(l) => {
+            let tail = l
+                .drop_first()
+                .map(|t| Value::List(t.with_meta(None)))
+                .unwrap_or_else(empty_list_value);
+            Some(nil_punned(tail, rest))
+        }
+        Value::Vector(v) => {
+            Some(Seq::vector_from(v, 1).map_or_else(end, |s| realized_of(s, SeqKind::Chunked)))
+        }
+        Value::Str(s) => {
+            let step = s.chars().next().map_or(0, char::len_utf8);
+            Some(Seq::string_from(s, step, 1).map_or_else(end, |s| realized_of(s, SeqKind::Str)))
+        }
+        Value::Extension(e) => next_extension(coll, e, rest),
+        other => {
+            *coll = other;
+            None
+        }
+    }
+}
+
+/// [`next_owned`] of an extension value: a realized seq held once
+/// steps in place; a shared one gets a fresh tail; anything else goes
+/// back in `coll` for the native (`None`).
+fn next_extension(
+    coll: &mut Value,
+    mut e: Arc<dyn clj_value::ExtensionValue>,
+    rest: bool,
+) -> Option<Value> {
+    let stepped = Arc::get_mut(&mut e)
+        .and_then(|x| x.as_any_mut())
+        .and_then(|a| a.downcast_mut::<RealizedSeq>())
+        .map(RealizedSeq::advance);
+    match stepped {
+        Some(true) => Some(Value::Extension(e)),
+        Some(false) => Some(if rest { empty_list_value() } else { Value::Nil }),
+        None => {
+            *coll = Value::Extension(e);
+            as_realized(coll).map(|r| nil_punned(rest_realized_seq(r), rest))
+        }
+    }
+}
+
+/// A `rest` tail as `next` answers it (`rest` keeps it): `nil` for
+/// the empty list.
+fn nil_punned(tail: Value, rest: bool) -> Value {
+    if !rest && matches!(&tail, Value::List(t) if t.is_empty()) {
+        Value::Nil
+    } else {
+        tail
+    }
 }
 
 /// `rest`: a seq value, never nil (empty lists print `()`).

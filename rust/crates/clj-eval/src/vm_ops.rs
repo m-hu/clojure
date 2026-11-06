@@ -523,6 +523,21 @@ const UNARY: &[Row1] = &[
         Some(shape1::<IsSome, AsTest>),
     ),
     ("count", shape1::<Count, AsValue>, None),
+    (
+        "first",
+        shape1::<First, AsValue>,
+        Some(shape1::<First, AsTest>),
+    ),
+    (
+        "seq",
+        shape1::<SeqOp, AsValue>,
+        Some(shape1::<SeqOp, AsTest>),
+    ),
+    (
+        "empty?",
+        shape1::<EmptyP, AsValue>,
+        Some(shape1::<EmptyP, AsTest>),
+    ),
     ("int", shape1::<IntCast, AsValue>, None),
     ("long", shape1::<LongCast, AsValue>, None),
     ("double", shape1::<DoubleCast, AsValue>, None),
@@ -622,6 +637,9 @@ pub(crate) enum Coll {
 /// collection is read — last, so the last-use analysis can move it
 /// even when the other operands read it ([`update_order`]).
 fn upd<O: Upd>(c: Site, coll: Coll, rest: Vec<Operand>) -> Exec {
+    if rest.is_empty() {
+        return upd1::<O>(c, coll);
+    }
     Box::new(move |ev, f| {
         let valid = ev.site_direct_valid(c.sid, &c.call);
         let mut args: SmallVec<[Value; 4]> = SmallVec::new();
@@ -646,11 +664,35 @@ fn upd<O: Upd>(c: Site, coll: Coll, rest: Vec<Operand>) -> Exec {
     })
 }
 
+/// A one-operand update op (`next`, `rest`): the collection alone,
+/// with no argument buffer unless the native runs.
+fn upd1<O: Upd>(c: Site, coll: Coll) -> Exec {
+    Box::new(move |ev, f| {
+        let valid = ev.site_direct_valid(c.sid, &c.call);
+        let mut a = match &coll {
+            Coll::Exec(e) => e(ev, f)?,
+            Coll::Take(r) => std::mem::replace(&mut f.regs[*r], Value::Nil),
+            Coll::Read(o) => o.eval(ev, f)?,
+        };
+        if valid {
+            if let Some(v) = O::apply(std::slice::from_mut(&mut a)) {
+                return Ok(v);
+            }
+        }
+        native(ev, &c, smallvec![a])
+    })
+}
+
 /// The update ops by core name and arg count.
 /// An update-op table row: core name, arg count, code constructor.
 type UpdRow = (&'static str, usize, UpdCtor);
 
-const UPDATES: &[UpdRow] = &[("assoc", 3, upd::<Assoc>), ("conj", 2, upd::<Conj>)];
+const UPDATES: &[UpdRow] = &[
+    ("assoc", 3, upd::<Assoc>),
+    ("conj", 2, upd::<Conj>),
+    ("next", 1, upd::<Next>),
+    ("rest", 1, upd::<Rest>),
+];
 
 /// An update op's code constructor (see [`upd`]).
 pub(crate) type UpdCtor = fn(Site, Coll, Vec<Operand>) -> Exec;
@@ -928,6 +970,72 @@ impl Op1 for Count {
     #[inline(always)]
     fn apply(a: &Value) -> Option<Value> {
         crate::vm_intrinsics::count_of(a)
+    }
+}
+
+/// `(first coll)` over nil, lists, vectors, strings and realized
+/// seqs ([`crate::lazy::first_fast`]).
+pub(crate) struct First;
+
+impl Op1 for First {
+    #[inline(always)]
+    fn apply(a: &Value) -> Option<Value> {
+        crate::lazy::first_fast(a)
+    }
+}
+
+/// `(seq coll)` over nil, lists, vectors, strings and realized seqs;
+/// as a test, its truth without building the seq.
+pub(crate) struct SeqOp;
+
+impl Op1 for SeqOp {
+    #[inline(always)]
+    fn apply(a: &Value) -> Option<Value> {
+        crate::lazy::seq_fast(a)
+    }
+
+    #[inline(always)]
+    fn test(a: &Value) -> Option<bool> {
+        crate::lazy::empty_fast(a).map(|e| !e)
+    }
+}
+
+/// `(empty? coll)` over nil, the counted collections, strings and
+/// realized seqs.
+pub(crate) struct EmptyP;
+
+impl Op1 for EmptyP {
+    #[inline(always)]
+    fn apply(a: &Value) -> Option<Value> {
+        crate::lazy::empty_fast(a).map(Value::Bool)
+    }
+
+    #[inline(always)]
+    fn test(a: &Value) -> Option<bool> {
+        crate::lazy::empty_fast(a)
+    }
+}
+
+/// `(next coll)` over an owned operand ([`crate::lazy::next_owned`]):
+/// a last-use seq steps in place.
+pub(crate) struct Next;
+
+impl Upd for Next {
+    #[inline(always)]
+    fn apply(args: &mut [Value]) -> Option<Value> {
+        let [coll] = args else { return None };
+        crate::lazy::next_owned(coll, false)
+    }
+}
+
+/// `(rest coll)`, like [`Next`] but `()` at the end.
+pub(crate) struct Rest;
+
+impl Upd for Rest {
+    #[inline(always)]
+    fn apply(args: &mut [Value]) -> Option<Value> {
+        let [coll] = args else { return None };
+        crate::lazy::next_owned(coll, true)
     }
 }
 

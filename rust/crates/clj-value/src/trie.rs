@@ -138,6 +138,22 @@ impl PVec {
         self.leaf(i).get(i & MASK)
     }
 
+    /// The items from `i` to the end of the leaf (or tail) holding
+    /// it, borrowed (empty past the end): a vector seq's current
+    /// chunk. Leaves and the tail start on multiples of 32, so the
+    /// chunks of a walk from 0 are the JVM's `ChunkedSeq` chunks.
+    #[must_use]
+    pub fn chunk_from(&self, i: usize) -> &[Value] {
+        if i >= self.len {
+            return &[];
+        }
+        let off = self.tail_offset();
+        if i >= off {
+            return &self.tail[i - off..];
+        }
+        &self.leaf(i)[i & MASK..]
+    }
+
     /// Append an item.
     pub fn push_back_mut(&mut self, v: Value) {
         if self.tail.len() < WIDTH {
@@ -420,5 +436,15 @@ mod tests {
         assert_eq!(ints(&big), (0..40).collect::<Vec<_>>());
         let mixed = PVec::from_vec(vec![Value::Nil, Value::Int(3)]);
         assert_eq!(ints(&mixed), vec![3]);
+    }
+
+    #[test]
+    fn chunks_borrow_leaves_and_tail() {
+        let v: PVec = (0..70).map(Value::Int).collect();
+        // A leaf from its middle, the second leaf, then the tail.
+        assert_eq!(v.chunk_from(5).len(), 27);
+        assert_eq!(v.chunk_from(32).len(), 32);
+        assert_eq!(v.chunk_from(65).len(), 5);
+        assert!(v.chunk_from(70).is_empty());
     }
 }
