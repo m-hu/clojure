@@ -2164,9 +2164,46 @@ const STATIC_LATTICE: &[StaticRow] = &[
     },
 ];
 
-/// A static lattice row by binary name.
+/// A per-static-row memo (classes, supertype sets), by row name.
+type StaticCache<T> = std::collections::HashMap<&'static str, T>;
+
+/// A static lattice row by binary name. Indexed once (#226): every
+/// `class`/`instance?` looks rows up — the value's class and each
+/// supertype — and a scan of the 325 rows cost each lookup hundreds
+/// of string compares. The first row of a name wins, as the scan did.
 fn static_row(name: &str) -> Option<&'static StaticRow> {
-    STATIC_LATTICE.iter().find(|r| r.name == name)
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static StaticRow>> =
+        std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| STATIC_LATTICE.iter().rev().map(|r| (r.name, r)).collect())
+        .get(name)
+        .copied()
+}
+
+/// A static class's transitive supertype names (memoized: the static
+/// lattice never changes, and static names resolve before user types,
+/// so this is the set [`closure_contains`] walks — dangling names
+/// included).
+fn static_supers(row: &'static StaticRow) -> Arc<HashSet<&'static str>> {
+    static SUPERS: std::sync::OnceLock<Mutex<StaticCache<Arc<HashSet<&'static str>>>>> =
+        std::sync::OnceLock::new();
+    let mut cache = SUPERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let set = cache.entry(row.name).or_insert_with(|| {
+        let mut out: HashSet<&'static str> = HashSet::new();
+        let mut stack: Vec<&'static str> = row.bases.to_vec();
+        while let Some(name) = stack.pop() {
+            if out.insert(name) {
+                if let Some(r) = static_row(name) {
+                    stack.extend(r.bases.iter().copied());
+                }
+            }
+        }
+        Arc::new(out)
+    });
+    Arc::clone(set)
 }
 
 /// The JVM default imports (`RT.DEFAULT_IMPORTS`, #74) in upstream
@@ -2310,13 +2347,23 @@ pub(crate) fn default_imports() -> impl Iterator<Item = (String, Arc<ClassVal>)>
 
 /// A static lattice row as a class value.
 fn static_class(name: &str) -> Option<Arc<ClassVal>> {
-    static_row(name).map(|r| {
+    // Built once per row (#226): a fresh class per lookup allocated
+    // its name and every supertype name (`class`/`instance?` hot).
+    static CLASSES: std::sync::OnceLock<Mutex<StaticCache<Arc<ClassVal>>>> =
+        std::sync::OnceLock::new();
+    let r = static_row(name)?;
+    let mut cache = CLASSES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let class = cache.entry(r.name).or_insert_with(|| {
         Arc::new(ClassVal::new(
             Arc::from(r.name),
             r.iface,
             r.bases.iter().map(|b| Arc::from(*b)).collect(),
         ))
-    })
+    });
+    Some(Arc::clone(class))
 }
 
 /// A static field read in value position (`Long/MAX_VALUE`):
@@ -2611,7 +2658,14 @@ pub(crate) fn is_instance_of(eval: &Evaluator, target: &str, x: &Value) -> bool 
     let Some(class) = class_of_value(x) else {
         return false;
     };
-    class.name() == target || closure_contains(eval, class.bases(), target)
+    if class.name() == target {
+        return true;
+    }
+    // Built-in values have static classes: their supertypes are fixed.
+    match static_row(class.name()).filter(|_| !matches!(x, Value::HostType(_))) {
+        Some(row) => static_supers(row).contains(target),
+        None => closure_contains(eval, class.bases(), target),
+    }
 }
 
 /// Whether the transitive supertypes of `bases` contain `target`.

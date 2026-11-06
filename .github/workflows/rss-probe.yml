@@ -22,7 +22,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rss-probe9
+          name: rss-probe10
           path: |
             probe-out.txt
             /tmp/out/

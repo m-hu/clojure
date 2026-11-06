@@ -331,6 +331,59 @@ const JVM_ROWS: &[(&str, &str)] = &[
         r#"[(str 1) (str -42 " " 0) (str Long/MIN_VALUE) (apply str (range 5)) (str 1 \a nil "b" 2.5 :k)]"#,
         r#"["1" "-42 0" "-9223372036854775808" "01234" "1ab2.5:k"]"#,
     ),
+    // Destructuring: plain map patterns on unsorted maps and positional
+    // patterns on vectors/map entries bind inline; every other shape
+    // (nil, sorted maps, seqs, strings, `:or`, `&`, nested) generally.
+    (
+        r#"((fn [m] (let [{a :a b "b" :keys [c d] :strs [e] :syms [g] :as all} m] [a b c d e g (count all)])) {:a 1 "b" 2 :c 3 "e" 5 'g 7})"#,
+        r#"[1 2 3 nil 5 7 5]"#,
+    ),
+    (
+        r#"((fn [x] (let [{a :a :keys [b]} x] [a b])) nil)"#,
+        r#"[nil nil]"#,
+    ),
+    (
+        r#"((fn [x] (let [{a :a :as all} x] [a all])) (sorted-map :a 1 :b 2))"#,
+        r#"[1 {:a 1, :b 2}]"#,
+    ),
+    (r#"((fn [x] (let [{a :a} x] a)) '(:a 9))"#, r#"9"#),
+    (r#"((fn [x] (let [{a :a :or {a 5}} x] a)) {})"#, r#"5"#),
+    (
+        r#"((fn [x] (let [{[p q] :pt} x] [p q])) {:pt [1 2]})"#,
+        r#"[1 2]"#,
+    ),
+    (
+        r#"((fn [x] (let [{a [1 2]} x] a)) {[1 2] :vec-key})"#,
+        r#":vec-key"#,
+    ),
+    (
+        r#"((fn [v] (let [[a b c :as all] v] [a b c all])) [1 2])"#,
+        r#"[1 2 nil [1 2]]"#,
+    ),
+    (r#"((fn [v] (let [[a b] v] [a b])) "xy")"#, r#"[\x \y]"#),
+    (r#"((fn [v] (let [[a b] v] [a b])) nil)"#, r#"[nil nil]"#),
+    (r#"((fn [v] (let [[a b] v] [a b])) '(1 2 3))"#, r#"[1 2]"#),
+    (
+        r#"((fn [v] (let [[a & more] v] [a more])) [1 2 3])"#,
+        r#"[1 (2 3)]"#,
+    ),
+    (r#"((fn [v] (let [[[a] b] v] [a b])) [[1] 2])"#, r#"[1 2]"#),
+    (
+        r#"(vec (for [[k v] {:a 1 :b 2}] [v k]))"#,
+        r#"[[1 :a] [2 :b]]"#,
+    ),
+    (
+        r#"((fn [e] (let [[k v x :as all] e] [k v x all])) (first {:a 1}))"#,
+        r#"[:a 1 nil [:a 1]]"#,
+    ),
+    (
+        r#"(let [f (fn [{:keys [a]} [b c]] [a b c])] (f {:a 1} [2 3]))"#,
+        r#"[1 2 3]"#,
+    ),
+    (
+        r#"(reduce (fn [{:keys [n s]} x] {:n (inc n) :s (+ s x)}) {:n 0 :s 0} [1 2 3])"#,
+        r#"{:n 3, :s 6}"#,
+    ),
 ];
 
 const PORT_ROWS: &[(&str, &str)] = &[

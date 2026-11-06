@@ -385,6 +385,87 @@ pub(crate) fn fixed_target(callee: &Value, argc: usize) -> Option<(&VmCode, &Com
     Some((code, arity))
 }
 
+/// A destructuring pattern the VM binds inline on its common value
+/// shape (#226: the general binder cost ~3K instructions a bind),
+/// leaving every other shape to the general binder.
+enum Unpack {
+    /// Lookups (`{a :a}`, `:keys`/`:strs`/`:syms`, then `:as`) on an
+    /// unsorted map: the `get` of each scalar key, in bind order.
+    Map { keys: Vec<Value>, whole: bool },
+    /// Positions (`[a b]`, then `:as`) on a vector or a map entry:
+    /// `nth` with a `nil` default.
+    Vec { n: usize, whole: bool },
+}
+
+/// The inline binding for `pat`, when it has one: only symbol locals,
+/// no `:or`/required keys/1.13 outlets/`&`, scalar lookup keys.
+fn inline_unpack(pat: &Pattern) -> Option<Unpack> {
+    match pat {
+        Pattern::Map(m) => inline_map(m).map(|keys| Unpack::Map {
+            keys,
+            whole: m.as_sym.is_some(),
+        }),
+        Pattern::Vec(v)
+            if v.rest.is_none() && v.fixed.iter().all(|p| matches!(p, Pattern::Symbol(_))) =>
+        {
+            Some(Unpack::Vec {
+                n: v.fixed.len(),
+                whole: v.as_sym.is_some(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A plain map pattern's lookup keys in bind order (`None` for
+/// anything the inline binding does not cover).
+fn inline_map(m: &crate::expr::MapPattern) -> Option<Vec<Value>> {
+    let outlets = [&m.select, &m.all, &m.excess, &m.missing];
+    if !m.or.is_empty() || !m.extra_keys.is_empty() || outlets.iter().any(|o| o.is_some()) {
+        return None;
+    }
+    let entries = m
+        .entries
+        .iter()
+        .map(|(local, key, _, req)| (matches!(local, Pattern::Symbol(_)) && !req).then_some(key));
+    let keys = m.keys.iter().map(|k| (!k.required).then_some(&k.key));
+    let keys: Option<Vec<Value>> = entries.chain(keys).map(|k| k.cloned()).collect();
+    keys.filter(|ks| ks.iter().all(crate::vm_intrinsics::is_scalar_key))
+}
+
+/// Bind `v` through `u` into `regs` (`false`, binding nothing, when
+/// `v`'s shape needs the general binder).
+fn unpack_inline(u: &Unpack, v: &Value, regs: &[usize], f: &mut Frame<'_>) -> bool {
+    let n = match (u, v) {
+        (Unpack::Map { keys, .. }, Value::Map(m)) if !m.is_sorted() => {
+            for (r, k) in regs.iter().zip(keys) {
+                f.regs[*r] = m.get(k).cloned().unwrap_or(Value::Nil);
+            }
+            keys.len()
+        }
+        (Unpack::Vec { n, .. }, Value::Vector(x)) => {
+            for (i, r) in regs.iter().take(*n).enumerate() {
+                f.regs[*r] = x.get(i).unwrap_or(Value::Nil);
+            }
+            *n
+        }
+        (Unpack::Vec { n, .. }, Value::MapEntry { key, val, .. }) => {
+            let items = [&**key, &**val];
+            for (i, r) in regs.iter().take(*n).enumerate() {
+                f.regs[*r] = items.get(i).map_or(Value::Nil, |x| (*x).clone());
+            }
+            *n
+        }
+        _ => return false,
+    };
+    if let (Unpack::Map { whole: true, .. } | Unpack::Vec { whole: true, .. }, Some(r)) =
+        (u, regs.get(n))
+    {
+        f.regs[*r] = v.clone();
+    }
+    true
+}
+
 /// Call a fixed arity: each arg evaluates straight into the
 /// callee's next register (depth-guarded like `apply_moved`).
 fn call_fixed(
@@ -834,9 +915,16 @@ impl Compiler {
     fn destructure_step(&mut self, pat: &Pattern, raw: usize) -> Exec {
         let env_locs = crate::vm_live::has_defaults(pat).then(|| self.visible_locs());
         let regs: Vec<usize> = (0..pattern_count(pat)).map(|_| self.push_local()).collect();
+        let inline = inline_unpack(pat);
         let pat = pat.clone();
         Box::new(move |ev, f| {
             let v = f.regs[raw].clone();
+            if inline
+                .as_ref()
+                .is_some_and(|u| unpack_inline(u, &v, &regs, f))
+            {
+                return Ok(Value::Nil);
+            }
             let env = env_locs
                 .as_ref()
                 .map_or_else(Env::new, |locs| frame_env(f, locs));
