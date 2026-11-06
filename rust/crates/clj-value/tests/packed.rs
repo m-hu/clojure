@@ -241,70 +241,160 @@ fn transient_generic_arms() {
     assert!(tv.pop().is_err());
 }
 
-/// Long runs never pack (#227): a shared packed update clones
-/// the whole run, so past the cap `Int` vectors ride the generic
-/// trie (log-time shared updates, no quadratic chains). The cap is
-/// 1024 (mirrors `MAX_PACKED_LEN` in value.rs).
+/// Long runs stay packed (#226): packed storage is the same
+/// persistent trie as generic, so a shared update path-copies in log
+/// time at any length (the #227 whole-run clone, and the 1024 cap it
+/// forced, are gone).
 #[test]
-fn long_runs_stay_generic() {
-    let v = Vector::from_vec(ints(1024));
-    assert!(v.is_packed());
+fn long_runs_stay_packed() {
     let v = Vector::from_vec(ints(1025));
-    assert!(!v.is_packed());
+    assert!(v.is_packed());
     let back: Vec<Value> = v.iter().collect();
     assert_eq!(back, ints(1025));
     let w = Vector::from_ints((0..2000).collect());
-    assert!(!w.is_packed());
+    assert!(w.is_packed());
     assert_eq!(w.len(), 2000);
     assert_eq!(w.get(1999), Some(Value::Int(1999)));
 }
 
-/// `push_back` past the cap unpacks once; both versions stay
-/// correct (persistence holds across the unpack).
+/// `push_back` of an `Int` keeps a long vector packed, and shared
+/// versions stay intact; a foreign value converts once.
 #[test]
-fn push_back_past_cap_unpacks_once() {
+fn push_back_keeps_packed_and_persistent() {
     let mut v = Vector::from_vec(ints(1024));
-    assert!(v.is_packed());
     v = v.push_back(Value::Int(1024));
-    assert!(!v.is_packed());
+    assert!(v.is_packed());
     assert_eq!(v.len(), 1025);
     let back: Vec<Value> = v.iter().collect();
     assert_eq!(back, ints(1025));
-    // Shared updates on the long vector keep every version intact.
     let shared = v.clone();
     let w = v.push_back(Value::Int(1025));
     assert_eq!(w.len(), 1026);
     assert_eq!(shared.len(), 1025);
     assert_eq!(shared.get(1024), Some(Value::Int(1024)));
     assert_eq!(w.get(1025), Some(Value::Int(1025)));
+    let mixed = shared.push_back(Value::Nil);
+    assert!(!mixed.is_packed());
+    assert_eq!(mixed.get(1025), Some(Value::Nil));
+    assert_eq!(mixed.get(1024), Some(Value::Int(1024)));
 }
 
 /// `assoc` on a long `Int` vector keeps every version intact (the
-/// generic trie path-copies; no whole-run clone per update).
+/// trie path-copies; no whole-run clone per update).
 #[test]
 fn set_nth_long_int_vector_persists() {
     let v = Vector::from_vec(ints(5000));
-    assert!(!v.is_packed());
+    assert!(v.is_packed());
     let w = v.set_nth(4999, Value::Int(7)).unwrap();
     assert_eq!(w.get(4999), Some(Value::Int(7)));
     assert_eq!(v.get(4999), Some(Value::Int(4999)));
     assert_eq!(w.len(), 5000);
+    assert!(v.set_nth(5000, Value::Int(1)).is_none());
 }
 
-/// `persistent!` of a long packed transient freezes generically
-/// with every item intact.
+/// `persistent!` of a long packed transient freezes packed with
+/// every item intact.
 #[test]
-fn transient_persistent_long_freezes_generic() {
+fn transient_persistent_long_freezes_packed() {
     let mut tv = TransientVector::new();
     for i in 0..2000 {
         tv.conj(Value::Int(i)).unwrap();
     }
     assert!(tv.is_packed());
     let frozen = tv.persistent().unwrap();
-    assert!(!frozen.is_packed());
+    assert!(frozen.is_packed());
     assert_eq!(frozen.len(), 2000);
     let back: Vec<Value> = frozen.iter().collect();
     assert_eq!(back, ints(2000));
+}
+
+fn chars(s: &str) -> Vec<Value> {
+    s.chars().map(Value::Char).collect()
+}
+
+/// A generic vector holding exactly `items` (packing never applies:
+/// it grows from a generic empty vector).
+fn generic_of(items: Vec<Value>) -> Vector {
+    let empty = Vector::from_vec(vec![Value::Nil]).drop_last().unwrap();
+    assert!(!empty.is_packed());
+    items.into_iter().fold(empty, Vector::push_back)
+}
+
+/// All-char vectors pack (4 bytes per char — a vector of a string's
+/// chars was 16x its text); packing stays invisible to `=`, `hash`,
+/// `nth`, chunks and iteration.
+#[test]
+fn char_vectors_pack_invisibly() {
+    let packed = Vector::from_vec(chars("hello, wörld"));
+    assert!(packed.is_packed());
+    let generic = generic_of(chars("hello, wörld"));
+    assert!(!generic.is_packed());
+    let (p, g) = (Value::Vector(packed.clone()), Value::Vector(generic));
+    assert_eq!(p, g);
+    assert_eq!(hash_of(&p), hash_of(&g));
+    assert_eq!(packed.get(8), Some(Value::Char('ö')));
+    assert_eq!(packed.iter().next_back(), Some(Value::Char('d')));
+    assert_eq!(packed.chunk_from(10).len(), 2);
+    assert_eq!(Vector::from_vec(ints(40)).chunk_from(3).len(), 29);
+    // Writes: chars stay packed; a foreign value converts once.
+    let w = packed.clone().push_back(Value::Char('!'));
+    assert!(w.is_packed() && w.len() == 13);
+    let s = packed.set_nth(0, Value::Char('H')).unwrap();
+    assert!(s.is_packed() && s.get(0) == Some(Value::Char('H')));
+    let f = packed.set_nth(0, Value::Int(1)).unwrap();
+    assert!(!f.is_packed() && f.get(1) == Some(Value::Char('e')));
+    let n = packed.clone().push_back(Value::Int(1));
+    assert!(!n.is_packed() && n.get(12) == Some(Value::Int(1)));
+    let d = packed.drop_last().unwrap();
+    assert!(d.is_packed() && d.len() == 11);
+    // Mixed input stays generic whichever kind comes first.
+    assert!(!Vector::from_vec(vec![Value::Char('a'), Value::Int(1)]).is_packed());
+    assert!(!Vector::from_vec(vec![Value::Int(1), Value::Char('a')]).is_packed());
+}
+
+/// An empty packed vector takes the type of its first item, either
+/// way round.
+#[test]
+fn empty_packed_vectors_retype() {
+    let c = Vector::new_sync().push_back(Value::Char('a'));
+    assert!(c.is_packed() && c.get(0) == Some(Value::Char('a')));
+    let i = c.drop_last().unwrap().push_back(Value::Int(7));
+    assert!(i.is_packed() && i.get(0) == Some(Value::Int(7)));
+    let g = Vector::new_sync().push_back(Value::Nil);
+    assert!(!g.is_packed());
+    let e = Vector::from_vec(Vec::new());
+    assert!(e.is_packed() && e.is_empty());
+}
+
+/// Char transients pack and freeze packed; empties retype; foreign
+/// values convert to generic, either way round.
+#[test]
+fn char_transients_pack() {
+    let mut tv = TransientVector::new();
+    tv.conj(Value::Char('a')).unwrap();
+    tv.conj(Value::Char('b')).unwrap();
+    tv.assoc(0, Value::Char('z')).unwrap();
+    assert!(tv.is_packed());
+    assert_eq!(tv.nth(0).unwrap(), Some(Value::Char('z')));
+    tv.pop().unwrap();
+    let frozen = tv.persistent().unwrap();
+    assert!(frozen.is_packed() && frozen.len() == 1);
+    // From a packed char vector, then a foreign value.
+    let mut tv = TransientVector::from_vector(&Vector::from_vec(chars("ab")));
+    assert!(tv.is_packed());
+    tv.conj(Value::Int(1)).unwrap();
+    assert!(!tv.is_packed());
+    assert_eq!(tv.nth(2).unwrap(), Some(Value::Int(1)));
+    // An `Int` buffer meeting a char converts too.
+    let mut tv = TransientVector::from_vector(&Vector::from_vec(ints(2)));
+    tv.conj(Value::Char('x')).unwrap();
+    assert!(!tv.is_packed());
+    // An emptied char buffer retypes to `Int`.
+    let mut tv = TransientVector::from_vector(&Vector::from_vec(chars("a")));
+    tv.pop().unwrap();
+    tv.conj(Value::Int(3)).unwrap();
+    assert!(tv.is_packed());
+    assert_eq!(tv.persistent().unwrap().get(0), Some(Value::Int(3)));
 }
 
 /// Metadata rides alongside packed storage (vectors stay `IObj`).

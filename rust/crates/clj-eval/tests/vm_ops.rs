@@ -298,6 +298,24 @@ const JVM_ROWS: &[(&str, &str)] = &[
         r#"[(chunked-seq? (seq [1 2])) (chunked-seq? (seq "ab")) (chunked-seq? (rest (seq [1 2]))) (class (seq "ab")) (class (next (seq "ab"))) (class (seq [1])) (class (rest (seq [1 2])))]"#,
         r#"[true false true clojure.lang.StringSeq clojure.lang.StringSeq clojure.lang.PersistentVector$ChunkedSeq clojure.lang.PersistentVector$ChunkedSeq]"#,
     ),
+    // `(apply str coll)` streams a realized coll into one string (lazy
+    // colls spread first); packed char vectors (#226 memory).
+    (
+        r#"[(apply str nil) (apply str [\a \b]) (apply str '(1 nil "x")) (apply str "abc") (apply str (map inc [1 2])) (apply str 1 2 [3]) (apply str 1 [\a nil]) (apply + 1 2 [3 4]) (apply max [3 1 2]) (apply str (seq [1 2])) (apply str (repeat 3 \q)) (apply str [])]"#,
+        r#"["" "ab" "1x" "abc" "23" "123" "1a" 10 3 "12" "qqq" ""]"#,
+    ),
+    (
+        r#"[(count (vec (repeat 40 \z))) (vec (repeat 3 \z)) (str \a "b" nil 1 :k) (apply str [[1 2] {:a 1} 'sym \c]) (apply vector 1 [2 3]) (apply list [])]"#,
+        r#"[40 [\z \z \z] "ab1:k" "[1 2]{:a 1}symc" [1 2 3] ()]"#,
+    ),
+    (
+        r#"(let [cur (transient [])] (dotimes [i 5] (conj! cur (char (+ 97 i)))) (apply str (persistent! cur)))"#,
+        r#""abcde""#,
+    ),
+    (
+        r#"[(conj (vec "abc") \d) (conj (vec "ab") 1) (assoc (vec "ab") 0 \z) (assoc (vec "ab") 1 :x) (pop (vec "ab")) (conj (pop [\a]) 1) (= (vec "ab") [\a \b]) (hash (vec "ab"))]"#,
+        r#"[[\a \b \c \d] [\a \b 1] [\z \b] [\a :x] [\a] [1] true -338459411]"#,
+    ),
 ];
 
 const PORT_ROWS: &[(&str, &str)] = &[

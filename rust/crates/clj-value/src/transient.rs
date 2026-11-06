@@ -76,12 +76,60 @@ fn ensure(valid: bool) -> Result<(), TransientError> {
 }
 
 /// Transient vector storage: all-`Int` buffers ride packed (8
-/// bytes per element); the first foreign value unpacks to generic
-/// (the foreign value stays, so the buffer never re-packs).
+/// bytes per element), all-char buffers too (4 bytes); an empty
+/// buffer takes the type of its first item, and the first foreign
+/// value converts to generic (which stays generic).
 #[derive(Clone, Debug)]
 enum TransientItems {
-    Packed(Vec<i64>),
+    Ints(Vec<i64>),
+    Chars(Vec<char>),
     Generic(Vec<Value>),
+}
+
+impl TransientItems {
+    /// Put `v` at `idx` (`idx == len` appends; callers bound `idx`):
+    /// an empty packed buffer retypes to `v`'s type, a foreign value
+    /// converts a packed buffer to generic.
+    fn put(&mut self, idx: usize, v: Value) {
+        let converted = match self {
+            TransientItems::Generic(x) => return put_at(x, idx, v),
+            TransientItems::Ints(x) => match v {
+                Value::Int(n) => return put_at(x, idx, n),
+                Value::Char(c) if x.is_empty() => TransientItems::Chars(vec![c]),
+                v => TransientItems::Generic(boxed_with(x, Value::Int, idx, v)),
+            },
+            TransientItems::Chars(x) => match v {
+                Value::Char(c) => return put_at(x, idx, c),
+                Value::Int(n) if x.is_empty() => TransientItems::Ints(vec![n]),
+                v => TransientItems::Generic(boxed_with(x, Value::Char, idx, v)),
+            },
+        };
+        *self = converted;
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            TransientItems::Ints(x) => x.len(),
+            TransientItems::Chars(x) => x.len(),
+            TransientItems::Generic(x) => x.len(),
+        }
+    }
+}
+
+/// A packed buffer boxed to values, with `v` put at `idx`.
+fn boxed_with<T: Copy>(x: &[T], box_item: fn(T) -> Value, idx: usize, v: Value) -> Vec<Value> {
+    let mut g: Vec<Value> = x.iter().map(|n| box_item(*n)).collect();
+    put_at(&mut g, idx, v);
+    g
+}
+
+/// Set `x[idx]`, or append at `idx == len`.
+fn put_at<T>(x: &mut Vec<T>, idx: usize, v: T) {
+    if idx == x.len() {
+        x.push(v);
+    } else {
+        x[idx] = v;
+    }
 }
 
 /// A transient vector: `conj!`/`pop!`/`assoc!` buffer.
@@ -96,7 +144,7 @@ impl TransientVector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            items: TransientItems::Packed(Vec::new()),
+            items: TransientItems::Ints(Vec::new()),
             valid: true,
         }
     }
@@ -104,8 +152,9 @@ impl TransientVector {
     /// A transient over `v`'s items.
     #[must_use]
     pub fn from_vector(v: &Vector) -> Self {
-        let items = match v.packed_slice() {
-            Some(ints) => TransientItems::Packed(ints.to_vec()),
+        let items = match v.typed_items() {
+            Some(crate::value::TypedItems::Ints(x)) => TransientItems::Ints(x),
+            Some(crate::value::TypedItems::Chars(x)) => TransientItems::Chars(x),
             None => TransientItems::Generic(v.iter().collect()),
         };
         Self { items, valid: true }
@@ -117,25 +166,12 @@ impl TransientVector {
 
     /// Append one value (`conj!` takes exactly one; arity is the
     /// core fn's job in S5). A foreign value into a packed buffer
-    /// expands it to generic in place (the foreign value stays, so
+    /// converts it to generic in place (the foreign value stays, so
     /// the buffer never re-packs).
     pub fn conj(&mut self, v: Value) -> Result<(), TransientError> {
         self.check()?;
-        match v {
-            Value::Int(n) => match &mut self.items {
-                TransientItems::Packed(ints) => ints.push(n),
-                TransientItems::Generic(items) => items.push(Value::Int(n)),
-            },
-            v => {
-                let mut generic: Vec<Value> =
-                    match std::mem::replace(&mut self.items, TransientItems::Packed(Vec::new())) {
-                        TransientItems::Packed(ints) => ints.into_iter().map(Value::Int).collect(),
-                        TransientItems::Generic(items) => items,
-                    };
-                generic.push(v);
-                self.items = TransientItems::Generic(generic);
-            }
-        }
+        let len = self.items.len();
+        self.items.put(len, v);
         Ok(())
     }
 
@@ -143,8 +179,9 @@ impl TransientVector {
     pub fn pop(&mut self) -> Result<(), TransientError> {
         self.check()?;
         let empty = match &mut self.items {
-            TransientItems::Packed(ints) => ints.pop().is_none(),
-            TransientItems::Generic(items) => items.pop().is_none(),
+            TransientItems::Ints(x) => x.pop().is_none(),
+            TransientItems::Chars(x) => x.pop().is_none(),
+            TransientItems::Generic(x) => x.pop().is_none(),
         };
         if empty {
             return Err(TransientError::EmptyPop);
@@ -155,41 +192,10 @@ impl TransientVector {
     /// Set index `idx` (`idx == len` appends, past that errors).
     pub fn assoc(&mut self, idx: usize, v: Value) -> Result<(), TransientError> {
         self.check()?;
-        let len = self.len()?;
-        if idx > len {
+        if idx > self.items.len() {
             return Err(TransientError::IndexOutOfBounds);
         }
-        match v {
-            Value::Int(n) => match &mut self.items {
-                TransientItems::Packed(ints) => {
-                    if idx == ints.len() {
-                        ints.push(n);
-                    } else {
-                        ints[idx] = n;
-                    }
-                }
-                TransientItems::Generic(items) => {
-                    if idx == items.len() {
-                        items.push(Value::Int(n));
-                    } else {
-                        items[idx] = Value::Int(n);
-                    }
-                }
-            },
-            v => {
-                let mut generic: Vec<Value> =
-                    match std::mem::replace(&mut self.items, TransientItems::Packed(Vec::new())) {
-                        TransientItems::Packed(ints) => ints.into_iter().map(Value::Int).collect(),
-                        TransientItems::Generic(items) => items,
-                    };
-                if idx == generic.len() {
-                    generic.push(v);
-                } else {
-                    generic[idx] = v;
-                }
-                self.items = TransientItems::Generic(generic);
-            }
-        }
+        self.items.put(idx, v);
         Ok(())
     }
 
@@ -197,18 +203,16 @@ impl TransientVector {
     pub fn nth(&self, idx: usize) -> Result<Option<Value>, TransientError> {
         self.check()?;
         Ok(match &self.items {
-            TransientItems::Packed(ints) => ints.get(idx).map(|n| Value::Int(*n)),
-            TransientItems::Generic(items) => items.get(idx).cloned(),
+            TransientItems::Ints(x) => x.get(idx).map(|n| Value::Int(*n)),
+            TransientItems::Chars(x) => x.get(idx).map(|c| Value::Char(*c)),
+            TransientItems::Generic(x) => x.get(idx).cloned(),
         })
     }
 
     /// The item count.
     pub fn len(&self) -> Result<usize, TransientError> {
         self.check()?;
-        Ok(match &self.items {
-            TransientItems::Packed(ints) => ints.len(),
-            TransientItems::Generic(items) => items.len(),
-        })
+        Ok(self.items.len())
     }
 
     /// Whether the vector is empty.
@@ -216,26 +220,30 @@ impl TransientVector {
         Ok(self.len()? == 0)
     }
 
-    /// Whether the buffer is still packed (all-`Int` so far).
+    /// Whether the buffer is still packed (all-`Int` or all-char so
+    /// far).
     #[must_use]
     pub fn is_packed(&self) -> bool {
-        matches!(self.items, TransientItems::Packed(_))
+        !matches!(self.items, TransientItems::Generic(_))
     }
 
     /// Freeze into a persistent vector (invalidates this transient).
     pub fn persistent(&mut self) -> Result<Vector, TransientError> {
         self.check()?;
         self.valid = false;
-        let items = std::mem::replace(&mut self.items, TransientItems::Packed(Vec::new()));
+        let items = std::mem::replace(&mut self.items, TransientItems::Ints(Vec::new()));
+        // Zero-copy for packed runs (no re-scan); growth slack is shed
+        // first — the frozen vector never grows.
         Ok(match items {
-            // Zero-copy: the packed run moves into the persistent
-            // vector (no re-scan, no second copy). Growth slack is
-            // shed first — the frozen vector never grows.
-            TransientItems::Packed(mut ints) => {
-                ints.shrink_to_fit();
-                Vector::from_ints(ints)
+            TransientItems::Ints(mut x) => {
+                x.shrink_to_fit();
+                Vector::from_ints(x)
             }
-            TransientItems::Generic(items) => Vector::from_vec(items),
+            TransientItems::Chars(mut x) => {
+                x.shrink_to_fit();
+                Vector::from_chars(x)
+            }
+            TransientItems::Generic(x) => Vector::from_vec(x),
         })
     }
 }

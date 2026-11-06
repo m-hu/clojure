@@ -279,8 +279,8 @@ def main():
     names = sorted(runs, key=lambda n: (-runs[n], first[n]))
     globs, done = [], set()
     for name in names:
-        if not re.fullmatch(r'[A-Za-z0-9_.$]+', name):
-            continue  # callgrind pseudo-entries such as `(below main)`
+        if not re.fullmatch(r'[A-Za-z0-9_.$]+', name) or name.startswith('0x'):
+            continue  # callgrind's `(below main)` and bare addresses
         g = glob(name)
         if g not in done:
             done.add(g)
@@ -290,7 +290,8 @@ def main():
         f.write('   profiles; see scripts/bench/hot-text/hot_text.py. Do not edit. */\n')
         f.write('SECTIONS\n{\n  .text.hot :\n  {\n')
         for g in globs:
-            f.write('    *(.text.%s .text.unlikely.%s)\n' % (g, g))
+            # `.text*.` also takes `.text.unlikely.` (`#[cold]` fns).
+            f.write('    *(.text*.%s)\n' % g)
         f.write('  }\n}\nINSERT BEFORE .text;\n')
     print('%d functions from %d profiles -> %d globs in %s' % (len(names), len(profiles), len(globs), out))
 

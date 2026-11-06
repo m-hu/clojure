@@ -246,36 +246,31 @@ pub struct Vector {
     id: u64,
 }
 
-/// Vector storage: the generic trie, or a shared packed `i64` run.
-/// Packing is decided at construction (`from_vec` scans, `from_ints`
-/// and packed transients skip the scan); `push_back` of an `Int`
-/// onto owned packed storage stays packed, anything else unpacks
-/// (one-time cost, then generic speed). Reads always stay packed.
+/// Vector storage: the generic trie of values, or the same trie over
+/// packed `i64`s or `char`s (#226: 8 or 4 bytes per element instead
+/// of a 64-byte `Value` — a vector of a string's chars was 16x its
+/// text). Typing is decided at construction (`from_vec` scans,
+/// `from_ints`/`from_chars` and typed transients skip the scan) and by
+/// the first item into an empty vector; a foreign value converts once
+/// to generic, which then stays generic. All three are the same
+/// persistent trie, so shared updates path-copy in log time
+/// whatever the type.
 #[derive(Clone, Debug)]
 enum VectorInner {
     Generic(RpdsVector),
-    Packed(Arc<Vec<i64>>),
+    Ints(crate::trie::PVec<i64>),
+    Chars(crate::trie::PVec<char>),
 }
 
-/// Longest packed `i64` run (#227): a shared packed update clones
-/// the whole run (`Arc::make_mut`), and loop-threaded vectors are
-/// shared at update time (the old binding is alive while the new
-/// value is computed), so an unbounded run turns `conj`/`assoc`
-/// chains quadratic. Past this length `Int` vectors ride the
-/// generic trie (log-time shared updates); at or below it a shared
-/// update clones at most 8KB.
-const MAX_PACKED_LEN: usize = 1024;
-
-/// Owned-value vector iteration (packed ints box on read). Neither
-/// `Clone` nor `Debug`: the generic arm wraps rpds's iterator,
-/// which implements neither.
+/// Owned-value vector iteration (typed items box on read).
 pub struct VectorIter<'a> {
     inner: VectorIterInner<'a>,
 }
 
 enum VectorIterInner<'a> {
     Generic(crate::trie::Iter<'a>),
-    Packed(std::slice::Iter<'a, i64>),
+    Ints(crate::trie::Iter<'a, i64>),
+    Chars(crate::trie::Iter<'a, char>),
 }
 
 impl Iterator for VectorIter<'_> {
@@ -284,14 +279,16 @@ impl Iterator for VectorIter<'_> {
     fn next(&mut self) -> Option<Value> {
         match &mut self.inner {
             VectorIterInner::Generic(it) => it.next().cloned(),
-            VectorIterInner::Packed(it) => it.next().map(|n| Value::Int(*n)),
+            VectorIterInner::Ints(it) => it.next().map(|n| Value::Int(*n)),
+            VectorIterInner::Chars(it) => it.next().map(|c| Value::Char(*c)),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
             VectorIterInner::Generic(it) => it.size_hint(),
-            VectorIterInner::Packed(it) => it.size_hint(),
+            VectorIterInner::Ints(it) => it.size_hint(),
+            VectorIterInner::Chars(it) => it.size_hint(),
         }
     }
 }
@@ -300,7 +297,8 @@ impl DoubleEndedIterator for VectorIter<'_> {
     fn next_back(&mut self) -> Option<Value> {
         match &mut self.inner {
             VectorIterInner::Generic(it) => it.next_back().cloned(),
-            VectorIterInner::Packed(it) => it.next_back().map(|n| Value::Int(*n)),
+            VectorIterInner::Ints(it) => it.next_back().map(|n| Value::Int(*n)),
+            VectorIterInner::Chars(it) => it.next_back().map(|c| Value::Char(*c)),
         }
     }
 }
@@ -608,134 +606,126 @@ impl List {
 }
 
 impl Vector {
-    /// An empty vector (packed: `conj` chains over `Int`s stay
-    /// packed from the first push).
+    /// An empty vector (typed by its first item: `conj` chains over
+    /// `Int`s or chars stay packed from the first push).
     #[must_use]
     pub fn new_sync() -> Self {
+        Self::of(VectorInner::Ints(crate::trie::PVec::new_sync()))
+    }
+
+    fn of(inner: VectorInner) -> Self {
         Self {
-            inner: VectorInner::Packed(Arc::new(Vec::new())),
+            inner,
             meta: None,
             id: next_vector_id(),
         }
     }
 
-    /// Build a vector from items in order (packed when every item
-    /// is an `Int` — one pass, completing generically at the first
-    /// foreign value or past `MAX_PACKED_LEN`).
+    /// Build a vector from items in order (packed when every item is
+    /// an `Int`, or every item a char; empty vectors start typed for
+    /// their first `conj`).
     #[must_use]
     pub fn from_vec(items: Vec<Value>) -> Self {
-        let mut items = items.into_iter();
-        // Exact capacity: all-`Int` input freezes with no slack.
-        let mut ints = Vec::with_capacity(items.len());
-        loop {
-            match items.next() {
-                None => return Self::from_ints(ints),
-                Some(Value::Int(n)) => ints.push(n),
-                Some(v) => {
-                    let mut all = Vec::with_capacity(ints.len() + 1 + items.len());
-                    all.extend(ints.into_iter().map(Value::Int));
-                    all.push(v);
-                    all.extend(items);
-                    let trie = RpdsVector::from_vec(all);
-                    return Self {
-                        inner: VectorInner::Generic(trie),
-                        meta: None,
-                        id: next_vector_id(),
-                    };
-                }
-            }
-        }
+        let typed = match items.first() {
+            None => return Self::new_sync(),
+            Some(Value::Int(_)) => items
+                .iter()
+                .map(|v| {
+                    if let Value::Int(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<i64>>>()
+                .map(Self::from_ints),
+            Some(Value::Char(_)) => items
+                .iter()
+                .map(|v| {
+                    if let Value::Char(c) = v {
+                        Some(*c)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<char>>>()
+                .map(Self::from_chars),
+            Some(_) => None,
+        };
+        typed.unwrap_or_else(|| Self::of(VectorInner::Generic(RpdsVector::from_vec(items))))
     }
 
-    /// Build a packed vector from `i64`s in order (no scan — for
-    /// callers that already know, like ranges and packed
-    /// transients). Past `MAX_PACKED_LEN` the vector rides the
-    /// generic trie instead (a long packed run would clone per
-    /// shared update — #227).
+    /// Build a packed `Int` vector from `i64`s in order (no scan — for
+    /// callers that already know, like ranges and packed transients).
     #[must_use]
     pub fn from_ints(ints: Vec<i64>) -> Self {
-        if ints.len() > MAX_PACKED_LEN {
-            let mut trie = RpdsVector::new_sync();
-            for n in ints {
-                trie.push_back_mut(Value::Int(n));
-            }
-            return Self {
-                inner: VectorInner::Generic(trie),
-                meta: None,
-                id: next_vector_id(),
-            };
-        }
-        Self {
-            inner: VectorInner::Packed(Arc::new(ints)),
-            meta: None,
-            id: next_vector_id(),
-        }
+        Self::of(VectorInner::Ints(crate::trie::PVec::from_vec(ints)))
     }
 
-    /// Whether this vector rides on packed `i64` storage (8 bytes
-    /// per element instead of one 72-byte `Value` per trie leaf).
+    /// Build a packed char vector from `char`s in order (no scan).
+    #[must_use]
+    pub fn from_chars(chars: Vec<char>) -> Self {
+        Self::of(VectorInner::Chars(crate::trie::PVec::from_vec(chars)))
+    }
+
+    /// Whether this vector rides on packed `i64` or `char` storage.
     #[must_use]
     pub fn is_packed(&self) -> bool {
-        matches!(self.inner, VectorInner::Packed(_))
+        !matches!(self.inner, VectorInner::Generic(_))
     }
 
-    /// The packed `i64` run when packed (`None` for the generic
-    /// trie) — for transients that freeze back to packed storage
-    /// without re-scanning.
-    #[must_use]
-    pub fn packed_slice(&self) -> Option<&[i64]> {
+    /// The packed items when typed (for transients that freeze back
+    /// to the same type without re-scanning).
+    pub(crate) fn typed_items(&self) -> Option<TypedItems> {
         match &self.inner {
-            VectorInner::Packed(ints) => Some(ints),
             VectorInner::Generic(_) => None,
+            VectorInner::Ints(t) => Some(TypedItems::Ints(t.iter().copied().collect())),
+            VectorInner::Chars(t) => Some(TypedItems::Chars(t.iter().copied().collect())),
+        }
+    }
+
+    /// An empty typed vector takes the type of a packable first item.
+    fn retype_empty(&mut self, v: &Value) {
+        if !self.is_packed() || !self.is_empty() {
+            return;
+        }
+        match (&self.inner, v) {
+            (VectorInner::Ints(_), Value::Char(_)) => {
+                self.inner = VectorInner::Chars(crate::trie::PVec::new_sync());
+            }
+            (VectorInner::Chars(_), Value::Int(_)) => {
+                self.inner = VectorInner::Ints(crate::trie::PVec::new_sync());
+            }
+            _ => {}
         }
     }
 
     /// Append a value.
     #[must_use]
     pub fn push_back(mut self, v: Value) -> Self {
-        // Through `&mut` (no `mem::replace` placeholder — even an
-        // empty trie `Arc::new`s its root, one alloc per `conj`
-        // before #227), so uniquely-owned `conj` chains mutate in
-        // place while versions shared with other handles still
-        // path-copy. Packed storage meeting a foreign value — or an
-        // `Int` at `MAX_PACKED_LEN` — rebuilds once (unpack), like
-        // [`set_nth_owned`](Self::set_nth_owned).
-        let unpack = match (&self.inner, &v) {
-            (VectorInner::Packed(ints), Value::Int(_)) => ints.len() >= MAX_PACKED_LEN,
-            (VectorInner::Packed(_), _) => true,
-            (VectorInner::Generic(_), _) => false,
+        // Through `&mut`, so uniquely-owned `conj` chains mutate in
+        // place while versions shared with other handles path-copy;
+        // a foreign value converts typed storage once (to generic,
+        // which stays generic).
+        self.retype_empty(&v);
+        let generic = match (&mut self.inner, v) {
+            (VectorInner::Generic(t), v) => {
+                t.push_back_mut(v);
+                None
+            }
+            (VectorInner::Ints(t), Value::Int(n)) => {
+                t.push_back_mut(n);
+                None
+            }
+            (VectorInner::Chars(t), Value::Char(c)) => {
+                t.push_back_mut(c);
+                None
+            }
+            (VectorInner::Ints(t), v) => Some(boxed(t, Value::Int, |g| g.push_back_mut(v))),
+            (VectorInner::Chars(t), v) => Some(boxed(t, Value::Char, |g| g.push_back_mut(v))),
         };
-        if unpack {
-            let mut out = RpdsVector::new_sync();
-            for n in self.packed_slice().expect("guarded packed above") {
-                out.push_back_mut(Value::Int(*n));
-            }
-            out.push_back_mut(v);
-            self.inner = VectorInner::Generic(out);
-            self.id = next_vector_id();
-            return self;
-        }
-        match &mut self.inner {
-            VectorInner::Generic(trie) => {
-                // Owned `self` means no other handle to this
-                // vector: mutate the trie in place instead of
-                // cloning the spine per push (rpds `push_back`
-                // clones unconditionally; `push_back_mut` still
-                // path-copies nodes shared with *other* versions).
-                trie.push_back_mut(v);
-            }
-            VectorInner::Packed(ints) => {
-                // Owned packed storage mutates in place when
-                // unique; `make_mut` copies the 8-byte run when
-                // shared — at most `MAX_PACKED_LEN` ints, since
-                // longer runs unpack above (a shared big run would
-                // clone per `conj`, turning chains quadratic — #227).
-                // `Int`-only below the cap here (foreign values and
-                // at-cap pushes unpacked above).
-                if let Value::Int(n) = v {
-                    Arc::make_mut(ints).push(n);
-                }
-            }
+        if let Some(g) = generic {
+            self.inner = VectorInner::Generic(g);
         }
         self.id = next_vector_id();
         self
@@ -756,52 +746,38 @@ impl Vector {
     /// out of bounds — `self` is consumed either way, so check
     /// [`len`](Self::len) first when the vector must survive).
     ///
-    /// The #212 pattern (`mut self` + `set_mut`): rpds path-copies
-    /// only nodes shared with *other* versions, so threading one
-    /// accumulator through an `assoc` chain mutates in place after
-    /// the first step instead of path-copying per step. Packed `Int`
-    /// storage mutates through `Arc::make_mut` (in place when
-    /// unique, at most `MAX_PACKED_LEN` ints when shared —
-    /// [`from_ints`](Self::from_ints) and
-    /// [`push_back`](Self::push_back) never build longer runs); a
-    /// foreign value unpacks once, like [`push_back`](Self::push_back).
+    /// The #212 pattern (`mut self` + `set_mut`): the trie
+    /// path-copies only nodes shared with *other* versions, so
+    /// threading one accumulator through an `assoc` chain mutates in
+    /// place after the first step. A foreign value converts typed
+    /// storage once, like [`push_back`](Self::push_back).
     #[must_use]
     pub fn set_nth_owned(mut self, index: usize, v: Value) -> Option<Self> {
-        // Packed storage meeting a foreign value rebuilds once
-        // (unpack); every other shape mutates through `&mut`, so
-        // uniquely-owned chains stay allocation-free (no
-        // `mem::replace` placeholder — even an empty trie would
-        // `Arc::new` its root).
-        if matches!(&self.inner, VectorInner::Packed(_)) && !matches!(v, Value::Int(_)) {
-            if index >= self.len() {
-                return None;
-            }
-            let mut out = RpdsVector::new_sync();
-            for n in self.packed_slice().expect("guarded packed above") {
-                out.push_back_mut(Value::Int(*n));
-            }
-            // `index` is below the length (guarded above over these
-            // same items), so this cannot fail.
-            assert!(out.set_mut(index, v));
-            self.inner = VectorInner::Generic(out);
-            self.id = next_vector_id();
-            return Some(self);
+        if index >= self.len() {
+            return None;
         }
-        match &mut self.inner {
-            VectorInner::Generic(trie) => {
-                if !trie.set_mut(index, v) {
-                    return None;
-                }
+        let generic = match (&mut self.inner, v) {
+            (VectorInner::Generic(t), v) => {
+                t.set_mut(index, v);
+                None
             }
-            VectorInner::Packed(ints) => {
-                if index >= ints.len() {
-                    return None;
-                }
-                // `Int`-only here (foreign values unpacked above).
-                if let Value::Int(n) = v {
-                    Arc::make_mut(ints)[index] = n;
-                }
+            (VectorInner::Ints(t), Value::Int(n)) => {
+                t.set_mut(index, n);
+                None
             }
+            (VectorInner::Chars(t), Value::Char(c)) => {
+                t.set_mut(index, c);
+                None
+            }
+            (VectorInner::Ints(t), v) => Some(boxed(t, Value::Int, |g| {
+                g.set_mut(index, v);
+            })),
+            (VectorInner::Chars(t), v) => Some(boxed(t, Value::Char, |g| {
+                g.set_mut(index, v);
+            })),
+        };
+        if let Some(g) = generic {
+            self.inner = VectorInner::Generic(g);
         }
         self.id = next_vector_id();
         Some(self)
@@ -822,77 +798,69 @@ impl Vector {
     /// `self` is consumed either way, so check
     /// [`is_empty`](Self::is_empty) first when the vector must survive).
     ///
-    /// The #212 pattern (`mut self` + `drop_last_mut`): packed
-    /// storage pops through `Arc::make_mut`, so `pop` chains over
-    /// uniquely-owned vectors mutate in place while versions shared
-    /// with other handles still path-copy (at most
-    /// `MAX_PACKED_LEN` ints — longer runs never pack).
+    /// The #212 pattern (`mut self` + `drop_last_mut`): `pop` chains
+    /// over uniquely-owned vectors mutate in place while versions
+    /// shared with other handles path-copy.
     #[must_use]
     pub fn drop_last_owned(mut self) -> Option<Self> {
-        // Through `&mut` (no `mem::replace` placeholder — even an
-        // empty trie would `Arc::new` its root), so uniquely-owned
-        // `pop` chains stay allocation-free.
-        match &mut self.inner {
-            VectorInner::Generic(trie) => {
-                if !trie.drop_last_mut() {
-                    return None;
-                }
-            }
-            VectorInner::Packed(ints) => {
-                if ints.is_empty() {
-                    return None;
-                }
-                Arc::make_mut(ints).pop();
-            }
+        let popped = match &mut self.inner {
+            VectorInner::Generic(t) => t.drop_last_mut(),
+            VectorInner::Ints(t) => t.drop_last_mut(),
+            VectorInner::Chars(t) => t.drop_last_mut(),
+        };
+        if !popped {
+            return None;
         }
         self.id = next_vector_id();
         Some(self)
     }
 
-    /// Iterate front to back (owned values; packed ints box on
-    /// read).
+    /// Iterate front to back (owned values; typed items box on read).
     pub fn iter(&self) -> VectorIter<'_> {
         VectorIter {
             inner: match &self.inner {
-                VectorInner::Generic(inner) => VectorIterInner::Generic(inner.iter()),
-                VectorInner::Packed(ints) => VectorIterInner::Packed(ints.iter()),
+                VectorInner::Generic(t) => VectorIterInner::Generic(t.iter()),
+                VectorInner::Ints(t) => VectorIterInner::Ints(t.iter()),
+                VectorInner::Chars(t) => VectorIterInner::Chars(t.iter()),
             },
         }
     }
 
-    /// The item at `index` (`None` past the end; logarithmic for
-    /// generic storage, constant for packed — indexed callers must
-    /// use this, not `iter().nth()`).
+    /// The item at `index` (`None` past the end; logarithmic — indexed
+    /// callers must use this, not `iter().nth()`).
     #[must_use]
     pub fn get(&self, index: usize) -> Option<Value> {
         match &self.inner {
-            VectorInner::Generic(inner) => inner.get(index).cloned(),
-            VectorInner::Packed(ints) => ints.get(index).map(|n| Value::Int(*n)),
+            VectorInner::Generic(t) => t.get(index).cloned(),
+            VectorInner::Ints(t) => t.get(index).map(|n| Value::Int(*n)),
+            VectorInner::Chars(t) => t.get(index).map(|c| Value::Char(*c)),
         }
     }
 
     /// The items from `index` to the end of its 32-item chunk (the
     /// JVM `ChunkedSeq` chunk; empty past the end): borrowed from
-    /// generic storage, boxed from packed.
+    /// generic storage, boxed from typed.
     #[must_use]
     pub fn chunk_from(&self, index: usize) -> std::borrow::Cow<'_, [Value]> {
+        use std::borrow::Cow;
         match &self.inner {
-            VectorInner::Generic(inner) => std::borrow::Cow::Borrowed(inner.chunk_from(index)),
-            VectorInner::Packed(ints) => {
-                let end = ((index / crate::CHUNK_SIZE + 1) * crate::CHUNK_SIZE).min(ints.len());
-                let items = ints.get(index..end).unwrap_or(&[]);
-                std::borrow::Cow::Owned(items.iter().map(|n| Value::Int(*n)).collect())
+            VectorInner::Generic(t) => Cow::Borrowed(t.chunk_from(index)),
+            VectorInner::Ints(t) => {
+                Cow::Owned(t.chunk_from(index).iter().map(|n| Value::Int(*n)).collect())
             }
+            VectorInner::Chars(t) => Cow::Owned(
+                t.chunk_from(index)
+                    .iter()
+                    .map(|c| Value::Char(*c))
+                    .collect(),
+            ),
         }
     }
 
     /// The element count.
     #[must_use]
     pub fn len(&self) -> usize {
-        match &self.inner {
-            VectorInner::Generic(inner) => inner.len(),
-            VectorInner::Packed(ints) => ints.len(),
-        }
+        vector_inner_len(&self.inner)
     }
 
     /// Whether the vector is empty.
@@ -922,6 +890,34 @@ impl Vector {
     pub fn id(&self) -> u64 {
         self.id
     }
+}
+
+/// The item count of a vector storage.
+fn vector_inner_len(inner: &VectorInner) -> usize {
+    match inner {
+        VectorInner::Generic(t) => t.len(),
+        VectorInner::Ints(t) => t.len(),
+        VectorInner::Chars(t) => t.len(),
+    }
+}
+
+/// Typed storage as a generic trie (`box_item` boxes each item),
+/// then `then` applied: the one-time conversion when a foreign value
+/// meets packed storage.
+fn boxed<T: Copy>(
+    t: &crate::trie::PVec<T>,
+    box_item: fn(T) -> Value,
+    then: impl FnOnce(&mut RpdsVector),
+) -> RpdsVector {
+    let mut g: RpdsVector = t.iter().map(|x| box_item(*x)).collect();
+    then(&mut g);
+    g
+}
+
+/// A typed vector's items, copied out for a transient.
+pub(crate) enum TypedItems {
+    Ints(Vec<i64>),
+    Chars(Vec<char>),
 }
 
 /// Entries in iteration order (insertion order, or comparator

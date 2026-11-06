@@ -491,13 +491,24 @@ fn native_apply(eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeErr
     if args.len() < 2 {
         return Err(NativeError::arity("clojure.core/apply", args.len()));
     }
-    let mut call_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    if crate::ext::as_native(&args[0]).is_some_and(|n| &*n.display == "clojure.core/str") {
+        if let Some(s) = crate::core::apply_str_direct(eval, &args[1..])? {
+            return Ok(s);
+        }
+    }
     // The spread realizes (JVM `spreadToArray`); any seq value —
     // including the lazy ones syntax-quote expansions build — seqs.
-    let spread =
+    // With no leading args it is the argument array as is (one copy
+    // of the items, not two).
+    let mut spread =
         crate::lazy::collect_all(eval, args[args.len() - 1].clone()).map_err(signal_to_native)?;
-    call_args.extend(spread);
-    eval.call(&args[0], &call_args).map_err(signal_to_native)
+    if args.len() > 2 {
+        let mut call_args = Vec::with_capacity(args.len() - 2 + spread.len());
+        call_args.extend_from_slice(&args[1..args.len() - 1]);
+        call_args.append(&mut spread);
+        spread = call_args;
+    }
+    eval.call(&args[0], &spread).map_err(signal_to_native)
 }
 
 /// The S5C natives installed into `clojure.core` by [`boot`](crate::ns::boot).

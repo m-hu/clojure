@@ -25,5 +25,5 @@ echo "== Pin instruction counts (hot vs python3.11)"
 bash $PR/pin/setup-instrumentation.sh 2>/dev/null | grep '^INSTRUMENTATION' > /tmp/pin.env; . /tmp/pin.env
 pin_count() { local o; o=$(mktemp); "$INSTRUMENTATION_BIN" -t "$INSTRUMENTATION_TOOL" -o $o -- "$@" > /dev/null 2>&1; awk '/^Count/{print $2}' $o; rm -f $o; }
 for i in 0 1 2 3 4 5 6 7 8 9 10 11; do
-  printf 's%-3s rs=%-12s py=%s\n' $i $(pin_count $V/hot run $PW/s$i.clj) $(pin_count setarch -R python3.11 $PW/s$i.py)
+  printf 's%-3s rs=%-12s py=%s\n' $i $(pin_count $V/hot run $PW/s$i.clj) $(pin_count setarch $(uname -m) -R python3.11 $PW/s$i.py)
 done

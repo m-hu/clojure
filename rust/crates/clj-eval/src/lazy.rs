@@ -3716,6 +3716,7 @@ fn collect_direct(v: &Value) -> Option<Vector> {
         let n = usize::try_from(r.n()?.max(0)).ok()?;
         return Some(match r.x() {
             Value::Int(x) => Vector::from_ints(vec![*x; n]),
+            Value::Char(c) => Vector::from_chars(vec![*c; n]),
             x => Vector::from_vec(vec![x.clone(); n]),
         });
     }
@@ -3732,6 +3733,11 @@ fn collect_direct(v: &Value) -> Option<Vector> {
 }
 
 pub(crate) fn collect_all(eval: &mut Evaluator, v: Value) -> Result<Vec<Value>, Signal> {
+    // A vector's items copy out at their exact count (no growth
+    // doubling, no chunk copies).
+    if let Value::Vector(x) = &v {
+        return Ok(x.iter().collect());
+    }
     let mut out = Vec::new();
     // Owned: the walk advances `cur` off the head (owned callers
     // nilled the arg slot, so memoized chunks free as it walks).

@@ -26,21 +26,21 @@ const MASK: usize = WIDTH - 1;
 
 /// A trie node: a branch's children, or a full leaf's items (the
 /// other side empty — the node's level says which, by construction).
-#[derive(Clone, Debug, Default)]
-struct Node {
-    kids: Vec<Arc<Node>>,
-    items: Vec<Value>,
+#[derive(Clone, Debug)]
+struct Node<T> {
+    kids: Vec<Arc<Node<T>>>,
+    items: Vec<T>,
 }
 
-impl Node {
-    fn branch(kids: Vec<Arc<Node>>) -> Self {
+impl<T> Node<T> {
+    fn branch(kids: Vec<Arc<Node<T>>>) -> Self {
         Self {
             kids,
             items: Vec::new(),
         }
     }
 
-    fn leaf(items: Vec<Value>) -> Self {
+    fn leaf(items: Vec<T>) -> Self {
         Self {
             kids: Vec::new(),
             items,
@@ -48,26 +48,27 @@ impl Node {
     }
 }
 
-/// A persistent vector of values.
+/// A persistent vector of values (or of a packed scalar type: the
+/// typed `Vector` storages keep `i64`/`char` items in the same trie).
 #[derive(Clone, Debug)]
-pub struct PVec {
+pub struct PVec<T = Value> {
     len: usize,
     /// The root's level: its children index by `(i >> shift) & MASK`
     /// (`BITS` when the root's children are leaves).
     shift: u32,
     /// The trie of full leaves (`None` while every item is in the
     /// tail).
-    root: Option<Arc<Node>>,
-    tail: Arc<Vec<Value>>,
+    root: Option<Arc<Node<T>>>,
+    tail: Arc<Vec<T>>,
 }
 
-impl Default for PVec {
+impl<T: Clone> Default for PVec<T> {
     fn default() -> Self {
         Self::new_sync()
     }
 }
 
-impl PVec {
+impl<T: Clone> PVec<T> {
     /// An empty vector.
     #[must_use]
     pub fn new_sync() -> Self {
@@ -82,7 +83,7 @@ impl PVec {
     /// A vector over `items` in order (up to 32 become the tail as
     /// is — no per-item push).
     #[must_use]
-    pub fn from_vec(items: Vec<Value>) -> Self {
+    pub fn from_vec(items: Vec<T>) -> Self {
         if items.len() <= WIDTH {
             return Self {
                 len: items.len(),
@@ -112,7 +113,7 @@ impl PVec {
     }
 
     /// The full leaf holding index `i` (below the tail offset).
-    fn leaf(&self, i: usize) -> &[Value] {
+    fn leaf(&self, i: usize) -> &[T] {
         let mut node = self
             .root
             .as_deref()
@@ -127,7 +128,7 @@ impl PVec {
 
     /// The item at `i` (`None` past the end).
     #[must_use]
-    pub fn get(&self, i: usize) -> Option<&Value> {
+    pub fn get(&self, i: usize) -> Option<&T> {
         if i >= self.len {
             return None;
         }
@@ -143,7 +144,7 @@ impl PVec {
     /// chunk. Leaves and the tail start on multiples of 32, so the
     /// chunks of a walk from 0 are the JVM's `ChunkedSeq` chunks.
     #[must_use]
-    pub fn chunk_from(&self, i: usize) -> &[Value] {
+    pub fn chunk_from(&self, i: usize) -> &[T] {
         if i >= self.len {
             return &[];
         }
@@ -155,7 +156,7 @@ impl PVec {
     }
 
     /// Append an item.
-    pub fn push_back_mut(&mut self, v: Value) {
+    pub fn push_back_mut(&mut self, v: T) {
         if self.tail.len() < WIDTH {
             Arc::make_mut(&mut self.tail).push(v);
             self.len += 1;
@@ -183,7 +184,7 @@ impl PVec {
     }
 
     /// Replace the item at `i` (`false` when out of bounds).
-    pub fn set_mut(&mut self, i: usize, v: Value) -> bool {
+    pub fn set_mut(&mut self, i: usize, v: T) -> bool {
         if i >= self.len {
             return false;
         }
@@ -236,7 +237,7 @@ impl PVec {
 
     /// Items front to back.
     #[must_use]
-    pub fn iter(&self) -> Iter<'_> {
+    pub fn iter(&self) -> Iter<'_, T> {
         Iter {
             vec: self,
             front: 0,
@@ -250,7 +251,7 @@ impl PVec {
 }
 
 /// A path of branches from `level` down to `leaf`.
-fn new_path(level: u32, leaf: Arc<Node>) -> Arc<Node> {
+fn new_path<T>(level: u32, leaf: Arc<Node<T>>) -> Arc<Node<T>> {
     if level == 0 {
         return leaf;
     }
@@ -259,7 +260,7 @@ fn new_path(level: u32, leaf: Arc<Node>) -> Arc<Node> {
 
 /// Push a full leaf for index `at` into `node` (a branch at `level`
 /// with room below it).
-fn push_leaf(node: &mut Node, level: u32, at: usize, leaf: Arc<Node>) {
+fn push_leaf<T: Clone>(node: &mut Node<T>, level: u32, at: usize, leaf: Arc<Node<T>>) {
     let kids = &mut node.kids;
     let slot = (at >> level) & MASK;
     if level == BITS {
@@ -273,7 +274,7 @@ fn push_leaf(node: &mut Node, level: u32, at: usize, leaf: Arc<Node>) {
 
 /// Remove the last leaf under `node` (a branch at `level`), pruning
 /// branches it empties; answers the leaf's items.
-fn pop_leaf(node: &mut Node, level: u32) -> Vec<Value> {
+fn pop_leaf<T: Clone>(node: &mut Node<T>, level: u32) -> Vec<T> {
     let kids = &mut node.kids;
     if level == BITS {
         let leaf = kids.pop().expect("a branch holds at least one child");
@@ -289,19 +290,19 @@ fn pop_leaf(node: &mut Node, level: u32) -> Vec<Value> {
 
 /// Front-to-back item iteration (double-ended), one leaf lookup per
 /// 32 items.
-pub struct Iter<'a> {
-    vec: &'a PVec,
+pub struct Iter<'a, T = Value> {
+    vec: &'a PVec<T>,
     front: usize,
     back: usize,
-    front_leaf: &'a [Value],
+    front_leaf: &'a [T],
     front_base: usize,
-    back_leaf: &'a [Value],
+    back_leaf: &'a [T],
     back_base: usize,
 }
 
-impl<'a> Iter<'a> {
+impl<'a, T: Clone> Iter<'a, T> {
     /// The leaf (or tail) holding index `i`, with its first index.
-    fn chunk(&self, i: usize) -> (&'a [Value], usize) {
+    fn chunk(&self, i: usize) -> (&'a [T], usize) {
         let off = self.vec.tail_offset();
         if i >= off {
             (&self.vec.tail[..], off)
@@ -311,10 +312,10 @@ impl<'a> Iter<'a> {
     }
 }
 
-impl<'a> Iterator for Iter<'a> {
-    type Item = &'a Value;
+impl<'a, T: Clone> Iterator for Iter<'a, T> {
+    type Item = &'a T;
 
-    fn next(&mut self) -> Option<&'a Value> {
+    fn next(&mut self) -> Option<&'a T> {
         if self.front >= self.back {
             return None;
         }
@@ -332,7 +333,7 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-impl DoubleEndedIterator for Iter<'_> {
+impl<T: Clone> DoubleEndedIterator for Iter<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.front >= self.back {
             return None;
@@ -346,10 +347,10 @@ impl DoubleEndedIterator for Iter<'_> {
     }
 }
 
-impl ExactSizeIterator for Iter<'_> {}
+impl<T: Clone> ExactSizeIterator for Iter<'_, T> {}
 
-impl FromIterator<Value> for PVec {
-    fn from_iter<I: IntoIterator<Item = Value>>(items: I) -> Self {
+impl<T: Clone> FromIterator<T> for PVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
         let mut out = PVec::new_sync();
         for v in items {
             out.push_back_mut(v);
@@ -428,8 +429,8 @@ mod tests {
         }
         assert!(it.next().is_none());
         assert!(it.next_back().is_none());
-        assert_eq!(PVec::default().len(), 0);
-        assert!(format!("{:?}", PVec::new_sync()).contains("PVec"));
+        assert_eq!(PVec::<Value>::default().len(), 0);
+        assert!(format!("{:?}", PVec::<Value>::new_sync()).contains("PVec"));
         let small = PVec::from_vec(vec![Value::Int(1), Value::Int(2)]);
         assert_eq!(ints(&small), vec![1, 2]);
         let big = PVec::from_vec((0..40).map(Value::Int).collect());

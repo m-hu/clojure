@@ -2781,9 +2781,50 @@ fn str_of_realized(eval: &mut Evaluator, v: &Value) -> Result<String, NativeErro
 fn str_concat(eval: &mut Evaluator, args: &[Value]) -> Result<String, NativeError> {
     let mut out = String::new();
     for arg in args {
-        out.push_str(&str_of_one(eval, arg)?);
+        str_push(&mut out, eval, arg)?;
     }
     Ok(out)
+}
+
+/// Append `v`'s `str` piece ([`str_of_one`]; chars, strings and nil
+/// append in place, with no piece string).
+fn str_push(out: &mut String, eval: &mut Evaluator, v: &Value) -> Result<(), NativeError> {
+    match v {
+        Value::Nil => {}
+        Value::Str(s) => out.push_str(s),
+        Value::Char(c) => out.push(*c),
+        _ => out.push_str(&str_of_one(eval, v)?),
+    }
+    Ok(())
+}
+
+/// `(apply str a … coll)` without spreading `coll` into an argument
+/// array, when `coll` is already realized (a vector, list, string or
+/// nil — no realization effects to order before the pieces): the
+/// pieces append into one buffer, so a 600K-char vector costs its
+/// text, not 64 bytes per char. `None` leaves other colls to the
+/// spread (a lazy seq realizes first, like the JVM's
+/// `spreadToArray`).
+pub(crate) fn apply_str_direct(
+    eval: &mut Evaluator,
+    args: &[Value],
+) -> Result<Option<Value>, NativeError> {
+    let (coll, lead) = args.split_last().expect("apply passes its spread");
+    let items: Box<dyn Iterator<Item = Value> + '_> = match coll {
+        Value::Nil => Box::new(std::iter::empty()),
+        Value::Vector(x) => Box::new(x.iter()),
+        Value::List(l) => Box::new(l.iter().cloned()),
+        Value::Str(s) => Box::new(s.chars().map(Value::Char)),
+        _ => return Ok(None),
+    };
+    let mut out = String::new();
+    for arg in lead {
+        str_push(&mut out, eval, arg)?;
+    }
+    for item in items {
+        str_push(&mut out, eval, &item)?;
+    }
+    Ok(Some(Value::Str(Arc::from(out.as_str()))))
 }
 
 pub(crate) fn native_str(eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeError> {
