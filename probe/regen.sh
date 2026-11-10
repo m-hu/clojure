@@ -7,6 +7,10 @@ mkdir -p /tmp/out
 w=$root/scripts/bench/hot-text/workloads
 (cd rust && cargo build --release --locked --no-default-features)
 cp rust/target/release/clojure-rs /tmp/out/old-bin
+# Profile a build without the script (build.rs applies it only when
+# the file exists): a packed binary hides the hot functions from
+# callgrind's symbol map.
+mv rust/hot-text.ld /tmp/out/old-hot-text.ld
 bash scripts/bench/hot-text/run.sh /tmp/out/hot-text.ld
 cp /tmp/out/hot-text.ld rust/hot-text.ld
 (cd rust && touch build.rs && cargo build --release --locked --no-default-features)
@@ -18,4 +22,4 @@ for f in "$w"/*.clj; do
   echo "$(basename "$f") $o $n"
 done
 rm -f /tmp/out/old-bin /tmp/out/new-bin
-diff <(git show HEAD:rust/hot-text.ld) /tmp/out/hot-text.ld | head -40 || true
+wc -l /tmp/out/old-hot-text.ld /tmp/out/hot-text.ld
