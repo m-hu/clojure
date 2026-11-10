@@ -15,7 +15,7 @@ jobs:
       - name: Regenerate and compare
         run: |
           rustc -vV; uname -a
-          probe/regen.sh 2>&1 | tee probe-out.txt
+          set -o pipefail; probe/regen.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

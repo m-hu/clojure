@@ -7,7 +7,7 @@ mkdir -p /tmp/out
 w=$root/scripts/bench/hot-text/workloads
 (cd rust && cargo build --release --locked --no-default-features)
 cp rust/target/release/clojure-rs /tmp/out/old-bin
-scripts/bench/hot-text/run.sh /tmp/out/hot-text.ld
+bash scripts/bench/hot-text/run.sh /tmp/out/hot-text.ld
 cp /tmp/out/hot-text.ld rust/hot-text.ld
 (cd rust && touch build.rs && cargo build --release --locked --no-default-features)
 cp rust/target/release/clojure-rs /tmp/out/new-bin
