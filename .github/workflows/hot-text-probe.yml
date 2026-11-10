@@ -1,0 +1,25 @@
+name: hot-text-probe
+on:
+  push:
+    branches: [probe/hot-text-254]
+  workflow_dispatch:
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install tools
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time valgrind
+      - name: Regenerate and compare
+        run: |
+          rustc -vV; uname -a
+          probe/regen.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hot-text-254
+          path: |
+            probe-out.txt
+            /tmp/out/
