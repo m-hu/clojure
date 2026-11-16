@@ -130,24 +130,29 @@ snap aot_grid ./aot_grid
 # --- link variants of the same object: which lever moves the floor?
 echo "== link variants"
 arch="$root/rust/target/release/libcljrt.a"
-ls "$root/rust/hot-text.ld" 2>/dev/null && cp "$root/rust/hot-text.ld" /tmp/w/hot-text.ld || true
+cp "$root/rust/hot-text.ld" /tmp/w/hot-text.ld 2>/dev/null || true
 for p in hello sum grid; do
   "$cljrs" build "$p.clj" --emit-obj "$p.o" -o /dev/null > /dev/null 2>&1
-  cc "$p.o" "$arch" -o "v_${p}_dyn" -lm -no-pie -Wl,--gc-sections
-  cc "$p.o" "$arch" -o "v_${p}_lazy" -lm -no-pie -Wl,--gc-sections -Wl,-z,lazy
-  cc "$p.o" "$arch" -o "v_${p}_static" -lm -static -no-pie -Wl,--gc-sections 2> "$out/static-link-$p.log" || cat "$out/static-link-$p.log"
-  if [ -f /tmp/w/hot-text.ld ]; then
-    cc "$p.o" "$arch" -o "v_${p}_static_hot" -lm -static -no-pie -Wl,--gc-sections -Wl,-T,/tmp/w/hot-text.ld 2>/dev/null || true
-  fi
+  base=("$p.o" "$arch" -lm -Wl,--gc-sections)
+  cc "${base[@]}" -no-pie -o "v_${p}_dyn"
+  cc "${base[@]}" -no-pie -static-libgcc -o "v_${p}_dyn_slibgcc" || true
+  cc "${base[@]}" -static-pie -o "v_${p}_spie" 2> "$out/spie-$p.log" || tail -3 "$out/spie-$p.log"
+  cc "${base[@]}" -static-pie -Wl,-z,pack-relative-relocs -o "v_${p}_spie_relr" 2>/dev/null || true
+  cc "${base[@]}" -static-pie -Wl,-z,pack-relative-relocs -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_spie_relr_hot" 2> "$out/spie-hot-$p.log" || tail -3 "$out/spie-hot-$p.log"
+  cc "${base[@]}" -static -no-pie -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_static_hot" 2>/dev/null || true
 done
 for p in hello sum grid; do
   in=empty.in; [ "$p" = sum ] && in=sum.in; [ "$p" = grid ] && in=grid.in
-  for v in dyn lazy static static_hot; do
+  for v in dyn dyn_slibgcc spie spie_relr spie_relr_hot static_hot; do
     [ -x "v_${p}_$v" ] || continue
     want=$(./aot_$p < "$in"); got=$("./v_${p}_$v" < "$in")
     [ "$want" = "$got" ] || echo "OUTPUT MISMATCH v_${p}_$v: $got vs $want"
+    relocs=$(readelf -r -W "v_${p}_$v" 2>/dev/null | grep -c 'R_X86_64' || true)
+    relr=$(readelf -d "v_${p}_$v" 2>/dev/null | grep -c 'RELR' || true)
+    printf 'relocs=%-7s relr_tags=%s  ' "$relocs" "$relr"
     measure "v_${p}_$v" "$in" "./v_${p}_$v"
   done
 done
-size v_sum_dyn v_sum_static 2>/dev/null || true
-snap v_sum_static ./v_sum_static
+echo "== top inclusive (v_sum_spie_relr)"; sed -n '/file:function/,$p' "$out/incl.v_sum_spie_relr.txt" 2>/dev/null | head -30
+echo "== top inclusive (v_sum_dyn_slibgcc)"; sed -n '/file:function/,$p' "$out/incl.v_sum_dyn_slibgcc.txt" 2>/dev/null | head -20
+snap v_sum_spie_relr ./v_sum_spie_relr
