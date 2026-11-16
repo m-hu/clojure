@@ -127,32 +127,47 @@ snap ml_sum ./ml_sum
 snap aot_sum ./aot_sum
 snap aot_grid ./aot_grid
 
-# --- link variants of the same object: which lever moves the floor?
+# --- link variants: static non-PIE without crtbeginT's eager frame
+# registration (GCC 13+ classifies every FDE at startup); unwinding falls
+# back to dl_iterate_phdr over PT_GNU_EH_FRAME, as in dynamic executables.
 echo "== link variants"
 arch="$root/rust/target/release/libcljrt.a"
 cp "$root/rust/hot-text.ld" /tmp/w/hot-text.ld 2>/dev/null || true
+cat > nofde.c <<'EOC'
+void __wrap___register_frame_info(const void *begin, void *ob) { (void)begin; (void)ob; }
+void *__wrap___deregister_frame_info(const void *begin) { (void)begin; return 0; }
+EOC
+cc -O2 -c nofde.c -o nofde.o
+nofde=(nofde.o -Wl,--eh-frame-hdr -Wl,--wrap=__register_frame_info -Wl,--wrap=__deregister_frame_info)
+# Unwinding check: a Rust staticlib that panics and catches it.
+cat > unw.rs <<'EOR'
+#[no_mangle]
+pub extern "C" fn caught_panic() -> i32 {
+    let r = std::panic::catch_unwind(|| { if std::hint::black_box(true) { panic!("boom") } });
+    i32::from(r.is_err())
+}
+EOR
+rustc -O --crate-type staticlib -o libunw.a unw.rs 2>/dev/null
+printf 'int caught_panic(void);\n#include <stdio.h>\nint main(void){printf("caught=%%d\\n", caught_panic());return 0;}\n' > unwmain.c
+cc unwmain.c libunw.a -o unw_static_nofde -static -no-pie "${nofde[@]}" -lm 2>/dev/null && echo "unwind static+nofde: $(./unw_static_nofde 2>&1 | tail -1)"
+cc unwmain.c libunw.a -o unw_static -static -no-pie -lm 2>/dev/null && echo "unwind static: $(./unw_static 2>&1 | tail -1)"
 for p in hello sum grid; do
   "$cljrs" build "$p.clj" --emit-obj "$p.o" -o /dev/null > /dev/null 2>&1
   base=("$p.o" "$arch" -lm -Wl,--gc-sections)
   cc "${base[@]}" -no-pie -o "v_${p}_dyn"
-  cc "${base[@]}" -no-pie -static-libgcc -o "v_${p}_dyn_slibgcc" || true
-  cc "${base[@]}" -static-pie -o "v_${p}_spie" 2> "$out/spie-$p.log" || tail -3 "$out/spie-$p.log"
-  cc "${base[@]}" -static-pie -Wl,-z,pack-relative-relocs -o "v_${p}_spie_relr" 2>/dev/null || true
-  cc "${base[@]}" -static-pie -Wl,-z,pack-relative-relocs -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_spie_relr_hot" 2> "$out/spie-hot-$p.log" || tail -3 "$out/spie-hot-$p.log"
-  cc "${base[@]}" -static -no-pie -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_static_hot" 2>/dev/null || true
+  cc "${base[@]}" -static -no-pie "${nofde[@]}" -o "v_${p}_snofde" 2>/dev/null || echo "link fail snofde $p"
+  cc "${base[@]}" -static -no-pie "${nofde[@]}" -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_snofde_hot" 2>/dev/null || echo "link fail snofde_hot $p"
+  cc "${base[@]}" -static-pie -Wl,-z,pack-relative-relocs -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_spie_relr_hot" 2>/dev/null || true
 done
 for p in hello sum grid; do
   in=empty.in; [ "$p" = sum ] && in=sum.in; [ "$p" = grid ] && in=grid.in
-  for v in dyn dyn_slibgcc spie spie_relr spie_relr_hot static_hot; do
+  for v in dyn snofde snofde_hot spie_relr_hot; do
     [ -x "v_${p}_$v" ] || continue
     want=$(./aot_$p < "$in"); got=$("./v_${p}_$v" < "$in")
     [ "$want" = "$got" ] || echo "OUTPUT MISMATCH v_${p}_$v: $got vs $want"
-    relocs=$(readelf -r -W "v_${p}_$v" 2>/dev/null | grep -c 'R_X86_64' || true)
-    relr=$(readelf -d "v_${p}_$v" 2>/dev/null | grep -c 'RELR' || true)
-    printf 'relocs=%-7s relr_tags=%s  ' "$relocs" "$relr"
     measure "v_${p}_$v" "$in" "./v_${p}_$v"
   done
 done
-echo "== top inclusive (v_sum_spie_relr)"; sed -n '/file:function/,$p' "$out/incl.v_sum_spie_relr.txt" 2>/dev/null | head -30
-echo "== top inclusive (v_sum_dyn_slibgcc)"; sed -n '/file:function/,$p' "$out/incl.v_sum_dyn_slibgcc.txt" 2>/dev/null | head -20
-snap v_sum_spie_relr ./v_sum_spie_relr
+echo "== top inclusive (v_sum_snofde_hot)"; sed -n '/file:function/,$p' "$out/incl.v_sum_snofde_hot.txt" 2>/dev/null | cut -c1-160 | head -40
+snap v_sum_snofde_hot ./v_sum_snofde_hot
+snap v_hello_snofde_hot ./v_hello_snofde_hot
