@@ -126,3 +126,28 @@ snap rs_readline ./rs_readline
 snap ml_sum ./ml_sum
 snap aot_sum ./aot_sum
 snap aot_grid ./aot_grid
+
+# --- link variants of the same object: which lever moves the floor?
+echo "== link variants"
+arch="$root/rust/target/release/libcljrt.a"
+ls "$root/rust/hot-text.ld" 2>/dev/null && cp "$root/rust/hot-text.ld" /tmp/w/hot-text.ld || true
+for p in hello sum grid; do
+  "$cljrs" build "$p.clj" --emit-obj "$p.o" -o /dev/null > /dev/null 2>&1
+  cc "$p.o" "$arch" -o "v_${p}_dyn" -lm -no-pie -Wl,--gc-sections
+  cc "$p.o" "$arch" -o "v_${p}_lazy" -lm -no-pie -Wl,--gc-sections -Wl,-z,lazy
+  cc "$p.o" "$arch" -o "v_${p}_static" -lm -static -no-pie -Wl,--gc-sections 2> "$out/static-link-$p.log" || cat "$out/static-link-$p.log"
+  if [ -f /tmp/w/hot-text.ld ]; then
+    cc "$p.o" "$arch" -o "v_${p}_static_hot" -lm -static -no-pie -Wl,--gc-sections -Wl,-T,/tmp/w/hot-text.ld 2>/dev/null || true
+  fi
+done
+for p in hello sum grid; do
+  in=empty.in; [ "$p" = sum ] && in=sum.in; [ "$p" = grid ] && in=grid.in
+  for v in dyn lazy static static_hot; do
+    [ -x "v_${p}_$v" ] || continue
+    want=$(./aot_$p < "$in"); got=$("./v_${p}_$v" < "$in")
+    [ "$want" = "$got" ] || echo "OUTPUT MISMATCH v_${p}_$v: $got vs $want"
+    measure "v_${p}_$v" "$in" "./v_${p}_$v"
+  done
+done
+size v_sum_dyn v_sum_static 2>/dev/null || true
+snap v_sum_static ./v_sum_static
