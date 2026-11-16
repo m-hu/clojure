@@ -1,0 +1,36 @@
+name: static-link-probe
+on:
+  push:
+    branches: [probe/static-link-271]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time valgrind file
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: ./.github/actions/setup-llvm
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: AOT test suites (static link path)
+        run: |
+          cd rust
+          cargo nextest run --locked -p clj-aot --no-fail-fast
+          cargo nextest run --locked -p clojure-rs --test build_corpus --test native_corpus --test cli --test compile_aot --no-fail-fast
+      - name: Static binaries and measurements
+        run: |
+          set -o pipefail; bash probe/static-check.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: static-link-271
+          path: probe-out.txt
