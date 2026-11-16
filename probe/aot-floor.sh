@@ -127,47 +127,51 @@ snap ml_sum ./ml_sum
 snap aot_sum ./aot_sum
 snap aot_grid ./aot_grid
 
-# --- link variants: static non-PIE without crtbeginT's eager frame
-# registration (GCC 13+ classifies every FDE at startup); unwinding falls
-# back to dl_iterate_phdr over PT_GNU_EH_FRAME, as in dynamic executables.
-echo "== link variants"
+# --- AOT-specific hot-text: profile static AOT binaries of the hot-text
+# workloads (+ the three probe programs), generate a script, compare RSS.
+echo "== aot hot-text"
 arch="$root/rust/target/release/libcljrt.a"
-cp "$root/rust/hot-text.ld" /tmp/w/hot-text.ld 2>/dev/null || true
 cat > nofde.c <<'EOC'
 void __wrap___register_frame_info(const void *begin, void *ob) { (void)begin; (void)ob; }
 void *__wrap___deregister_frame_info(const void *begin) { (void)begin; return 0; }
 EOC
 cc -O2 -c nofde.c -o nofde.o
 nofde=(nofde.o -Wl,--eh-frame-hdr -Wl,--wrap=__register_frame_info -Wl,--wrap=__deregister_frame_info)
-# Unwinding check: a Rust staticlib that panics and catches it.
-cat > unw.rs <<'EOR'
-#[no_mangle]
-pub extern "C" fn caught_panic() -> i32 {
-    let r = std::panic::catch_unwind(|| { if std::hint::black_box(true) { panic!("boom") } });
-    i32::from(r.is_err())
-}
-EOR
-rustc -O --crate-type staticlib -o libunw.a unw.rs 2>/dev/null
-printf 'int caught_panic(void);\n#include <stdio.h>\nint main(void){printf("caught=%%d\\n", caught_panic());return 0;}\n' > unwmain.c
-cc unwmain.c libunw.a -o unw_static_nofde -static -no-pie "${nofde[@]}" -lm 2>/dev/null && echo "unwind static+nofde: $(./unw_static_nofde 2>&1 | tail -1)"
-cc unwmain.c libunw.a -o unw_static -static -no-pie -lm 2>/dev/null && echo "unwind static: $(./unw_static 2>&1 | tail -1)"
+mkdir -p /tmp/aot /tmp/prof
+for w in "$root"/scripts/bench/hot-text/workloads/*.clj /tmp/w/hello.clj /tmp/w/sum.clj /tmp/w/grid.clj; do
+  n=$(basename "$w" .clj)
+  "$cljrs" build "$w" --emit-obj "/tmp/aot/$n.o" -o /dev/null > /dev/null 2>&1 || { echo "build fail $n"; continue; }
+  cc "/tmp/aot/$n.o" "$arch" -o "/tmp/aot/$n" -lm -static -no-pie -Wl,--gc-sections "${nofde[@]}" 2>/dev/null || { echo "link fail $n"; continue; }
+  cp "/tmp/aot/$n" /tmp/aot/prog
+  in=/tmp/w/empty.in; [ -f "/tmp/w/$n.in" ] && in="/tmp/w/$n.in"
+  valgrind --tool=callgrind --demangle=no --dump-instr=no --callgrind-out-file="/tmp/prof/$n.cg" /tmp/aot/prog < "$in" > /dev/null 2>&1 || echo "profile fail $n"
+done
+python3 "$root/scripts/bench/hot-text/hot_text.py" /tmp/aot/prog /tmp/w/hot-text-aot.ld /tmp/prof/*.cg
+cp /tmp/w/hot-text-aot.ld "$out/hot-text-aot.ld"
+cp "$root/rust/hot-text.ld" /tmp/w/hot-text.ld
 for p in hello sum grid; do
-  "$cljrs" build "$p.clj" --emit-obj "$p.o" -o /dev/null > /dev/null 2>&1
-  base=("$p.o" "$arch" -lm -Wl,--gc-sections)
-  cc "${base[@]}" -no-pie -o "v_${p}_dyn"
-  cc "${base[@]}" -static -no-pie "${nofde[@]}" -o "v_${p}_snofde" 2>/dev/null || echo "link fail snofde $p"
-  cc "${base[@]}" -static -no-pie "${nofde[@]}" -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_snofde_hot" 2>/dev/null || echo "link fail snofde_hot $p"
-  cc "${base[@]}" -static-pie -Wl,-z,pack-relative-relocs -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_spie_relr_hot" 2>/dev/null || true
+  base=("/tmp/aot/$p.o" "$arch" -lm -static -no-pie -Wl,--gc-sections "${nofde[@]}")
+  cc "${base[@]}" -o "v_${p}_s" 2>/dev/null
+  cc "${base[@]}" -Wl,-T,/tmp/w/hot-text.ld -o "v_${p}_s_hot" 2>/dev/null
+  cc "${base[@]}" -Wl,-T,/tmp/w/hot-text-aot.ld -o "v_${p}_s_aothot" 2>/dev/null
 done
 for p in hello sum grid; do
   in=empty.in; [ "$p" = sum ] && in=sum.in; [ "$p" = grid ] && in=grid.in
-  for v in dyn snofde snofde_hot spie_relr_hot; do
-    [ -x "v_${p}_$v" ] || continue
+  for v in s s_hot s_aothot; do
     want=$(./aot_$p < "$in"); got=$("./v_${p}_$v" < "$in")
-    [ "$want" = "$got" ] || echo "OUTPUT MISMATCH v_${p}_$v: $got vs $want"
-    measure "v_${p}_$v" "$in" "./v_${p}_$v"
+    [ "$want" = "$got" ] || echo "OUTPUT MISMATCH v_${p}_$v"
+    rss=$(for _ in 1 2 3 4 5; do { /usr/bin/time -f '%M' "./v_${p}_$v" < "$in" > /dev/null; } 2>&1 | tail -1; done | sort -n | head -1)
+    echo "v_${p}_$v maxrss_kb=$rss"
   done
 done
-echo "== top inclusive (v_sum_snofde_hot)"; sed -n '/file:function/,$p' "$out/incl.v_sum_snofde_hot.txt" 2>/dev/null | cut -c1-160 | head -40
-snap v_sum_snofde_hot ./v_sum_snofde_hot
-snap v_hello_snofde_hot ./v_hello_snofde_hot
+# workload RSS under each script (the generalization check)
+for w in "$root"/scripts/bench/hot-text/workloads/*.clj; do
+  n=$(basename "$w" .clj); [ -f "/tmp/aot/$n.o" ] || continue
+  base=("/tmp/aot/$n.o" "$arch" -lm -static -no-pie -Wl,--gc-sections "${nofde[@]}")
+  cc "${base[@]}" -Wl,-T,/tmp/w/hot-text.ld -o "/tmp/aot/${n}_hot" 2>/dev/null
+  cc "${base[@]}" -Wl,-T,/tmp/w/hot-text-aot.ld -o "/tmp/aot/${n}_aothot" 2>/dev/null
+  a=$(for _ in 1 2 3; do { /usr/bin/time -f '%M' "/tmp/aot/$n" < /tmp/w/empty.in > /dev/null; } 2>&1 | tail -1; done | sort -n | head -1)
+  b=$(for _ in 1 2 3; do { /usr/bin/time -f '%M' "/tmp/aot/${n}_hot" < /tmp/w/empty.in > /dev/null; } 2>&1 | tail -1; done | sort -n | head -1)
+  c=$(for _ in 1 2 3; do { /usr/bin/time -f '%M' "/tmp/aot/${n}_aothot" < /tmp/w/empty.in > /dev/null; } 2>&1 | tail -1; done | sort -n | head -1)
+  echo "workload $n none=$a interp_hot=$b aot_hot=$c"
+done
