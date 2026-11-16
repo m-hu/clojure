@@ -49,11 +49,13 @@ EOF
 printf 'int main(void){return 0;}\n' > empty.c
 printf 'fn main(){}\n' > empty.rs
 printf 'fn main(){println!("1");}\n' > hello.rs
+printf 'fn main(){let mut s=String::new();std::io::stdin().read_line(&mut s).unwrap();println!("{}",s.len());}\n' > readline.rs
 
 gcc -O2 -o c_empty empty.c
 gcc -O2 -static -o c_empty_static empty.c || true
 rustc -O -o rs_empty empty.rs
 rustc -O -o rs_hello hello.rs
+rustc -O -o rs_readline readline.rs
 ocamlopt -O2 -o ml_hello hello.ml 2>/dev/null || ocamlopt -o ml_hello hello.ml
 ocamlopt -O2 -o ml_sum sum.ml 2>/dev/null || ocamlopt -o ml_sum sum.ml
 for p in hello sum grid; do
@@ -101,3 +103,26 @@ echo "== top inclusive (aot_hello)"; head -45 "$out/incl.aot_hello" 2>/dev/null 
 echo "== top self (aot_hello)"; head -45 "$out/self.aot_hello.txt"
 echo "== top self (aot_sum)"; head -45 "$out/self.aot_sum.txt"
 echo "== top self (ml_sum)"; head -30 "$out/self.ml_sum.txt"
+
+# --- post-boot RSS attribution: block each program on a FIFO stdin,
+# snapshot /proc/PID/smaps, then release it.
+snap() { # name cmd...
+  local name=$1; shift
+  rm -f /tmp/w/fifo; mkfifo /tmp/w/fifo
+  "$@" < /tmp/w/fifo > /dev/null 2>&1 &
+  local pid=$!
+  exec 3> /tmp/w/fifo
+  sleep 1
+  cp "/proc/$pid/smaps" "$out/smaps.$name.txt" 2>/dev/null || true
+  echo "-- $name (pid $pid) post-boot rollup"
+  grep -E '^(Rss|Pss|Shared_Clean|Shared_Dirty|Private_Clean|Private_Dirty|Anonymous):' "/proc/$pid/smaps_rollup" 2>/dev/null || true
+  echo "   per-mapping Rss (kB), largest first:"
+  awk '/^[0-9a-f]+-[0-9a-f]+ /{name=($6==""?"[anon]":$6)} /^Rss:/{rss[name]+=$2} END{for(n in rss) if (rss[n]>0) printf "   %7d %s\n", rss[n], n}' "$out/smaps.$name.txt" | sort -rn | head -14
+  exec 3>&-
+  wait "$pid" || true
+}
+echo "== post-boot RSS"
+snap rs_readline ./rs_readline
+snap ml_sum ./ml_sum
+snap aot_sum ./aot_sum
+snap aot_grid ./aot_grid
