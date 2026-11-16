@@ -1,0 +1,36 @@
+name: aot-floor-probe
+on:
+  push:
+    branches: [probe/aot-floor-271]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time valgrind ocaml ocaml-native-compilers
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: ./.github/actions/setup-llvm
+      - name: Build clojure-rs + LTO runtime archive
+        run: |
+          cd rust
+          cargo build --release --locked -p clojure-rs
+          cargo rustc --release --locked -p clj-rt --crate-type staticlib
+      - name: Probe
+        run: |
+          rustc -vV; uname -a
+          set -o pipefail; bash probe/aot-floor.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aot-floor-271
+          path: |
+            probe-out.txt
+            /tmp/out/
