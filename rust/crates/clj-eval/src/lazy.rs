@@ -1163,10 +1163,44 @@ fn iterate_seed(eval: &mut Evaluator, it: &IterateValue) -> Result<Value, Signal
                 .to_owned(),
         )));
     }
-    crate::core::check_ifn(eval, it.f())?;
-    let seed = eval.call(it.f(), std::slice::from_ref(it.prev()))?;
+    // `(range)` is `(iterate inc' 0)` (#271): the core `inc'` / `inc`
+    // native on a long below the max answers `n + 1` (the max takes
+    // the call: `inc'` promotes, `inc` throws).
+    let seed = match long_successor(it.f(), it.prev()) {
+        Some(next) => next,
+        None => {
+            crate::core::check_ifn(eval, it.f())?;
+            eval.call(it.f(), std::slice::from_ref(it.prev()))?
+        }
+    };
     it.store_seed(seed.clone());
     Ok(seed)
+}
+
+/// The first item of `v` when it is a core `inc'` / `inc` iterate over
+/// longs (`(range)`), read without calling anything (`None`: anything
+/// else).
+pub(crate) fn core_long_iterate_head(v: &Value) -> Option<i64> {
+    let it = as_iterate(v)?;
+    long_successor(it.f(), &Value::Int(0))?;
+    match it
+        .seed_opt()
+        .or_else(|| long_successor(it.f(), it.prev()))?
+    {
+        Value::Int(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// `(f n)` for the core `inc'` / `inc` natives on a long `n` below the
+/// max, computed in place (`None`: call `f`).
+fn long_successor(f: &Value, prev: &Value) -> Option<Value> {
+    let Value::Int(n) = prev else {
+        return None;
+    };
+    let name = &*crate::ext::as_native(f)?.display;
+    let core_inc = name == "clojure.core/inc'" || name == "clojure.core/inc";
+    core_inc.then(|| n.checked_add(1).map(Value::Int))?
 }
 
 /// Step an iterate: realize this head (at most one `f` call, like

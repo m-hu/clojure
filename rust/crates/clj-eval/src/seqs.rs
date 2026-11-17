@@ -194,7 +194,7 @@ fn finite_repeat(coll: &Value) -> Option<(Value, i64)> {
 
 /// A counted `long` range's start, step, and count (items stay in
 /// `i64`: the range's own bound checked its last item).
-fn long_range(coll: &Value) -> Option<(i64, i64, i64)> {
+pub(crate) fn long_range(coll: &Value) -> Option<(i64, i64, i64)> {
     let Value::Extension(e) = coll else {
         return None;
     };
