@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use clj_eval::aot_front::{FrontEnd, for_each_child, pattern_children};
+use clj_eval::aot_front::{FrontEnd, TopUnit, for_each_child, names_lib, pattern_children};
 use clj_eval::expr::{Arity, CaseTest, Expr, FunExpr, NsClause, Pattern};
 use clj_eval::native_abi;
 use clj_value::{Map, Symbol, Value, Vector};
@@ -66,6 +66,13 @@ enum Const {
     StaticField(String, String),
     Class(String),
     Read(String),
+    /// An empty collection literal without metadata (`[]`, `{}`, `#{}`):
+    /// one value per form, as under `run` — built once by its literal
+    /// shim, `site` keeping each form's value its own.
+    EmptyColl {
+        helper: &'static str,
+        site: usize,
+    },
 }
 
 /// One compiled arity: `(fixed, variadic, code)`.
@@ -223,12 +230,19 @@ impl<'ctx> Lowerer<'ctx> {
         front: &FrontEnd,
         path: &str,
     ) -> Result<Module<'ctx>, Unsupported> {
-        self.inline_arith = !front.units.iter().any(|u| mentions_rebinding(&u.expr));
         self.lite = can_lite_program(front);
-        self.var_meta = !self.lite || program_reads_var_meta(front);
-        self.reserve_defns(front);
-        let mut tops = Vec::with_capacity(front.units.len());
-        for unit in &front.units {
+        // A full boot loads the spliced libraries through the program's
+        // own `require` (#271): their compiled units drop.
+        let units = if self.lite {
+            &front.units[..]
+        } else {
+            &front.units[front.lib_units..]
+        };
+        self.inline_arith = !units.iter().any(|u| mentions_rebinding(&u.expr));
+        self.var_meta = !self.lite || program_reads_var_meta(units);
+        self.reserve_defns(units);
+        let mut tops = Vec::with_capacity(units.len());
+        for unit in units {
             if self.drops(&unit.expr) {
                 continue;
             }
@@ -244,7 +258,7 @@ impl<'ctx> Lowerer<'ctx> {
 
     /// Reserve every top-level `(def name (fn …))` whose var is defined
     /// exactly once: calls through such a var may go direct.
-    fn reserve_defns(&mut self, front: &FrontEnd) {
+    fn reserve_defns(&mut self, units: &[TopUnit]) {
         let key = |sym: &Symbol| {
             (
                 sym.namespace().unwrap_or("user").to_owned(),
@@ -252,7 +266,7 @@ impl<'ctx> Lowerer<'ctx> {
             )
         };
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
-        for u in &front.units {
+        for u in units {
             if let Expr::Def { sym, .. } | Expr::DefMacro { sym, .. } = &u.expr {
                 *counts.entry(key(sym)).or_default() += 1;
             }
@@ -262,7 +276,7 @@ impl<'ctx> Lowerer<'ctx> {
                 }
             }
         }
-        for u in &front.units {
+        for u in units {
             let Expr::Def {
                 sym,
                 init: Some(init),
@@ -2462,7 +2476,8 @@ impl<'ctx> Lowerer<'ctx> {
         let moving = bc_sym.is_none()
             && fast.is_none()
             && (has_own_op
-                || (is_owned_move_op(ns, name, n) && call.args.iter().any(|a| is_move(f, a))));
+                || (is_owned_move_op(ns, name, n)
+                    && call.args.iter().any(|a| is_move(f, a) || is_temporary(a))));
         if moving {
             return self.lower_direct_moving(f, call, k, core_name.as_deref(), dest);
         }
@@ -3459,12 +3474,21 @@ impl<'ctx> Lowerer<'ctx> {
     fn lower_coll(
         &mut self,
         f: &mut FnCtx<'ctx>,
-        helper: &str,
+        helper: &'static str,
         items: &[Expr],
         meta: Option<&Map>,
         dest: PointerValue<'ctx>,
         fallible: bool,
     ) -> Result<(), Unsupported> {
+        if items.is_empty() && meta.is_none() {
+            // One value per form (no allocation per evaluation). (A
+            // literal with reader metadata stays per evaluation: its
+            // metadata is a pool constant the init cannot read yet.)
+            let site = self.consts.len();
+            let k = self.constant(Const::EmptyColl { helper, site });
+            self.call("rt_n_const", None, &[dest.into(), self.u64c(k)]);
+            return Ok(());
+        }
         let mk = self.meta_const(meta)?;
         let arr = self.lower_args(f, items)?;
         let aref = self.slots_ref(f, arr, items.len());
@@ -4179,6 +4203,16 @@ impl<'ctx> Lowerer<'ctx> {
                     let p = self.str_ptr(text);
                     self.call("rt_n_read", None, &[t.into(), p.into()]);
                 }
+                Const::EmptyColl { helper, .. } => {
+                    let empty = self.const_slice(self.ptr.const_null(), 0);
+                    let args = [t.into(), empty.into(), self.u64c(NONE)];
+                    if *helper == "rt_n_vec_lit" {
+                        self.call(helper, None, &args);
+                    } else {
+                        let st = self.call(helper, Some(self.i32t), &args).expect("st");
+                        self.check(&f, st);
+                    }
+                }
             }
             self.call("rt_n_set_const", None, &[self.u64c(k as u64), t.into()]);
         }
@@ -4606,6 +4640,17 @@ fn is_owned_move_op(ns: Option<&str>, name: &str, argc: usize) -> bool {
         ) => argc >= 1,
         _ => false,
     }
+}
+
+/// Whether `e` evaluates into a slot of its own (a call, a constructed
+/// collection — not a local, constant, or var): an owned call takes that
+/// slot over instead of cloning it (#271), so e.g. `reduce` sees a fresh
+/// `(map …)` seq as its only holder.
+fn is_temporary(e: &Expr) -> bool {
+    !matches!(
+        e,
+        Expr::Local(_) | Expr::Literal(_) | Expr::Quote(_) | Expr::Global(_) | Expr::VarRef(_)
+    )
 }
 
 /// Whether `e` is an occurrence the current `recur` args move.
@@ -5212,7 +5257,19 @@ fn can_lite_program(front: &FrontEnd) -> bool {
         }
         collect_lite_defs(&u.expr, &mut defined);
     }
-    front.units.iter().all(|u| expr_lite_ok(&u.expr, &defined))
+    let scope = LiteScope {
+        defined,
+        libs: &front.libs,
+    };
+    front.units.iter().all(|u| expr_lite_ok(&u.expr, &scope))
+}
+
+/// What the Lite check resolves against: the program's own definitions
+/// (spliced library units included) and the spliced libraries its
+/// leading `ns` form may require (#271).
+struct LiteScope<'a> {
+    defined: BTreeSet<(String, String)>,
+    libs: &'a [&'static str],
 }
 
 fn sym_key(sym: &Symbol) -> (String, String) {
@@ -5224,13 +5281,9 @@ fn sym_key(sym: &Symbol) -> (String, String) {
 
 /// Whether a program references a reader of var metadata
 /// ([`clj_eval::aot_boot::needs_var_meta`] over every var it names).
-fn program_reads_var_meta(front: &FrontEnd) -> bool {
+fn program_reads_var_meta(units: &[TopUnit]) -> bool {
     let mut refs = Vec::new();
-    for u in front
-        .units
-        .iter()
-        .filter(|u| !is_inert_meta_statement(&u.expr))
-    {
+    for u in units.iter().filter(|u| !is_inert_meta_statement(&u.expr)) {
         collect_var_refs(&u.expr, &mut refs);
     }
     let refs: Vec<(&str, &str)> = refs
@@ -5419,15 +5472,17 @@ fn lite_direct_require_aliases(call: &clj_eval::expr::DirectCall) -> Option<Vec<
         .collect()
 }
 
-fn ns_clause_lite_ok(clause: &NsClause) -> bool {
+fn ns_clause_lite_ok(clause: &NsClause, libs: &[&str]) -> bool {
     match clause {
         NsClause::ReferClojure(_) => true,
-        NsClause::Require(specs) => specs.iter().all(|v| lite_require_spec_alias(v).is_some()),
+        NsClause::Require(specs) => specs
+            .iter()
+            .all(|v| lite_require_spec_alias(v).is_some() || libs.iter().any(|l| names_lib(v, l))),
         NsClause::Use(_) | NsClause::Import(_) => false,
     }
 }
 
-fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
+fn expr_lite_ok(e: &Expr, scope: &LiteScope<'_>) -> bool {
     if let Expr::DirectNative(call) = e
         && lite_direct_require_aliases(call).is_some()
     {
@@ -5435,14 +5490,14 @@ fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
     }
     let here = match e {
         Expr::DefMacro { .. } => false,
-        Expr::Ns { clauses, .. } => clauses.iter().all(ns_clause_lite_ok),
+        Expr::Ns { clauses, .. } => clauses.iter().all(|c| ns_clause_lite_ok(c, scope.libs)),
         Expr::Global(v) | Expr::VarRef(v) | Expr::Set { var: v, .. } => {
-            var_lite_ok(&v.sym, defined)
+            var_lite_ok(&v.sym, &scope.defined)
         }
-        Expr::DirectNative(call) => var_lite_ok(&call.var.sym, defined),
-        Expr::Binding { pairs, .. } | Expr::WithRedefs { pairs, .. } => {
-            pairs.iter().all(|(v, _)| var_lite_ok(&v.sym, defined))
-        }
+        Expr::DirectNative(call) => var_lite_ok(&call.var.sym, &scope.defined),
+        Expr::Binding { pairs, .. } | Expr::WithRedefs { pairs, .. } => pairs
+            .iter()
+            .all(|(v, _)| var_lite_ok(&v.sym, &scope.defined)),
         _ => true,
     };
     if !here {
@@ -5450,7 +5505,7 @@ fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
     }
     let mut ok = true;
     for_each_child(e, &mut |c| {
-        if ok && !expr_lite_ok(c, defined) {
+        if ok && !expr_lite_ok(c, scope) {
             ok = false;
         }
     });

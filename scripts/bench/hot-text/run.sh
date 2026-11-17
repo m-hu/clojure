@@ -17,14 +17,34 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
+profiles=$(mktemp -d)
+trap 'rm -rf "$profiles"' EXIT
+
+# Profile binaries linked with an empty order: callgrind attributes the
+# `.text.hot` output section to an unnamed object, not the binary, so an
+# order in place would hide its own hot functions from the regeneration.
+# `blank_order ORDER` swaps in the placeholder (restored on any exit);
+# `finish_order ORDER OUT` restores ORDER, then writes the new order to
+# OUT (which may be ORDER itself).
+blank_order() {
+  cp "$1" "$profiles/order.saved"
+  trap 'cp "$profiles/order.saved" "'"$1"'"; rm -rf "$profiles"' EXIT
+  printf '%s\n' '/* Placeholder: regenerate with scripts/bench/hot-text/run.sh' \
+    '   (Linux; see scripts/bench/hot-text/hot_text.py). Do not edit. */' \
+    'SECTIONS' '{' '  .text.hot :' '  {' '  }' '}' 'INSERT BEFORE .text;' > "$1"
+}
+finish_order() {
+  cp "$profiles/order.saved" "$1"
+  trap 'rm -rf "$profiles"' EXIT
+  cp "$profiles/new.ld" "$2"
+}
 if [ "${1:-}" = "--aot" ]; then
   shift
   out=${1:-$root/rust/hot-text-aot.ld}
+  blank_order "$root/rust/hot-text-aot.ld"
   (cd "$root/rust" && cargo build --release --locked -p clojure-rs \
     && cargo rustc --release --locked -p clj-rt --crate-type staticlib)
   bin=$root/rust/target/release/clojure-rs
-  profiles=$(mktemp -d)
-  trap 'rm -rf "$profiles"' EXIT
   # One path for every compiled workload: hot_text.py keeps the
   # functions of the profiled object by its basename.
   prog=$profiles/prog
@@ -44,14 +64,14 @@ if [ "${1:-}" = "--aot" ]; then
       exit 1
     }
   done
-  python3 "$here/hot_text.py" "$prog" "$out" "$profiles"/*.cg
+  python3 "$here/hot_text.py" "$prog" "$profiles/new.ld" "$profiles"/*.cg
+  finish_order "$root/rust/hot-text-aot.ld" "$out"
   exit 0
 fi
 out=${1:-$root/rust/hot-text.ld}
+blank_order "$root/rust/hot-text.ld"
 (cd "$root/rust" && cargo build --release --locked --no-default-features)
 bin=$root/rust/target/release/clojure-rs
-profiles=$(mktemp -d)
-trap 'rm -rf "$profiles"' EXIT
 for w in "$here"/workloads/*.clj; do
   name=$(basename "$w" .clj)
   valgrind --tool=callgrind --demangle=no --dump-instr=no \
@@ -61,4 +81,5 @@ for w in "$here"/workloads/*.clj; do
     exit 1
   }
 done
-python3 "$here/hot_text.py" "$bin" "$out" "$profiles"/*.cg
+python3 "$here/hot_text.py" "$bin" "$profiles/new.ld" "$profiles"/*.cg
+finish_order "$root/rust/hot-text.ld" "$out"

@@ -233,8 +233,8 @@ pub(crate) fn native_module_with_helpers<'ctx>(
     let mut eval = clj_eval::boot();
     let front = clj_eval::aot_front::front_end(&mut eval, source, source_path)
         .map_err(|e| NativeFail::Program(clj_eval::script::run_diagnostic(source_path, &e)))?;
-    let defns = front
-        .units
+    // The program's own definitions (spliced library units aside, #271).
+    let defns = front.units[front.lib_units..]
         .iter()
         .filter(|u| matches!(&u.expr, clj_eval::expr::Expr::Def { init: Some(_), .. }))
         .count();

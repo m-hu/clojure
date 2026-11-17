@@ -25,7 +25,7 @@ use clj_value::Value;
 
 use crate::error::span_of;
 use crate::eval::{Evaluator, SourceError, split_top_do};
-use crate::expr::{Arity, Expr, FunExpr, Pattern};
+use crate::expr::{Arity, Expr, FunExpr, NsClause, Pattern};
 
 /// Core fns whose top-level calls change what later forms read or
 /// resolve (evaluated at build time as well as compiled).
@@ -58,7 +58,21 @@ pub struct TopUnit {
 pub struct FrontEnd {
     /// Every top-level unit, `do`-split, in load order.
     pub units: Vec<TopUnit>,
+    /// How many leading units are spliced library units (#271, see
+    /// [`SPLICED_LIBS`]): a full-boot build drops them, its `require`
+    /// loading the interpreted library instead.
+    pub lib_units: usize,
+    /// The namespaces those units define, in splice order.
+    pub libs: Vec<&'static str>,
 }
+
+/// Vendored pure-Clojure stdlib namespaces a compiled program carries as
+/// its own leading units when its leading `ns` form requires them
+/// (#271): `(namespace, file, source)`. They compile like user code (so
+/// they behave exactly as the interpreted library under `run`), and a
+/// program requiring them keeps `BootMode::Lite`.
+const SPLICED_LIBS: &[(&str, &str, &str)] =
+    &[("clojure.set", "clojure/set.clj", crate::ns::STDLIB_SET_CLJ)];
 
 /// Run the front end over `text` (named `path` in spans) on a
 /// booted build evaluator, inside `run`'s own binding frame
@@ -96,12 +110,64 @@ pub fn front_end(eval: &mut Evaluator, text: &str, path: &str) -> Result<FrontEn
 const FRONT_NS: &str = "clj.aot.build";
 
 fn front_end_inner(eval: &mut Evaluator, text: &str) -> Result<FrontEnd, SourceError> {
+    let mut front = read_units(eval, text)?;
+    splice_libs(eval, &mut front)?;
+    Ok(front)
+}
+
+/// Read, expand, and analyze every top-level form of `text`.
+fn read_units(eval: &mut Evaluator, text: &str) -> Result<FrontEnd, SourceError> {
     let mut front = FrontEnd::default();
     let mut forms = eval.live_forms(text);
     while let Some(form) = eval.next_live_form(&mut forms)? {
         unit(eval, &form, &mut front)?;
     }
     Ok(front)
+}
+
+/// Prepend the units of every [`SPLICED_LIBS`] library the program's
+/// leading `ns` form requires (#271). They run before that form, as the
+/// interpreted library would have loaded during its `require`; the build
+/// evaluator (which already loaded the library through that `require`)
+/// re-evaluates their environment effects, the same definitions.
+fn splice_libs(eval: &mut Evaluator, front: &mut FrontEnd) -> Result<(), SourceError> {
+    let mut units = Vec::new();
+    for &(ns, file, text) in SPLICED_LIBS {
+        if !leading_ns_requires(front, ns) {
+            continue;
+        }
+        let prev = eval.swap_source(Arc::from(file));
+        let lib = read_units(eval, text);
+        eval.swap_source(prev);
+        units.extend(lib?.units);
+        front.libs.push(ns);
+    }
+    front.lib_units = units.len();
+    units.append(&mut front.units);
+    front.units = units;
+    Ok(())
+}
+
+/// Whether the program's first unit is an `ns` form whose `:require`
+/// names `lib`.
+fn leading_ns_requires(front: &FrontEnd, lib: &str) -> bool {
+    let Some(Expr::Ns { clauses, .. }) = front.units.first().map(|u| &u.expr) else {
+        return false;
+    };
+    clauses.iter().any(|c| match c {
+        NsClause::Require(specs) => specs.iter().any(|s| names_lib(s, lib)),
+        _ => false,
+    })
+}
+
+/// Whether a `:require` spec (`lib` or `[lib …]`) names `lib`.
+#[must_use]
+pub fn names_lib(spec: &Value, lib: &str) -> bool {
+    let head = match spec {
+        Value::Vector(items) => items.get(0),
+        other => Some(other.clone()),
+    };
+    matches!(head, Some(Value::Symbol(s)) if s.namespace().is_none() && s.name() == lib)
 }
 
 /// Expand, split, analyze (and maybe evaluate) one top-level form.
@@ -374,6 +440,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SourceError::Compile(_)), "{err:?}");
+    }
+
+    #[test]
+    fn front_end_splices_libs_a_leading_ns_requires() {
+        use crate::expr::Expr;
+        use clj_value::{Symbol, Value, Vector};
+        let mut eval = boot();
+        let front = front_end(
+            &mut eval,
+            "(ns t (:require [clojure.set :as s] clojure.string)) (s/union #{1} #{2})",
+            "t.clj",
+        )
+        .expect("front");
+        assert_eq!(front.libs, ["clojure.set"]);
+        assert!(matches!(&front.units[0].expr, Expr::Ns { name, .. } if name == "clojure.set"));
+        assert!(matches!(
+            &front.units[front.lib_units].expr,
+            Expr::Ns { name, .. } if name == "t"
+        ));
+        // Only a leading `ns` form's `:require` splices.
+        for src in [
+            "",
+            "(require 'clojure.set) (ns u (:require clojure.set))",
+            "(ns v (:require [clojure.string :as str]) (:refer-clojure :exclude [get]))",
+        ] {
+            let front = front_end(&mut boot(), src, "t.clj").expect("front");
+            assert_eq!((front.lib_units, front.libs.len()), (0, 0), "{src}");
+        }
+        let lib = || Value::Symbol(Symbol::new(None, "clojure.set"));
+        assert!(super::names_lib(&lib(), "clojure.set"));
+        assert!(super::names_lib(
+            &Value::Vector(Vector::from_vec(vec![lib()])),
+            "clojure.set"
+        ));
+        assert!(!super::names_lib(
+            &Value::Vector(Vector::from_vec(Vec::new())),
+            "clojure.set"
+        ));
+        assert!(!super::names_lib(&Value::Int(1), "clojure.set"));
+        assert!(!super::names_lib(&lib(), "clojure.string"));
     }
 
     #[test]

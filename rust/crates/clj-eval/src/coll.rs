@@ -2987,17 +2987,21 @@ enum SortPos {
     Insert(usize),
 }
 
-fn sort_position(
+/// Binary search a sorted collection's `len` keys (`key_at`) for `k`,
+/// in place (no snapshot of the order sidecar).
+fn sort_position<'a>(
     eval: &mut Evaluator,
     spec: &SortSpec,
-    keys: &[Value],
+    len: usize,
+    key_at: impl Fn(usize) -> Option<&'a Value>,
     k: &Value,
 ) -> Result<SortPos, NativeError> {
     let mut lo = 0usize;
-    let mut hi = keys.len();
+    let mut hi = len;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        match compare_sort_keys(eval, spec, &keys[mid], k)? {
+        let key = key_at(mid).expect("sorted position in range");
+        match compare_sort_keys(eval, spec, key, k)? {
             Ordering::Less => lo = mid + 1,
             Ordering::Greater => hi = mid,
             Ordering::Equal => return Ok(SortPos::Found(mid)),
@@ -3010,32 +3014,33 @@ fn sort_position(
 /// the original key object (probe `sorted-keyobj`); a miss
 /// inserts at the sort position.
 fn sorted_assoc_map(eval: &mut Evaluator, m: &Map, k: Value, v: Value) -> Result<Map, NativeError> {
+    Ok(match map_position(eval, m, &k)? {
+        SortPos::Found(i) => m.clone().insert(map_key_at(m, i), v),
+        SortPos::Insert(i) => m.clone().insert_sorted_at(i, k, v),
+    })
+}
+
+/// `k`'s position in sorted map `m`.
+fn map_position(eval: &mut Evaluator, m: &Map, k: &Value) -> Result<SortPos, NativeError> {
     let spec = m
         .sort_spec()
         .cloned()
-        .expect("sorted assoc needs a sort order");
-    let mut entries: Vec<(Value, Value)> = m.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
-    match sort_position(eval, &spec, &m.ordered_keys(), &k)? {
-        SortPos::Found(i) => entries[i].1 = v,
-        SortPos::Insert(i) => entries.insert(i, (k, v)),
-    }
-    Ok(m.clone().with_ordered_entries(entries))
+        .expect("a sorted map has a sort order");
+    sort_position(eval, &spec, m.sorted_len(), |i| m.sorted_key(i), k)
+}
+
+/// The stored key at a found sorted position.
+fn map_key_at(m: &Map, i: usize) -> Value {
+    m.sorted_key(i).cloned().expect("found position in range")
 }
 
 /// Sorted `dissoc`: the found stored key drives the removal, so
 /// compare-0-but-unequal keys still drop.
 fn sorted_without_map(eval: &mut Evaluator, m: &Map, k: &Value) -> Result<Map, NativeError> {
-    let spec = m
-        .sort_spec()
-        .cloned()
-        .expect("sorted dissoc needs a sort order");
-    match sort_position(eval, &spec, &m.ordered_keys(), k)? {
-        SortPos::Found(i) => {
-            let found = m.ordered_keys()[i].clone();
-            Ok(m.clone().without(&found))
-        }
-        SortPos::Insert(_) => Ok(m.clone()),
-    }
+    Ok(match map_position(eval, m, k)? {
+        SortPos::Found(i) => m.clone().without(&map_key_at(m, i)),
+        SortPos::Insert(_) => m.clone(),
+    })
 }
 
 /// Sorted `get`: compare-0 search, then the stored entry.
@@ -3044,56 +3049,39 @@ fn sorted_lookup_map(
     m: &Map,
     k: &Value,
 ) -> Result<Option<Value>, NativeError> {
-    let spec = m
-        .sort_spec()
-        .cloned()
-        .expect("sorted get needs a sort order");
-    match sort_position(eval, &spec, &m.ordered_keys(), k)? {
-        SortPos::Found(i) => Ok(m.get(&m.ordered_keys()[i]).cloned()),
-        SortPos::Insert(_) => Ok(None),
-    }
+    Ok(match map_position(eval, m, k)? {
+        SortPos::Found(i) => m.get(&map_key_at(m, i)).cloned(),
+        SortPos::Insert(_) => None,
+    })
 }
 
 /// Sorted `conj`: a compare-0 hit is a no-op (the member stays).
 fn sorted_conj_set(eval: &mut Evaluator, s: &Set, v: Value) -> Result<Set, NativeError> {
+    Ok(match set_position(eval, s, &v)? {
+        SortPos::Found(_) => s.clone(),
+        SortPos::Insert(i) => s.clone().insert_sorted_at(i, v),
+    })
+}
+
+/// `v`'s position in sorted set `s`.
+fn set_position(eval: &mut Evaluator, s: &Set, v: &Value) -> Result<SortPos, NativeError> {
     let spec = s
         .sort_spec()
         .cloned()
-        .expect("sorted conj needs a sort order");
-    match sort_position(eval, &spec, &s.ordered_members(), &v)? {
-        SortPos::Found(_) => Ok(s.clone()),
-        SortPos::Insert(i) => {
-            let mut members = s.ordered_members();
-            members.insert(i, v);
-            Ok(s.clone().with_ordered_members(members))
-        }
-    }
+        .expect("a sorted set has a sort order");
+    sort_position(eval, &spec, s.sorted_len(), |i| s.sorted_member(i), v)
 }
 
 /// Sorted `disj` / `contains?` through the stored member.
 fn sorted_without_set(eval: &mut Evaluator, s: &Set, v: &Value) -> Result<Set, NativeError> {
-    let spec = s
-        .sort_spec()
-        .cloned()
-        .expect("sorted disj needs a sort order");
-    match sort_position(eval, &spec, &s.ordered_members(), v)? {
-        SortPos::Found(i) => {
-            let found = s.ordered_members()[i].clone();
-            Ok(s.clone().without(&found))
-        }
-        SortPos::Insert(_) => Ok(s.clone()),
-    }
+    Ok(match set_position(eval, s, v)? {
+        SortPos::Found(i) => s.clone().without_sorted_at(i),
+        SortPos::Insert(_) => s.clone(),
+    })
 }
 
 fn sorted_contains_set(eval: &mut Evaluator, s: &Set, v: &Value) -> Result<bool, NativeError> {
-    let spec = s
-        .sort_spec()
-        .cloned()
-        .expect("sorted contains needs a sort order");
-    match sort_position(eval, &spec, &s.ordered_members(), v)? {
-        SortPos::Found(_) => Ok(true),
-        SortPos::Insert(_) => Ok(false),
-    }
+    Ok(matches!(set_position(eval, s, v)?, SortPos::Found(_)))
 }
 
 /// Sorted `get` on sets: the stored member, like `Set::get`.
@@ -3102,14 +3090,10 @@ fn sorted_lookup_set(
     s: &Set,
     v: &Value,
 ) -> Result<Option<Value>, NativeError> {
-    let spec = s
-        .sort_spec()
-        .cloned()
-        .expect("sorted set get needs a sort order");
-    match sort_position(eval, &spec, &s.ordered_members(), v)? {
-        SortPos::Found(i) => Ok(Some(s.ordered_members()[i].clone())),
-        SortPos::Insert(_) => Ok(None),
-    }
+    Ok(match set_position(eval, s, v)? {
+        SortPos::Found(i) => s.sorted_member(i).cloned(),
+        SortPos::Insert(_) => None,
+    })
 }
 
 /// The odd-argument error for map constructors (JVM `RT.map` text).
