@@ -18,14 +18,15 @@
 //! evaluator. Every other unit is only analyzed: nothing like
 //! `(slurp *in*)` ever runs during `build`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use clj_reader::Span;
-use clj_value::Value;
+use clj_value::{Symbol, Value};
 
 use crate::error::span_of;
 use crate::eval::{Evaluator, SourceError, split_top_do};
-use crate::expr::{Arity, Expr, FunExpr, Pattern};
+use crate::expr::{Arity, Expr, FunExpr, NsClause, Pattern};
 
 /// Core fns whose top-level calls change what later forms read or
 /// resolve (evaluated at build time as well as compiled).
@@ -51,6 +52,9 @@ pub struct TopUnit {
     pub env_effect: bool,
     /// The unit's source span.
     pub span: Span,
+    /// Which top-level form of its source text the unit came from
+    /// (`do`-split units share it).
+    pub form: usize,
 }
 
 /// The front end's output: units in load order.
@@ -58,7 +62,55 @@ pub struct TopUnit {
 pub struct FrontEnd {
     /// Every top-level unit, `do`-split, in load order.
     pub units: Vec<TopUnit>,
+    /// How many leading units are spliced library units (#271, see
+    /// [`SPLICED_LIBS`]): a full-boot build drops them, its `require`
+    /// loading the interpreted library instead.
+    pub lib_units: usize,
+    /// The namespaces those units define, in splice order.
+    pub libs: Vec<&'static str>,
 }
+
+/// A vendored stdlib namespace a compiled program carries as its own
+/// leading units when its leading `ns` form requires it (#271). The
+/// units compile like user code (so they behave exactly as the
+/// interpreted library under `run`), and the program keeps
+/// `BootMode::Lite`.
+struct SplicedLib {
+    ns: &'static str,
+    file: &'static str,
+    text: &'static str,
+    /// `Some(has_native)`: only the definitions the program reaches that
+    /// no Lite native (`has_native`) covers, with the definitions they
+    /// reach in turn; `None`: the whole library.
+    select: Option<fn(&str) -> bool>,
+}
+
+/// The [`SplicedLib`]s, in splice order.
+const SPLICED_LIBS: &[SplicedLib] = &[
+    SplicedLib {
+        ns: "clojure.set",
+        file: "clojure/set.clj",
+        text: crate::ns::STDLIB_SET_CLJ,
+        select: None,
+    },
+    SplicedLib {
+        ns: "clojure.string",
+        file: "clojure/string.clj",
+        text: crate::ns::STDLIB_STRING_CLJ,
+        select: Some(crate::aot_boot::is_lite_string_var),
+    },
+];
+
+/// Core fns that look vars up at runtime: a program naming one keeps
+/// every library whole (a spliced subset would show there).
+const RUNTIME_RESOLVERS: [&str; 6] = [
+    "resolve",
+    "ns-resolve",
+    "ns-publics",
+    "ns-interns",
+    "ns-map",
+    "find-var",
+];
 
 /// Run the front end over `text` (named `path` in spans) on a
 /// booted build evaluator, inside `run`'s own binding frame
@@ -96,23 +148,180 @@ pub fn front_end(eval: &mut Evaluator, text: &str, path: &str) -> Result<FrontEn
 const FRONT_NS: &str = "clj.aot.build";
 
 fn front_end_inner(eval: &mut Evaluator, text: &str) -> Result<FrontEnd, SourceError> {
+    let mut front = read_units(eval, text)?;
+    splice_libs(eval, &mut front)?;
+    Ok(front)
+}
+
+/// Read, expand, and analyze every top-level form of `text`.
+fn read_units(eval: &mut Evaluator, text: &str) -> Result<FrontEnd, SourceError> {
     let mut front = FrontEnd::default();
     let mut forms = eval.live_forms(text);
+    let mut ix = 0;
     while let Some(form) = eval.next_live_form(&mut forms)? {
-        unit(eval, &form, &mut front)?;
+        unit(eval, &form, &mut front, ix)?;
+        ix += 1;
     }
     Ok(front)
 }
 
-/// Expand, split, analyze (and maybe evaluate) one top-level form.
-fn unit(eval: &mut Evaluator, form: &Value, front: &mut FrontEnd) -> Result<(), SourceError> {
+/// Prepend the units of every [`SPLICED_LIBS`] library the program's
+/// leading `ns` form requires (#271). They run before that form, as the
+/// interpreted library would have loaded during its `require`; the build
+/// evaluator (which already loaded the library through that `require`)
+/// re-evaluates their environment effects, the same definitions.
+fn splice_libs(eval: &mut Evaluator, front: &mut FrontEnd) -> Result<(), SourceError> {
+    let mut units = Vec::new();
+    for lib in SPLICED_LIBS {
+        if let Some(kept) = lib_units(eval, front, lib)? {
+            units.extend(kept);
+            front.libs.push(lib.ns);
+        }
+    }
+    front.lib_units = units.len();
+    units.append(&mut front.units);
+    front.units = units;
+    Ok(())
+}
+
+/// The units `lib` contributes to the program (`None`: it is not
+/// spliced — not required by the leading `ns` form, or, for a selective
+/// library, nothing to splice).
+fn lib_units(
+    eval: &mut Evaluator,
+    front: &FrontEnd,
+    lib: &SplicedLib,
+) -> Result<Option<Vec<TopUnit>>, SourceError> {
+    if !leading_ns_requires(front, lib.ns) {
+        return Ok(None);
+    }
+    let needed = match lib.select {
+        Some(native) => match needed_defs(&front.units, lib.ns, native) {
+            Some(needed) if !needed.is_empty() => Some((native, needed)),
+            _ => return Ok(None),
+        },
+        None => None,
+    };
+    let prev = eval.swap_source(Arc::from(lib.file));
+    let read = read_units(eval, lib.text);
+    eval.swap_source(prev);
+    let units = read?.units;
+    Ok(match needed {
+        Some((native, needed)) => select_units(units, lib.ns, native, needed),
+        None => Some(units),
+    })
+}
+
+/// The `lib` vars `units` name that no Lite native (`native`) covers —
+/// `None` when the program can look vars up at runtime.
+fn needed_defs(units: &[TopUnit], lib: &str, native: fn(&str) -> bool) -> Option<BTreeSet<String>> {
+    let mut syms = Vec::new();
+    for u in units {
+        global_syms(&u.expr, &mut syms);
+    }
+    let resolves = syms
+        .iter()
+        .any(|s| s.namespace() == Some("clojure.core") && RUNTIME_RESOLVERS.contains(&s.name()));
+    (!resolves).then(|| lib_needs(&syms, lib, native))
+}
+
+/// The names of the `lib` vars among `syms` without a Lite native.
+fn lib_needs(syms: &[Symbol], lib: &str, native: fn(&str) -> bool) -> BTreeSet<String> {
+    syms.iter()
+        .filter(|s| s.namespace() == Some(lib) && !native(s.name()))
+        .map(|s| s.name().to_owned())
+        .collect()
+}
+
+/// The vars `e` names (globals, var refs, direct natives).
+fn global_syms(e: &Expr, out: &mut Vec<Symbol>) {
+    match e {
+        Expr::Global(v) | Expr::VarRef(v) => out.push(v.sym.clone()),
+        Expr::DirectNative(call) => out.push(call.var.sym.clone()),
+        _ => {}
+    }
+    for_each_child(e, &mut |c| global_syms(c, out));
+}
+
+/// A selective library's units for `needed`: its `ns` form (clauses
+/// dropped — the build evaluator applied them, and a Lite `ns` form only
+/// switches namespaces) plus every top-level form defining a needed var
+/// or a var those forms reach (`None` when one has no definition here).
+fn select_units(
+    units: Vec<TopUnit>,
+    lib: &str,
+    native: fn(&str) -> bool,
+    needed: BTreeSet<String>,
+) -> Option<Vec<TopUnit>> {
+    let mut want: Vec<String> = needed.into_iter().collect();
+    let mut seen = BTreeSet::new();
+    let mut forms = BTreeSet::new();
+    while let Some(name) = want.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let form = units.iter().find(|u| defines(&u.expr, lib, &name))?.form;
+        forms.insert(form);
+        let mut syms = Vec::new();
+        for u in units.iter().filter(|u| u.form == form) {
+            global_syms(&u.expr, &mut syms);
+        }
+        want.extend(lib_needs(&syms, lib, native));
+    }
+    let mut kept = Vec::new();
+    for mut u in units {
+        if let Expr::Ns { clauses, .. } = &mut u.expr {
+            clauses.clear();
+            kept.push(u);
+        } else if forms.contains(&u.form) {
+            kept.push(u);
+        }
+    }
+    Some(kept)
+}
+
+/// Whether `e` defines `lib/name`.
+fn defines(e: &Expr, lib: &str, name: &str) -> bool {
+    matches!(e, Expr::Def { sym, .. } if sym.namespace() == Some(lib) && sym.name() == name)
+}
+
+/// Whether the program's first unit is an `ns` form whose `:require`
+/// names `lib`.
+fn leading_ns_requires(front: &FrontEnd, lib: &str) -> bool {
+    let Some(Expr::Ns { clauses, .. }) = front.units.first().map(|u| &u.expr) else {
+        return false;
+    };
+    clauses.iter().any(|c| match c {
+        NsClause::Require(specs) => specs.iter().any(|s| names_lib(s, lib)),
+        _ => false,
+    })
+}
+
+/// Whether a `:require` spec (`lib` or `[lib …]`) names `lib`.
+#[must_use]
+pub fn names_lib(spec: &Value, lib: &str) -> bool {
+    let head = match spec {
+        Value::Vector(items) => items.get(0),
+        other => Some(other.clone()),
+    };
+    matches!(head, Some(Value::Symbol(s)) if s.namespace().is_none() && s.name() == lib)
+}
+
+/// Expand, split, analyze (and maybe evaluate) one top-level form (the
+/// `ix`th of its text).
+fn unit(
+    eval: &mut Evaluator,
+    form: &Value,
+    front: &mut FrontEnd,
+    ix: usize,
+) -> Result<(), SourceError> {
     let source = Arc::clone(&eval.source);
     let span = span_of(form, Span::new(1, 1));
     let expanded = crate::macros::macroexpand_full(eval, form, span, &source)
         .map_err(|e| eval.compile_err(e))?;
     if let Some(elements) = split_top_do(&expanded) {
         for element in elements {
-            unit(eval, element, front)?;
+            unit(eval, element, front, ix)?;
         }
         return Ok(());
     }
@@ -127,6 +336,7 @@ fn unit(eval: &mut Evaluator, form: &Value, front: &mut FrontEnd) -> Result<(), 
         expr,
         env_effect,
         span,
+        form: ix,
     });
     Ok(())
 }
@@ -374,6 +584,80 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SourceError::Compile(_)), "{err:?}");
+    }
+
+    #[test]
+    fn front_end_splices_libs_a_leading_ns_requires() {
+        use crate::expr::Expr;
+        use clj_value::{Symbol, Value, Vector};
+        let mut eval = boot();
+        let front = front_end(
+            &mut eval,
+            "(ns t (:require [clojure.set :as s] clojure.string)) (s/union #{1} #{2})",
+            "t.clj",
+        )
+        .expect("front");
+        assert_eq!(front.libs, ["clojure.set"]);
+        assert!(matches!(&front.units[0].expr, Expr::Ns { name, .. } if name == "clojure.set"));
+        assert!(matches!(
+            &front.units[front.lib_units].expr,
+            Expr::Ns { name, .. } if name == "t"
+        ));
+        // Only a leading `ns` form's `:require` splices.
+        for src in [
+            "",
+            "(require 'clojure.set) (ns u (:require clojure.set))",
+            "(ns v (:require [clojure.string :as str]) (:refer-clojure :exclude [get]))",
+        ] {
+            let front = front_end(&mut boot(), src, "t.clj").expect("front");
+            assert_eq!((front.lib_units, front.libs.len()), (0, 0), "{src}");
+        }
+        let lib = || Value::Symbol(Symbol::new(None, "clojure.set"));
+        assert!(super::names_lib(&lib(), "clojure.set"));
+        assert!(super::names_lib(
+            &Value::Vector(Vector::from_vec(vec![lib()])),
+            "clojure.set"
+        ));
+        assert!(!super::names_lib(
+            &Value::Vector(Vector::from_vec(Vec::new())),
+            "clojure.set"
+        ));
+        assert!(!super::names_lib(&Value::Int(1), "clojure.set"));
+        assert!(!super::names_lib(&lib(), "clojure.string"));
+    }
+
+    #[test]
+    fn front_end_splices_the_string_defs_a_program_needs() {
+        use crate::expr::Expr;
+        let defs = |src: &str| {
+            let front = front_end(&mut boot(), src, "t.clj").expect("front");
+            let names: Vec<String> = front.units[..front.lib_units]
+                .iter()
+                .filter_map(|u| match &u.expr {
+                    Expr::Def { sym, .. } => Some(sym.name().to_owned()),
+                    Expr::Ns { name, clauses, .. } => Some(format!("ns {name} {}", clauses.len())),
+                    _ => None,
+                })
+                .collect();
+            (front.libs.clone(), names)
+        };
+        // `replace` (no Lite native) and its private helper splice, after the
+        // namespace's clause-free `ns` form; natives and unused defs do not.
+        let (libs, names) = defs(
+            "(ns t (:require [clojure.string :as str])) \
+             (println (str/replace \"a1\" #\"\\d\" \"x\") (str/join [1]))",
+        );
+        assert_eq!(libs, ["clojure.string"]);
+        assert_eq!(names, ["ns clojure.string 0", "replace-by", "replace"]);
+        // Nothing to splice: only natives, a runtime var lookup, a var the
+        // library does not define.
+        for src in [
+            "(ns t (:require [clojure.string :as str])) (println (str/join [1]))",
+            "(ns t (:require [clojure.string :as str])) (println (resolve 'str/join) (str/replace \"a\" \"a\" \"b\"))",
+            "(ns t (:require [clojure.string :as str])) (in-ns 'clojure.string) (def extra 1) (in-ns 't) (println str/extra)",
+        ] {
+            assert_eq!(defs(src), (Vec::new(), Vec::new()), "{src}");
+        }
     }
 
     #[test]

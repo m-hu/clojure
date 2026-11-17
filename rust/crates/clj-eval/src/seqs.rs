@@ -91,6 +91,9 @@ pub(crate) fn walk_seq(
     if let Some(done) = walk_direct(eval, &coll, &mut visit) {
         return done;
     }
+    if let Some(done) = walk_sole_map(eval, &coll, &mut visit) {
+        return done;
+    }
     let mut seq = seq_value(eval, &coll).map_err(signal_to_native)?;
     // The walk holds `seq`, never `coll`: owned callers nilled the
     // arg slot (`take_walk_coll`), so dropping the head here frees
@@ -121,6 +124,28 @@ pub(crate) fn walk_seq(
             }
         }
     }
+}
+
+/// Walk a sole unforced `map` seq without its lazy cells (#271, see
+/// [`crate::lazy::walk_sole_map`]; `None`: walk the seq).
+fn walk_sole_map(
+    eval: &mut Evaluator,
+    coll: &Value,
+    visit: &mut impl FnMut(&mut Evaluator, &Value) -> Result<Walk, NativeError>,
+) -> Option<Result<(), NativeError>> {
+    let mut failed = None;
+    let mut sole = |eval: &mut Evaluator, head: Value| match visit(eval, &head) {
+        Ok(walk) => Ok(matches!(walk, Walk::Continue)),
+        Err(e) => {
+            failed = Some(e);
+            Ok(false)
+        }
+    };
+    let done = crate::lazy::walk_sole_map(eval, coll, &mut sole)?;
+    Some(
+        done.map_err(signal_to_native)
+            .and(failed.map_or(Ok(()), Err)),
+    )
 }
 
 /// Walk a vector, a finite repeat, or a counted `long` range in
@@ -2072,5 +2097,109 @@ mod sort_fast_path_tests {
             direct.sort_by(cmp_str_int_pair);
             assert_eq!(by_index, direct, "n={n}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sole_map_walk_tests {
+    use super::{Walk, walk_seq};
+    use crate::error::NativeError;
+    use crate::eval::Evaluator;
+    use crate::lazy::{collect_packed, filter_thunk, map_thunk, seq_value};
+    use clj_value::{Value, Vector};
+
+    fn source(eval: &mut Evaluator, text: &str) -> Value {
+        eval.eval_source(text)
+            .expect("evaluates")
+            .pop()
+            .expect("a value")
+    }
+
+    fn ints(xs: &[i64]) -> Value {
+        Value::Vector(Vector::from_vec(
+            xs.iter().map(|n| Value::Int(*n)).collect(),
+        ))
+    }
+
+    /// The items a walk visits (stopping after `stop_after`).
+    fn walked(eval: &mut Evaluator, coll: Value, stop_after: usize) -> Result<Value, NativeError> {
+        let mut out = Vec::new();
+        walk_seq(eval, coll, |_, v| {
+            out.push(v.clone());
+            Ok(if out.len() >= stop_after {
+                Walk::Stop
+            } else {
+                Walk::Continue
+            })
+        })?;
+        Ok(Value::Vector(Vector::from_vec(out)))
+    }
+
+    /// #271: a sole unforced `map` seq walks without building its lazy
+    /// cells; the items, early stops, and errors are the seq's own.
+    #[test]
+    fn sole_map_seqs_walk_like_their_cells() {
+        let mut eval = crate::ns::boot();
+        let inc = source(&mut eval, "inc");
+        let add = source(&mut eval, "+");
+        let list = source(&mut eval, "'(1 2)");
+        let odd = source(&mut eval, "odd?");
+        let kw = source(&mut eval, "[:a]");
+        let mut walk = |coll: Value, stop: usize| walked(&mut eval, coll, stop).expect("walks");
+        // One input: vector chunks, list items, nothing; an early stop.
+        assert_eq!(
+            walk(map_thunk(inc.clone(), vec![ints(&[1, 2, 3])]), 9),
+            ints(&[2, 3, 4])
+        );
+        assert_eq!(
+            walk(map_thunk(inc.clone(), vec![list.clone()]), 9),
+            ints(&[2, 3])
+        );
+        assert_eq!(walk(map_thunk(inc.clone(), vec![ints(&[])]), 9), ints(&[]));
+        assert_eq!(
+            walk(map_thunk(inc.clone(), vec![ints(&[1, 2, 3])]), 1),
+            ints(&[2])
+        );
+        // Vector inputs: one call per item, the shortest bounds the walk.
+        let both = || map_thunk(add.clone(), vec![ints(&[1, 2, 3]), ints(&[10, 20])]);
+        assert_eq!(walk(both(), 9), ints(&[11, 22]));
+        assert_eq!(walk(both(), 1), ints(&[11]));
+        // Not sole: shared, forced, other thunks, a non-vector input among
+        // several, a plain list — each walks through the seq itself.
+        let shared = map_thunk(inc.clone(), vec![ints(&[1])]);
+        assert_eq!(walk(shared.clone(), 9), ints(&[2]));
+        drop(shared);
+        assert_eq!(
+            walk(filter_thunk(odd, ints(&[1, 2, 3]), false), 9),
+            ints(&[1, 3])
+        );
+        assert_eq!(
+            walk(map_thunk(add.clone(), vec![ints(&[1, 2]), list.clone()]), 9),
+            ints(&[2, 4])
+        );
+        assert_eq!(walk(list.clone(), 9), ints(&[1, 2]));
+        let forced = map_thunk(inc.clone(), vec![ints(&[1])]);
+        seq_value(&mut eval, &forced).expect("forces");
+        assert_eq!(walked(&mut eval, forced, 9).expect("walks"), ints(&[2]));
+        // The map fn's errors and the visitor's surface.
+        assert!(walked(&mut eval, map_thunk(inc.clone(), vec![kw]), 9).is_err());
+        let mut calls = 0;
+        let failed = walk_seq(
+            &mut eval,
+            map_thunk(add.clone(), vec![ints(&[1, 2]), ints(&[3, 4])]),
+            |_, _| {
+                calls += 1;
+                Err(NativeError::arity("visit", 0))
+            },
+        );
+        assert!(failed.is_err() && calls == 1);
+        // `collect_packed` (`mapv`) takes the same walk.
+        let two = collect_packed(
+            &mut eval,
+            map_thunk(add, vec![ints(&[1, 2]), ints(&[3, 4])]),
+        );
+        assert_eq!(Value::Vector(two.expect("collects")), ints(&[4, 6]));
+        let one = collect_packed(&mut eval, map_thunk(inc, vec![ints(&[5])]));
+        assert_eq!(Value::Vector(one.expect("collects")), ints(&[6]));
     }
 }

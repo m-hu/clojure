@@ -882,6 +882,75 @@ fn native_emit_ir_selects_lite_vs_full_boot() {
 }
 
 #[test]
+fn native_emit_splices_clojure_set_under_lite_only() {
+    // #271: a leading `ns` requiring `clojure.set` compiles the vendored
+    // library into the program and keeps the Lite boot; a program that
+    // needs the full boot anyway drops those units (its `require` loads
+    // the interpreted library).
+    let emit = |tag: &str, src: &str| {
+        let ir = tmp(&format!("splice-{tag}.ll"));
+        let report = clj_aot::build_str(
+            src,
+            "s.clj",
+            &tmp("nope-splice"),
+            &EmitOptions {
+                emit_ir: Some(ir.clone()),
+                emit_obj: None,
+            },
+            &no_link(),
+            clj_aot::BuildMode::Mixed,
+        )
+        .expect("splice native");
+        let text = std::fs::read_to_string(&ir).expect("ir");
+        std::fs::remove_file(&ir).expect("cleanup");
+        (report, text)
+    };
+    let (report, lite) = emit(
+        "lite",
+        "(ns demo.set (:require [clojure.set :as set] [clojure.string :as str]))
+         (defn pick [a b] (set/union a b))
+         (println (pick #{1} #{2}) (str/join [1]))",
+    );
+    assert!(report.starts_with("aot: native 1/1 defns"), "{report}");
+    assert!(lite.contains("@rt_n_main_lite("), "{lite}");
+    assert!(lite.contains("_clojure_set_union"), "{lite}");
+    let (report, full) = emit(
+        "full",
+        "(ns demo.setm (:require [clojure.set :as set]))
+         (defmacro m [x] x)
+         (println (m (set/union #{1} #{2})))",
+    );
+    assert!(report.starts_with("aot: native 0/0 defns"), "{report}");
+    assert!(full.contains("@rt_n_main("), "{full}");
+    assert!(!full.contains("_clojure_set_union"), "{full}");
+    // `clojure.string` splices only what no Lite native covers
+    // (`replace` and its helper); redefining a native-served var still
+    // takes the full boot.
+    let (_, lite) = emit(
+        "string",
+        "(ns demo.str (:require [clojure.string :as str]))
+         (println (str/replace \"a1\" #\"\\d\" \"x\") (str/join [1]))",
+    );
+    assert!(lite.contains("@rt_n_main_lite("), "{lite}");
+    assert!(lite.contains("_clojure_string_replace_by"), "{lite}");
+    assert!(!lite.contains("_clojure_string_join"), "{lite}");
+    let (_, redef) = emit(
+        "string-redef",
+        "(ns demo.strr (:require [clojure.string :as str]))
+         (in-ns 'clojure.string)
+         (defn trim [s] s)
+         (in-ns 'demo.strr)
+         (println (str/trim \" a \"))",
+    );
+    assert!(redef.contains("@rt_n_main("), "{redef}");
+    let (_, core) = emit(
+        "core-def",
+        "(in-ns 'clojure.core) (def x-271 1) (in-ns 'user) (println clojure.core/x-271)",
+    );
+    assert!(core.contains("@rt_n_main("), "{core}");
+}
+
+#[test]
 fn native_emit_ir_lowers_scalar_loops_and_branch_conds_271() {
     let src = "\
 (defn step [x]

@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use clj_eval::aot_front::{FrontEnd, for_each_child, pattern_children};
+use clj_eval::aot_front::{FrontEnd, TopUnit, for_each_child, names_lib, pattern_children};
 use clj_eval::expr::{Arity, CaseTest, Expr, FunExpr, NsClause, Pattern};
 use clj_eval::native_abi;
 use clj_value::{Map, Symbol, Value, Vector};
@@ -66,6 +66,49 @@ enum Const {
     StaticField(String, String),
     Class(String),
     Read(String),
+    /// A symbol whose metadata maps keywords to simple values (`defn-`'s
+    /// `^{:private true}` names), built without the reader (#271). Its
+    /// metadata is self-contained: the init cannot read other pool
+    /// constants before the pool freezes.
+    MetaSymbol {
+        ns: Option<String>,
+        name: String,
+        meta: Vec<(MetaVal, MetaVal)>,
+    },
+    /// An empty collection literal without metadata (`[]`, `{}`, `#{}`):
+    /// one value per form, as under `run` — built once by its literal
+    /// shim, `site` keeping each form's value its own.
+    EmptyColl {
+        helper: &'static str,
+        site: usize,
+    },
+}
+
+/// A [`Const::MetaSymbol`] metadata key or value, built in place: a
+/// scalar written inline, or a keyword, symbol, or string made by name.
+#[derive(Clone, Debug, PartialEq)]
+enum MetaVal {
+    Inline(Value),
+    Keyword(Option<String>, String),
+    Symbol(Option<String>, String),
+    Str(String),
+}
+
+/// The [`MetaVal`] for `v` (`None`: not a simple metadata value).
+fn meta_val(v: &Value) -> Option<MetaVal> {
+    Some(match v {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Double(_) | Value::Char(_) => {
+            MetaVal::Inline(v.clone())
+        }
+        Value::Keyword(k) => {
+            MetaVal::Keyword(k.namespace().map(str::to_owned), k.name().to_owned())
+        }
+        Value::Symbol(s) if s.meta().is_none() => {
+            MetaVal::Symbol(s.namespace().map(str::to_owned), s.name().to_owned())
+        }
+        Value::Str(s) => MetaVal::Str(s.to_string()),
+        _ => return None,
+    })
 }
 
 /// One compiled arity: `(fixed, variadic, code)`.
@@ -223,12 +266,19 @@ impl<'ctx> Lowerer<'ctx> {
         front: &FrontEnd,
         path: &str,
     ) -> Result<Module<'ctx>, Unsupported> {
-        self.inline_arith = !front.units.iter().any(|u| mentions_rebinding(&u.expr));
         self.lite = can_lite_program(front);
-        self.var_meta = !self.lite || program_reads_var_meta(front);
-        self.reserve_defns(front);
-        let mut tops = Vec::with_capacity(front.units.len());
-        for unit in &front.units {
+        // A full boot loads the spliced libraries through the program's
+        // own `require` (#271): their compiled units drop.
+        let units = if self.lite {
+            &front.units[..]
+        } else {
+            &front.units[front.lib_units..]
+        };
+        self.inline_arith = !units.iter().any(|u| mentions_rebinding(&u.expr));
+        self.var_meta = !self.lite || program_reads_var_meta(units);
+        self.reserve_defns(units);
+        let mut tops = Vec::with_capacity(units.len());
+        for unit in units {
             if self.drops(&unit.expr) {
                 continue;
             }
@@ -244,7 +294,7 @@ impl<'ctx> Lowerer<'ctx> {
 
     /// Reserve every top-level `(def name (fn …))` whose var is defined
     /// exactly once: calls through such a var may go direct.
-    fn reserve_defns(&mut self, front: &FrontEnd) {
+    fn reserve_defns(&mut self, units: &[TopUnit]) {
         let key = |sym: &Symbol| {
             (
                 sym.namespace().unwrap_or("user").to_owned(),
@@ -252,7 +302,7 @@ impl<'ctx> Lowerer<'ctx> {
             )
         };
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
-        for u in &front.units {
+        for u in units {
             if let Expr::Def { sym, .. } | Expr::DefMacro { sym, .. } = &u.expr {
                 *counts.entry(key(sym)).or_default() += 1;
             }
@@ -262,7 +312,7 @@ impl<'ctx> Lowerer<'ctx> {
                 }
             }
         }
-        for u in &front.units {
+        for u in units {
             let Expr::Def {
                 sym,
                 init: Some(init),
@@ -473,7 +523,7 @@ impl<'ctx> Lowerer<'ctx> {
     /// else through the printed-and-read fallback, checked to round
     /// trip at build time).
     fn value_const(&mut self, v: &Value) -> Result<u64, Unsupported> {
-        let c = match scalar_const(v) {
+        let c = match scalar_const(v).or_else(|| meta_symbol_const(v)) {
             Some(c) => c,
             None => Const::Read(readable_text(v)?),
         };
@@ -2462,7 +2512,8 @@ impl<'ctx> Lowerer<'ctx> {
         let moving = bc_sym.is_none()
             && fast.is_none()
             && (has_own_op
-                || (is_owned_move_op(ns, name, n) && call.args.iter().any(|a| is_move(f, a))));
+                || (is_owned_move_op(ns, name, n)
+                    && call.args.iter().any(|a| is_move(f, a) || is_temporary(a))));
         if moving {
             return self.lower_direct_moving(f, call, k, core_name.as_deref(), dest);
         }
@@ -3459,12 +3510,21 @@ impl<'ctx> Lowerer<'ctx> {
     fn lower_coll(
         &mut self,
         f: &mut FnCtx<'ctx>,
-        helper: &str,
+        helper: &'static str,
         items: &[Expr],
         meta: Option<&Map>,
         dest: PointerValue<'ctx>,
         fallible: bool,
     ) -> Result<(), Unsupported> {
+        if items.is_empty() && meta.is_none() {
+            // One value per form (no allocation per evaluation). (A
+            // literal with reader metadata stays per evaluation: its
+            // metadata is a pool constant the init cannot read yet.)
+            let site = self.consts.len();
+            let k = self.constant(Const::EmptyColl { helper, site });
+            self.call("rt_n_const", None, &[dest.into(), self.u64c(k)]);
+            return Ok(());
+        }
         let mk = self.meta_const(meta)?;
         let arr = self.lower_args(f, items)?;
         let aref = self.slots_ref(f, arr, items.len());
@@ -4179,11 +4239,82 @@ impl<'ctx> Lowerer<'ctx> {
                     let p = self.str_ptr(text);
                     self.call("rt_n_read", None, &[t.into(), p.into()]);
                 }
+                Const::MetaSymbol { ns, name, meta } => {
+                    self.init_meta_symbol(&mut f, t, ns.as_deref(), name, meta);
+                }
+                Const::EmptyColl { helper, .. } => {
+                    let empty = self.const_slice(self.ptr.const_null(), 0);
+                    let args = [t.into(), empty.into(), self.u64c(NONE)];
+                    if *helper == "rt_n_vec_lit" {
+                        self.call(helper, None, &args);
+                    } else {
+                        let st = self.call(helper, Some(self.i32t), &args).expect("st");
+                        self.check(&f, st);
+                    }
+                }
             }
             self.call("rt_n_set_const", None, &[self.u64c(k as u64), t.into()]);
         }
         let result = self.slot(&mut f);
         self.end_fn(f, result)
+    }
+
+    /// Build a [`Const::MetaSymbol`] into `t`: its metadata pairs into a
+    /// slot array, then `rt_n_meta_sym`.
+    fn init_meta_symbol(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        t: PointerValue<'ctx>,
+        ns: Option<&str>,
+        name: &str,
+        meta: &[(MetaVal, MetaVal)],
+    ) {
+        let n = meta.len() * 2;
+        let (arr, elems) = self.slot_array(f, n);
+        for ((key, val), pair) in meta.iter().zip(elems.chunks(2)) {
+            self.init_meta_val(f.func, key, pair[0]);
+            self.init_meta_val(f.func, val, pair[1]);
+        }
+        let kvs = self.slots_ref(f, arr, n);
+        let np = self.opt_str_ptr(ns);
+        let p = self.str_ptr(name);
+        self.call(
+            "rt_n_meta_sym",
+            None,
+            &[t.into(), np.into(), p.into(), kvs.into()],
+        );
+        self.drop_slots(f.func, &elems);
+    }
+
+    /// Write one [`MetaVal`] into `slot`.
+    fn init_meta_val(&mut self, func: FunctionValue<'ctx>, v: &MetaVal, slot: PointerValue<'ctx>) {
+        match v {
+            MetaVal::Inline(v) => self
+                .lower_const(func, v, slot)
+                .expect("inline scalars lower"),
+            MetaVal::Keyword(ns, name) | MetaVal::Symbol(ns, name) => {
+                let np = self.opt_str_ptr(ns.as_deref());
+                let p = self.str_ptr(name);
+                let h = if matches!(v, MetaVal::Keyword(..)) {
+                    "rt_n_kw"
+                } else {
+                    "rt_n_sym"
+                };
+                self.call(h, None, &[slot.into(), np.into(), p.into()]);
+            }
+            MetaVal::Str(s) => {
+                let p = self.str_ptr(s);
+                self.call("rt_n_str", None, &[slot.into(), p.into()]);
+            }
+        }
+    }
+
+    /// A string constant pointer, or null for `None`.
+    fn opt_str_ptr(&mut self, s: Option<&str>) -> PointerValue<'ctx> {
+        match s {
+            Some(s) => self.str_ptr(s),
+            None => self.ptr.const_null(),
+        }
     }
 
     /// No-op targets for the Linux static link's `--wrap` of crtbeginT's
@@ -4557,6 +4688,24 @@ fn scalar_const(v: &Value) -> Option<Const> {
     })
 }
 
+/// A symbol whose metadata maps keywords to simple values, built
+/// without the reader (#271; `None`: anything else).
+fn meta_symbol_const(v: &Value) -> Option<Const> {
+    let Value::Symbol(s) = v else {
+        return None;
+    };
+    let mut meta = Vec::new();
+    for (k, val) in s.meta()?.iter() {
+        let key = matches!(k, Value::Keyword(_)).then(|| meta_val(k))??;
+        meta.push((key, meta_val(val)?));
+    }
+    Some(Const::MetaSymbol {
+        ns: s.namespace().map(str::to_owned),
+        name: s.name().to_owned(),
+        meta,
+    })
+}
+
 /// Host-derived constants rebuilt by name at startup (regexes,
 /// classes, folded static fields).
 fn host_const(v: &Value) -> Option<Const> {
@@ -4606,6 +4755,17 @@ fn is_owned_move_op(ns: Option<&str>, name: &str, argc: usize) -> bool {
         ) => argc >= 1,
         _ => false,
     }
+}
+
+/// Whether `e` evaluates into a slot of its own (a call, a constructed
+/// collection — not a local, constant, or var): an owned call takes that
+/// slot over instead of cloning it (#271), so e.g. `reduce` sees a fresh
+/// `(map …)` seq as its only holder.
+fn is_temporary(e: &Expr) -> bool {
+    !matches!(
+        e,
+        Expr::Local(_) | Expr::Literal(_) | Expr::Quote(_) | Expr::Global(_) | Expr::VarRef(_)
+    )
 }
 
 /// Whether `e` is an occurrence the current `recur` args move.
@@ -5163,7 +5323,13 @@ fn mentions_rebinding(e: &Expr) -> bool {
         Expr::WithRedefs { .. } => true,
         Expr::Global(v) | Expr::VarRef(v) => core_rebind(v),
         Expr::DirectNative(c) => core_rebind(&c.var),
-        Expr::Def { sym, .. } => matches!(sym.namespace(), Some("clojure.core" | "clojure.string")),
+        // Redefining a `clojure.string` var only conflicts with a Lite
+        // native that serves it (a spliced definition has none, #271).
+        Expr::Def { sym, .. } => match sym.namespace() {
+            Some("clojure.core") => true,
+            Some("clojure.string") => clj_eval::aot_boot::is_lite_string_var(sym.name()),
+            _ => false,
+        },
         _ => false,
     };
     let mut found = hit;
@@ -5212,7 +5378,19 @@ fn can_lite_program(front: &FrontEnd) -> bool {
         }
         collect_lite_defs(&u.expr, &mut defined);
     }
-    front.units.iter().all(|u| expr_lite_ok(&u.expr, &defined))
+    let scope = LiteScope {
+        defined,
+        libs: &front.libs,
+    };
+    front.units.iter().all(|u| expr_lite_ok(&u.expr, &scope))
+}
+
+/// What the Lite check resolves against: the program's own definitions
+/// (spliced library units included) and the spliced libraries its
+/// leading `ns` form may require (#271).
+struct LiteScope<'a> {
+    defined: BTreeSet<(String, String)>,
+    libs: &'a [&'static str],
 }
 
 fn sym_key(sym: &Symbol) -> (String, String) {
@@ -5224,13 +5402,9 @@ fn sym_key(sym: &Symbol) -> (String, String) {
 
 /// Whether a program references a reader of var metadata
 /// ([`clj_eval::aot_boot::needs_var_meta`] over every var it names).
-fn program_reads_var_meta(front: &FrontEnd) -> bool {
+fn program_reads_var_meta(units: &[TopUnit]) -> bool {
     let mut refs = Vec::new();
-    for u in front
-        .units
-        .iter()
-        .filter(|u| !is_inert_meta_statement(&u.expr))
-    {
+    for u in units.iter().filter(|u| !is_inert_meta_statement(&u.expr)) {
         collect_var_refs(&u.expr, &mut refs);
     }
     let refs: Vec<(&str, &str)> = refs
@@ -5373,7 +5547,12 @@ fn var_lite_ok(sym: &Symbol, defined: &BTreeSet<(String, String)>) -> bool {
     let name = sym.name();
     match ns {
         "clojure.core" => clj_eval::aot_boot::is_lite_core_var(name),
-        "clojure.string" => clj_eval::aot_boot::is_lite_string_var(name),
+        // A `clojure.string` var without a Lite native may be spliced
+        // in (#271): defined by the program's own units.
+        "clojure.string" => {
+            clj_eval::aot_boot::is_lite_string_var(name)
+                || defined.contains(&(ns.to_owned(), name.to_owned()))
+        }
         _ => defined.contains(&(ns.to_owned(), name.to_owned())),
     }
 }
@@ -5419,15 +5598,17 @@ fn lite_direct_require_aliases(call: &clj_eval::expr::DirectCall) -> Option<Vec<
         .collect()
 }
 
-fn ns_clause_lite_ok(clause: &NsClause) -> bool {
+fn ns_clause_lite_ok(clause: &NsClause, libs: &[&str]) -> bool {
     match clause {
         NsClause::ReferClojure(_) => true,
-        NsClause::Require(specs) => specs.iter().all(|v| lite_require_spec_alias(v).is_some()),
+        NsClause::Require(specs) => specs
+            .iter()
+            .all(|v| lite_require_spec_alias(v).is_some() || libs.iter().any(|l| names_lib(v, l))),
         NsClause::Use(_) | NsClause::Import(_) => false,
     }
 }
 
-fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
+fn expr_lite_ok(e: &Expr, scope: &LiteScope<'_>) -> bool {
     if let Expr::DirectNative(call) = e
         && lite_direct_require_aliases(call).is_some()
     {
@@ -5435,14 +5616,14 @@ fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
     }
     let here = match e {
         Expr::DefMacro { .. } => false,
-        Expr::Ns { clauses, .. } => clauses.iter().all(ns_clause_lite_ok),
+        Expr::Ns { clauses, .. } => clauses.iter().all(|c| ns_clause_lite_ok(c, scope.libs)),
         Expr::Global(v) | Expr::VarRef(v) | Expr::Set { var: v, .. } => {
-            var_lite_ok(&v.sym, defined)
+            var_lite_ok(&v.sym, &scope.defined)
         }
-        Expr::DirectNative(call) => var_lite_ok(&call.var.sym, defined),
-        Expr::Binding { pairs, .. } | Expr::WithRedefs { pairs, .. } => {
-            pairs.iter().all(|(v, _)| var_lite_ok(&v.sym, defined))
-        }
+        Expr::DirectNative(call) => var_lite_ok(&call.var.sym, &scope.defined),
+        Expr::Binding { pairs, .. } | Expr::WithRedefs { pairs, .. } => pairs
+            .iter()
+            .all(|(v, _)| var_lite_ok(&v.sym, &scope.defined)),
         _ => true,
     };
     if !here {
@@ -5450,7 +5631,7 @@ fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
     }
     let mut ok = true;
     for_each_child(e, &mut |c| {
-        if ok && !expr_lite_ok(c, defined) {
+        if ok && !expr_lite_ok(c, scope) {
             ok = false;
         }
     });
@@ -5460,6 +5641,37 @@ fn expr_lite_ok(e: &Expr, defined: &BTreeSet<(String, String)>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_symbols_pool_without_the_reader() {
+        use clj_value::{Keyword, List, new_map};
+        let kw = |n: &str| Value::Keyword(Keyword::new(None, n));
+        let named = |pairs: Vec<(Value, Value)>| {
+            let meta = pairs
+                .into_iter()
+                .fold(new_map(), |m, (k, v)| m.insert(k, v));
+            Value::Symbol(Symbol::new(Some("user"), "f")).with_meta(Some(meta))
+        };
+        let simple = named(vec![
+            (kw("private"), Value::Bool(true)),
+            (kw("k"), Value::Keyword(Keyword::new(Some("a"), "b"))),
+            (kw("tag"), Value::Symbol(Symbol::new(None, "String"))),
+            (kw("doc"), Value::Str(std::sync::Arc::from("d"))),
+        ]);
+        assert!(matches!(
+            meta_symbol_const(&simple),
+            Some(Const::MetaSymbol { ns, name, meta })
+                if ns.as_deref() == Some("user") && name == "f" && meta.len() == 4
+        ));
+        // Anything else reads back: a non-keyword key, a nested value, a
+        // symbol carrying its own metadata, a plain symbol, a non-symbol.
+        let list = Value::List(List::from_vec(vec![Value::Int(1)]));
+        assert!(meta_symbol_const(&named(vec![(Value::Int(1), Value::Nil)])).is_none());
+        assert!(meta_symbol_const(&named(vec![(kw("arglists"), list)])).is_none());
+        assert!(meta_symbol_const(&named(vec![(kw("tag"), simple.clone())])).is_none());
+        assert!(meta_symbol_const(&Value::Symbol(Symbol::new(None, "plain"))).is_none());
+        assert!(meta_symbol_const(&Value::Int(1)).is_none());
+    }
 
     #[test]
     fn static_call_op_needs_literal_class_and_member() {

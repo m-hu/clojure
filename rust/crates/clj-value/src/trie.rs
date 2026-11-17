@@ -317,9 +317,15 @@ impl<T: Clone> PVec<T> {
     /// Items front to back.
     #[must_use]
     pub fn iter(&self) -> Iter<'_, T> {
+        self.iter_from(0)
+    }
+
+    /// Items from index `start` (clamped to the length) to the back.
+    #[must_use]
+    pub fn iter_from(&self, start: usize) -> Iter<'_, T> {
         Iter {
             vec: self,
-            front: 0,
+            front: start.min(self.len),
             back: self.len,
             front_leaf: &[],
             front_base: 0,

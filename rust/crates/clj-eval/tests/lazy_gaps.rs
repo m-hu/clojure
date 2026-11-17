@@ -514,3 +514,52 @@ fn lazy_chunked_cons_and_exhaustion_rows() {
         "()"
     );
 }
+
+#[test]
+fn lazy_cons_runs_rest_as_lazy_seqs() {
+    let mut eval = boot();
+    // `take` / `interpose` (and `partition`'s padded window) force a
+    // realized run of items at once, but cons one item per step on the
+    // JVM: their rests stay unchunked LazySeqs, whether `rest` forces
+    // the run or walks an already-forced one.
+    assert_eq!(
+        run_last(
+            &mut eval,
+            "(let [t (take 5 (range 10)) r (rest t)] \
+               [(class r) (class (rest t)) (class (rest r)) (chunked-seq? r) r])"
+        ),
+        "[clojure.lang.LazySeq clojure.lang.LazySeq clojure.lang.LazySeq false (1 2 3 4)]"
+    );
+    assert_eq!(
+        run_last(
+            &mut eval,
+            "(let [i (interpose 0 [1 2 3])] \
+               [(class (rest i)) (class (next (seq i))) (chunked-seq? (next i)) i])"
+        ),
+        "[clojure.lang.LazySeq clojure.lang.LazySeq false (1 0 2 0 3)]"
+    );
+    assert_eq!(
+        run_last(
+            &mut eval,
+            "(let [w (last (partition 3 3 [:p :q] [1 2 3 4]))] [(class (rest w)) w])"
+        ),
+        "[clojure.lang.LazySeq (4 :p :q)]"
+    );
+    // One rest cell per item (the JVM's conses), forced or not; a
+    // chunked seq's rests stay fresh `ChunkedCons` cells.
+    assert_eq!(
+        run_last(
+            &mut eval,
+            "(let [t (take 5 (range 10)) u (take 5 (range 10)) i (interpose 0 [1 2]) m (map inc [1 2 3])] \
+               (seq u) \
+               [(identical? (rest t) (rest t)) (identical? (next u) (next u)) \
+                (identical? (rest (rest t)) (next (next t))) (identical? (rest i) (rest i)) \
+                (identical? (rest m) (rest m)) (vec (rest (rest t)))])"
+        ),
+        "[true true true true false [2 3 4]]"
+    );
+    assert_eq!(
+        uncaught(&mut eval, "(+ 1 (rest (take 3 (range 5))))"),
+        "java.lang.ClassCastException | class clojure.lang.LazySeq cannot be cast to class java.lang.Number (clojure.lang.LazySeq is in unnamed module of loader 'app'; java.lang.Number is in module java.base of loader 'bootstrap')"
+    );
+}

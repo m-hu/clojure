@@ -81,7 +81,7 @@ const JAVA_SHELL_CLJ: &str = include_str!("java_shell.clj");
 /// `require` path (the `spec_alpha.clj` shape), so scripts work
 /// with zero install steps.
 pub(crate) static STDLIB_STRING_CLJ: &str = include_str!("stdlib/clojure/string.clj");
-const STDLIB_SET_CLJ: &str = include_str!("stdlib/clojure/set.clj");
+pub(crate) static STDLIB_SET_CLJ: &str = include_str!("stdlib/clojure/set.clj");
 // W1 (verbatim+pure) — do not merge by hand, integrator resolves.
 const STDLIB_W1_TEMPLATE_CLJ: &str = include_str!("stdlib/clojure/template.clj");
 const STDLIB_W1_WALK_CLJ: &str = include_str!("stdlib/clojure/walk.clj");
