@@ -12,7 +12,7 @@ mkdir -p /tmp/fns /tmp/b
 : > /tmp/allsyms.txt
 run_one() {  # name source input
   "$c" build "$2" -o /tmp/b/prog > /dev/null 2>&1 || { echo "$1 build-fail"; return; }
-  valgrind --tool=callgrind --dump-instr=no --callgrind-out-file=/tmp/b/cg /tmp/b/prog < "$3" > /dev/null 2>&1 || true
+  valgrind --tool=callgrind --demangle=no --dump-instr=no --callgrind-out-file=/tmp/b/cg /tmp/b/prog < "$3" > /dev/null 2>&1 || true
   python3 probe/cg-fns.py /tmp/b/cg prog > "/tmp/fns/$1.txt"
   nm --defined-only /tmp/b/prog | awk '$2 ~ /^[tTwW]$/ {print $3}' >> /tmp/allsyms.txt
   echo "$1 $(wc -l < /tmp/fns/$1.txt)"
