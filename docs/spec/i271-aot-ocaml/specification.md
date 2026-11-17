@@ -182,6 +182,16 @@ A direct call of a compiled `defn` cost about 290 instructions on macOS beyond i
 2. **Borrowed parameters.** A parameter whose every use is an operand of a core call outside the owned-move ops, or of an invoke, keeps reading the caller's argument array. An owned copy at entry can buy no in-place update for it. Parameters reaching an owned-move op, a `let`, `recur`, or the result still take or clone their value as before, including `reduce`'s handed-over accumulator.
 3. **Effect (macOS, per iteration):** `(defn pick [w i] (nth w i))` called in a loop falls from 422 to 231 instructions (call overhead about 290 → 96). Corpus `direct_calls.clj` covers recursion at depth 20,000, forward calls, and every parameter shape.
 
+### 6.8 Slice 4c: inline traversal loops
+
+`doseq` expands to `(dorun (map (fn [x] …) xs))` and `for` to a lazy `map` of a `fn`, so every iteration of these and of `mapv` / `reduce` with a literal `fn` was a lazy-seq step plus a callback into a compiled closure. That cost 400–550 instructions per item beyond the body (Linux callgrind: `doseq` over a range 531, `for` 548).
+
+1. **Shapes.** `(dorun (map F xs))`, `(mapv F xs)`, `(vec (map F xs))`, `(into [] (map F xs))`, and `(reduce F init xs)`, all `clojure.core` in a program that cannot rebind core vars, where `F` is a literal `fn` with one arity of exactly the needed symbol params (one, or two for `reduce`) that never `recur`s to itself. A named `fn` arrives as a `letfn`, so `F` never refers to itself.
+2. **Direct loop.** The collection (and `reduce`'s init) evaluate in argument order. `rt_n_iter_plan` (`native_abi::iter_plan`) then classifies the collection. A persistent vector iterates by index (`rt_n_vec_item`) and a long range by arithmetic (wrapping, so the unused value after the last cannot trap). The `fn`'s body runs in place with its params bound like a `let` at the env indices the analyzer gave them. It is lowered with its own last-use moves: a param or a body local may move, while an enclosing local is read afresh every item. `mapv` and `vec`/`into` accumulate into a uniquely held vector (`rt_n_vec_push`). `reduce` stops on a `reduced` value (`rt_n_unreduce`).
+3. **General path.** Any other collection (lazy seqs, lists, maps, sets, strings, nil) makes the `fn` a closure and calls the original core functions over the already-evaluated collection, with the arguments moved over as the original call took its temporaries. `run`'s semantics therefore hold exactly, lazy forcing order and `walk_sole_map` fusion included.
+4. **Moves.** The analysis saw the closure capture its free locals before the collection evaluated, so it may have let the collection move a local the body still reads. While the collection and init lower, those locals' moves are suppressed.
+5. **Effect (macOS, per item):** `doseq` over a range 423 → 22 instructions, `reduce` with a literal `fn` 460 → 138, `mapv` over a vector 449 → 307 (the accumulator push dominates). Corpus `hof_loops.clj` covers every shape and collection kind, early `reduced`, exceptions in the body, nested loops, captured locals, and lazy forcing order.
+
 ## 7. Acceptance Checklist (Issue #271)
 
 - [ ] `h2h-compare` `--allow-extra-challenger` implemented and covered by Go tests.

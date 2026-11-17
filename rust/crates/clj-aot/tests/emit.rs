@@ -1145,6 +1145,29 @@ fn native_emit_ir_caches_stable_var_roots_271() {
     for needle in ["@rt_n_enter()", "@rt_n_enter_fn("] {
         assert!(text.contains(needle), "missing {needle}:\n{text}");
     }
+    // Inline traversals (#271 Slice 4c): `doseq`, `mapv`, `vec`/`into []`
+    // of `map`, and `reduce` over literal `fn`s plan a direct loop with a
+    // general fallback; other shapes keep the plain call.
+    let text = emit(
+        "\
+(def v [1 2 3])
+(doseq [x v] (print x))
+(println (mapv (fn [x] (* x x)) v) (vec (map (fn [x] (inc x)) (range 3))))
+(println (into [] (map (fn [x] x) v)) (reduce (fn [a x] (+ a x)) 0 v))
+(println (reduce (fn [a x] a) 0 '(1)) (mapv (fn [x & r] x) v) (into [1] (map (fn [x] x) v)))
+(println (mapv (fn self [x] (if (pos? x) (self (dec x)) x)) v) (mapv (fn [[a]] a) [[1]]))
+(println (map (fn [x] x) v) (dorun (map inc v)) (mapv (fn [x] (recur (dec x))) []))
+",
+        "loops.ll",
+    );
+    for needle in [
+        "@rt_n_iter_plan(",
+        "@rt_n_vec_item(",
+        "@rt_n_vec_push(",
+        "@rt_n_unreduce(",
+    ] {
+        assert!(text.contains(needle), "missing {needle}:\n{text}");
+    }
     // Any var-rooting call anywhere disables the caches.
     let text = emit(
         "(def a [1]) (defn f [] (nth a 0)) (alter-var-root #'a conj 2) (println (f))",

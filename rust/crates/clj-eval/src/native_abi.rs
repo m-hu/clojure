@@ -21,7 +21,8 @@ use std::sync::atomic::AtomicU64;
 
 use clj_reader::Span;
 use clj_value::{
-    BindCounts, Keyword, List, Map, Set, Symbol, ThrowClass, Throwable, Value, Var, Vector, new_map,
+    BindCounts, Keyword, List, Map, RangeNum, Set, Symbol, ThrowClass, Throwable, Value, Var,
+    Vector, new_map,
 };
 
 use crate::error::{NativeError, Signal};
@@ -1052,6 +1053,56 @@ pub fn apply_own(id: u32, args: &mut [Value]) -> Option<Value> {
         .and_then(|(_, _, f)| f(args))
 }
 
+/// A compiled loop's direct iteration plan (#271 Slice 4c): `(1, count,
+/// 0, 0)` for a persistent vector (items by index, [`vec_item`]), `(2,
+/// count, start, step)` for a long range (items `start`, `start + step`,
+/// …). `None`: the loop takes the general call, which walks the seq
+/// exactly as `run` does (lazy forcing order included).
+#[must_use]
+pub fn iter_plan(coll: &Value) -> Option<(u8, i64, i64, i64)> {
+    match coll {
+        Value::Vector(v) => Some((1, i64::try_from(v.len()).ok()?, 0, 0)),
+        Value::Extension(e) => {
+            let r = e.as_any().downcast_ref::<clj_value::RangeValue>()?;
+            match (r.is_long(), r.count(), r.cur(), r.step()) {
+                (true, Some(n), RangeNum::Int(start), RangeNum::Int(step)) => {
+                    Some((2, n, start, step))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Item `i` of persistent vector `v` (an index below [`iter_plan`]'s
+/// count; anything else is nil).
+#[must_use]
+pub fn vec_item(v: &Value, i: usize) -> Value {
+    match v {
+        Value::Vector(v) => v.get(i).unwrap_or(Value::Nil),
+        _ => Value::Nil,
+    }
+}
+
+/// Append `v` to a compiled `mapv` / `vec` loop's vector accumulator
+/// (#271): in place while the loop holds it alone.
+pub fn vec_push(acc: &mut Value, v: Value) {
+    if let Value::Vector(vec) = std::mem::replace(acc, Value::Nil) {
+        *acc = Value::Vector(vec.push_back(v));
+    }
+}
+
+/// Unwrap a `reduced` accumulator in place (`true`: it was one, so the
+/// compiled `reduce` loop stops).
+pub fn unreduce(v: &mut Value) -> bool {
+    let Some(inner) = crate::core::as_reduced(v).cloned() else {
+        return false;
+    };
+    *v = inner;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1138,43 @@ mod tests {
             assert_eq!(print_constant(&built), print_constant(&read));
             assert_eq!(built.meta(), read.meta());
         }
+    }
+
+    #[test]
+    fn loop_plans_vectors_and_long_ranges() {
+        use clj_value::RangeValue;
+        let v = Value::Vector(Vector::from_vec(vec![Value::Int(7), Value::Int(8)]));
+        assert_eq!(iter_plan(&v), Some((1, 2, 0, 0)));
+        assert_eq!(vec_item(&v, 1), Value::Int(8));
+        assert_eq!(vec_item(&Value::Nil, 0), Value::Nil);
+        let range = |cur, end, step, long, count| {
+            Value::Extension(Arc::new(RangeValue::new(cur, end, step, long, count)))
+        };
+        let long = range(
+            RangeNum::Int(3),
+            Some(RangeNum::Int(9)),
+            RangeNum::Int(2),
+            true,
+            Some(3),
+        );
+        assert_eq!(iter_plan(&long), Some((2, 3, 3, 2)));
+        let dbl = range(
+            RangeNum::Double(0.0),
+            Some(RangeNum::Double(1.0)),
+            RangeNum::Double(0.5),
+            false,
+            None,
+        );
+        assert_eq!(iter_plan(&dbl), None);
+        let mut reduced = crate::core::Reduced::wrap(Value::Int(5));
+        assert_eq!(iter_plan(&reduced), None);
+        assert_eq!(iter_plan(&Value::Nil), None);
+        assert!(unreduce(&mut reduced));
+        assert_eq!(reduced, Value::Int(5));
+        assert!(!unreduce(&mut reduced));
+        let mut acc = Value::Vector(Vector::from_vec(Vec::new()));
+        vec_push(&mut acc, Value::Int(1));
+        assert_eq!(acc, Value::Vector(Vector::from_vec(vec![Value::Int(1)])));
     }
 
     #[test]

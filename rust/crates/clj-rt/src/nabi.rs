@@ -307,6 +307,42 @@ pub extern "C" fn rt_n_const(out: &mut Value, k: u64) {
     *out = native::constant(k as usize).clone();
 }
 
+/// A compiled loop's iteration plan for `coll` (#271 Slice 4c): `plan` =
+/// (count, start, step); returns 1 for a persistent vector, 2 for a long
+/// range, and 0 when the loop must take the general call.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_iter_plan(coll: &Value, plan: &mut [i64; 3]) -> u8 {
+    let Some((kind, n, start, step)) = native_abi::iter_plan(coll) else {
+        return 0;
+    };
+    *plan = [n, start, step];
+    kind
+}
+
+/// `out = v[i]` (a persistent vector and an in-range index).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_item(out: &mut Value, v: &Value, i: u64) {
+    *out = native_abi::vec_item(v, i as usize);
+}
+
+/// `out = []`: a compiled `mapv` / `vec` loop's accumulator.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_new(out: &mut Value) {
+    *out = Value::Vector(clj_value::Vector::from_vec(Vec::new()));
+}
+
+/// Append `v` (taken: left nil) to accumulator `acc`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_push(acc: &mut Value, v: &mut Value) {
+    native_abi::vec_push(acc, std::mem::replace(v, Value::Nil));
+}
+
+/// Unwrap a `reduced` accumulator in place: 1 when it was one.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_unreduce(v: &mut Value) -> u8 {
+    u8::from(native_abi::unreduce(v))
+}
+
 /// The frozen constant table's first slot (#271): generated code borrows
 /// `&consts[k]` in place of cloning constant `k` into a temporary.
 #[unsafe(no_mangle)]
@@ -1091,6 +1127,11 @@ pub fn native_symbols() -> Vec<(&'static str, usize)> {
         rt_n_coll,
         rt_n_consts_base,
         rt_n_enter,
+        rt_n_iter_plan,
+        rt_n_vec_item,
+        rt_n_vec_new,
+        rt_n_vec_push,
+        rt_n_unreduce,
         rt_n_regex,
         rt_n_static_field,
         rt_n_class,

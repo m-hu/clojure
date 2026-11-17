@@ -2641,10 +2641,338 @@ impl<'ctx> Lowerer<'ctx> {
             }
             return Ok(());
         }
-        if self.try_lower_assoc_conj(f, call, Some(dest))? {
+        if self.try_lower_assoc_conj(f, call, Some(dest))?
+            || (self.inline_arith && self.try_lower_hof_loop(f, call, dest)?)
+        {
             return Ok(());
         }
         self.lower_direct_with(f, call, None, dest)
+    }
+
+    /// Run a [`HofLoop`] inline (#271 Slice 4c). The collection (and a
+    /// `reduce` init) evaluate in argument order; then a persistent vector
+    /// or long range runs the `fn`'s body per item right here, with its
+    /// params bound like a `let` (no closure, no lazy seq, no call). Any
+    /// other collection takes the general call, the `fn` made into a
+    /// closure, over the already-evaluated collection: exactly what `run`
+    /// does, lazy forcing order included.
+    fn try_lower_hof_loop(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        call: &clj_eval::expr::DirectCall,
+        dest: PointerValue<'ctx>,
+    ) -> Result<bool, Unsupported> {
+        let Some(hl) = hof_loop(call) else {
+            return Ok(false);
+        };
+        let base = f.env.len();
+        // The analysis saw the `fn` capture its free locals before the
+        // collection (and init) evaluated, so it may let those move a local
+        // the body still reads. Here the body runs after them, and the
+        // general path's closure is made after them: keep those locals.
+        let mut free = BTreeSet::new();
+        arity_free(hl.arity, base, &mut free);
+        let enclosing = f.moves.clone();
+        f.moves.retain(|m| !free.contains(&m.1));
+        let lowered = self.lower_hof_loop(f, &hl, base, dest);
+        f.moves = enclosing;
+        lowered?;
+        Ok(true)
+    }
+
+    /// [`try_lower_hof_loop`] once the moves are safe.
+    fn lower_hof_loop(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        hl: &HofLoop<'_>,
+        base: usize,
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        let acc = self.slot(f);
+        match hl.init {
+            Some(init) => self.lower(f, init, acc)?,
+            None => {
+                if hl.kind == HofKind::Collect {
+                    self.call("rt_n_vec_new", None, &[acc.into()]);
+                }
+            }
+        }
+        let coll = self.slot(f);
+        self.lower(f, hl.coll, coll)?;
+        let plan_ty = self.ctx.struct_type(&[self.i64t.into(); 3], false);
+        let plan = self.entry_alloca(f, plan_ty, "plan");
+        let kind = self
+            .call(
+                "rt_n_iter_plan",
+                Some(self.i8t),
+                &[coll.into(), plan.into()],
+            )
+            .expect("kind");
+        let direct = self.ctx.append_basic_block(f.func, "loop_direct");
+        let general = self.ctx.append_basic_block(f.func, "loop_general");
+        let done = self.ctx.append_basic_block(f.func, "loop_done");
+        let is_direct = self
+            .builder
+            .build_int_compare(IntPredicate::NE, kind, self.i8t.const_zero(), "direct")
+            .expect("cmp");
+        self.builder
+            .build_conditional_branch(is_direct, direct, general)
+            .expect("br");
+        self.builder.position_at_end(direct);
+        let fields = (0..3)
+            .map(|i| {
+                let p = self
+                    .builder
+                    .build_struct_gep(plan_ty, plan, i, "plan_field")
+                    .expect("gep");
+                self.builder
+                    .build_load(self.i64t, p, "plan_v")
+                    .expect("load")
+                    .into_int_value()
+            })
+            .collect::<Vec<_>>();
+        let state = LoopState {
+            acc,
+            coll,
+            kind,
+            n: fields[0],
+            start: fields[1],
+            step: fields[2],
+        };
+        self.emit_hof_direct(f, hl, base, &state, dest)?;
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(general);
+        self.emit_hof_general(f, hl, base, acc, coll, dest)?;
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
+        self.drop_and_nil_slots(f.func, &[coll, acc]);
+        Ok(())
+    }
+
+    /// The inline loop of [`try_lower_hof_loop`] over a vector (items by
+    /// index) or a long range (items by arithmetic): binds the params,
+    /// lowers the body with its own moves (a param or a body local may be
+    /// moved; an enclosing local is read afresh every item), and folds the
+    /// result into the accumulator. Leaves the loop's value in `dest`.
+    fn emit_hof_direct(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        hl: &HofLoop<'_>,
+        base: usize,
+        st: &LoopState<'ctx>,
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        let i_ptr = self.entry_alloca(f, self.i64t, "loop_i");
+        let cur_ptr = self.entry_alloca(f, self.i64t, "loop_cur");
+        self.builder
+            .build_store(i_ptr, self.i64t.const_zero())
+            .expect("store");
+        self.builder.build_store(cur_ptr, st.start).expect("store");
+        let head = self.ctx.append_basic_block(f.func, "loop_head");
+        let body = self.ctx.append_basic_block(f.func, "loop_body");
+        let exit = self.ctx.append_basic_block(f.func, "loop_exit");
+        self.builder.build_unconditional_branch(head).expect("br");
+        self.builder.position_at_end(head);
+        let i = self
+            .builder
+            .build_load(self.i64t, i_ptr, "i")
+            .expect("load")
+            .into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, i, st.n, "more")
+            .expect("cmp");
+        self.builder
+            .build_conditional_branch(more, body, exit)
+            .expect("br");
+        self.builder.position_at_end(body);
+        let item = self.slot(f);
+        self.emit_loop_item(f, st, item, i, cur_ptr);
+        let next = self
+            .builder
+            .build_int_add(i, self.i64t.const_int(1, false), "i_next")
+            .expect("add");
+        self.builder.build_store(i_ptr, next).expect("store");
+        let params = match hl.kind {
+            HofKind::Reduce => vec![st.acc, item],
+            HofKind::Each | HofKind::Collect => vec![item],
+        };
+        let res = self.slot(f);
+        self.lower_inline_body(f, hl.arity, base, &params, res)?;
+        match hl.kind {
+            HofKind::Each => self.drop_and_nil_slots(f.func, &[res]),
+            HofKind::Collect => {
+                self.call("rt_n_vec_push", None, &[st.acc.into(), res.into()]);
+            }
+            HofKind::Reduce => self.move_v(f.func, st.acc, res),
+        }
+        self.drop_and_nil_slots(f.func, &[item]);
+        if hl.kind == HofKind::Reduce {
+            let stop = self
+                .call("rt_n_unreduce", Some(self.i8t), &[st.acc.into()])
+                .expect("stop");
+            let stopped = self
+                .builder
+                .build_int_compare(IntPredicate::NE, stop, self.i8t.const_zero(), "stopped")
+                .expect("cmp");
+            self.builder
+                .build_conditional_branch(stopped, exit, head)
+                .expect("br");
+        } else {
+            self.builder.build_unconditional_branch(head).expect("br");
+        }
+        self.builder.position_at_end(exit);
+        match hl.kind {
+            HofKind::Each => self.write_nil(f.func, dest),
+            HofKind::Collect | HofKind::Reduce => self.move_v(f.func, dest, st.acc),
+        }
+        Ok(())
+    }
+
+    /// `item =` the loop's `i`th item: a vector's element (by index), or a
+    /// long range's current value (then advanced by its step; wrapping, so
+    /// the never-used value after the last cannot trap).
+    fn emit_loop_item(
+        &mut self,
+        f: &FnCtx<'ctx>,
+        st: &LoopState<'ctx>,
+        item: PointerValue<'ctx>,
+        i: IntValue<'ctx>,
+        cur_ptr: PointerValue<'ctx>,
+    ) {
+        let vec_b = self.ctx.append_basic_block(f.func, "loop_vec_item");
+        let range_b = self.ctx.append_basic_block(f.func, "loop_range_item");
+        let got = self.ctx.append_basic_block(f.func, "loop_item");
+        let is_vec = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                st.kind,
+                self.i8t.const_int(1, false),
+                "is_vec",
+            )
+            .expect("cmp");
+        self.builder
+            .build_conditional_branch(is_vec, vec_b, range_b)
+            .expect("br");
+        self.builder.position_at_end(vec_b);
+        self.call(
+            "rt_n_vec_item",
+            None,
+            &[item.into(), st.coll.into(), i.into()],
+        );
+        self.builder.build_unconditional_branch(got).expect("br");
+        self.builder.position_at_end(range_b);
+        let cur = self
+            .builder
+            .build_load(self.i64t, cur_ptr, "cur")
+            .expect("load")
+            .into_int_value();
+        self.write_int(f.func, item, cur);
+        let after = self
+            .builder
+            .build_int_add(cur, st.step, "cur_next")
+            .expect("add");
+        self.builder.build_store(cur_ptr, after).expect("store");
+        self.builder.build_unconditional_branch(got).expect("br");
+        self.builder.position_at_end(got);
+    }
+
+    /// Lower a literal `fn` arity's body in place, its params bound to
+    /// `params` like a `let` (at env index `base` onward, where the
+    /// analyzer placed them) and the body's own last uses as its moves.
+    fn lower_inline_body(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        arity: &Arity,
+        base: usize,
+        params: &[PointerValue<'ctx>],
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        for p in params {
+            f.env.push(Some(LocalRef::Slot(*p)));
+        }
+        let owned: Vec<usize> = (base..base + params.len()).collect();
+        let moves = collect_body_moves(&arity.body, base, &f.env, &owned);
+        let saved = std::mem::replace(&mut f.moves, moves);
+        let lowered = self.lower_body(f, &arity.body, dest);
+        f.moves = saved;
+        f.env.truncate(base);
+        lowered
+    }
+
+    /// The general path of [`try_lower_hof_loop`]: the `fn` as a closure,
+    /// then the original core calls (`map` then `dorun` / `vec` / `into`,
+    /// or `mapv` / `reduce`) over the evaluated collection.
+    fn emit_hof_general(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        hl: &HofLoop<'_>,
+        base: usize,
+        acc: PointerValue<'ctx>,
+        coll: PointerValue<'ctx>,
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        let closure = self.slot(f);
+        self.make_closure(f, hl.fun, base, closure)?;
+        let mut args = vec![closure];
+        if hl.kind == HofKind::Reduce {
+            args.push(acc);
+        }
+        args.push(coll);
+        let Some((outer, prefix)) = hl.outer else {
+            self.core_call_owned(f, hl.inner, &args, dest);
+            return Ok(());
+        };
+        let seq = self.slot(f);
+        self.core_call_owned(f, hl.inner, &args, seq);
+        let mut outer_args = Vec::new();
+        if let Some(p) = prefix {
+            let s = self.slot(f);
+            self.lower(f, p, s)?;
+            outer_args.push(s);
+        }
+        outer_args.push(seq);
+        self.core_call_owned(f, outer, &outer_args, dest);
+        Ok(())
+    }
+
+    /// `dest = (var args…)` through the core var's native, the `args`
+    /// slots moved over (left nil), as the original call took its
+    /// temporaries: a `map` seq reaches `dorun` / `vec` uniquely held, so
+    /// the walk can fuse it (`walk_sole_map`).
+    fn core_call_owned(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        call: &clj_eval::expr::DirectCall,
+        args: &[PointerValue<'ctx>],
+        dest: PointerValue<'ctx>,
+    ) {
+        let k = self.var_of(&call.var);
+        let n = args.len();
+        let (arr, elems) = self.slot_array(f, n);
+        for (e, a) in elems.iter().zip(args) {
+            self.move_v(f.func, *e, *a);
+        }
+        let name = call.var.sym.name();
+        let op = native_abi::own_op(name, n)
+            .or_else(|| native_abi::inline_op(name, n))
+            .unwrap_or(u32::MAX);
+        let aref = self.slots_ref(f, arr, n);
+        let st = self
+            .call(
+                "rt_n_core_own",
+                Some(self.i32t),
+                &[
+                    dest.into(),
+                    self.i32t.const_int(u64::from(op), false).into(),
+                    self.u64c(k),
+                    aref.into(),
+                ],
+            )
+            .expect("st");
+        self.check(f, st);
+        self.drop_slots(f.func, &elems);
     }
 
     fn lower_direct_with(
@@ -5170,6 +5498,118 @@ fn self_recurs(body: &[Expr]) -> bool {
 
 /// Whether a direct call has an owned-args entry that can reuse moved
 /// (`Arc::strong_count == 1`) collections or release consumed inputs early.
+/// Which eager traversal a [`HofLoop`] runs: a `doseq` (`dorun` of a
+/// `map`), a vector build (`mapv`, `vec` / `into []` of a `map`), or a
+/// `reduce`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HofKind {
+    Each,
+    Collect,
+    Reduce,
+}
+
+/// A core traversal over a literal `fn` that a compiled loop can run
+/// inline (#271 Slice 4c), with the calls the general path makes: the
+/// inner one (`map`, `mapv`, or `reduce`) and, for `dorun` / `vec` /
+/// `into []`, the outer one with its leading argument.
+struct HofLoop<'a> {
+    kind: HofKind,
+    fun: &'a FunExpr,
+    arity: &'a Arity,
+    init: Option<&'a Expr>,
+    coll: &'a Expr,
+    inner: &'a clj_eval::expr::DirectCall,
+    outer: Option<(&'a clj_eval::expr::DirectCall, Option<&'a Expr>)>,
+}
+
+/// A compiled loop's runtime state: the accumulator and collection
+/// slots, the [`rt_n_iter_plan`] kind, and the plan's count, start, step.
+struct LoopState<'ctx> {
+    acc: PointerValue<'ctx>,
+    coll: PointerValue<'ctx>,
+    kind: IntValue<'ctx>,
+    n: IntValue<'ctx>,
+    start: IntValue<'ctx>,
+    step: IntValue<'ctx>,
+}
+
+/// `call` as a [`HofLoop`]: `(mapv F xs)`, `(reduce F init xs)`, or
+/// `(dorun (map F xs))` / `(vec (map F xs))` / `(into [] (map F xs))`,
+/// all `clojure.core`.
+fn hof_loop(call: &clj_eval::expr::DirectCall) -> Option<HofLoop<'_>> {
+    if call.var.sym.namespace() != Some("clojure.core") {
+        return None;
+    }
+    let one = |kind, fe, init, coll| {
+        let (fun, arity) = inline_fn(fe, if kind == HofKind::Reduce { 2 } else { 1 })?;
+        Some(HofLoop {
+            kind,
+            fun,
+            arity,
+            init,
+            coll,
+            inner: call,
+            outer: None,
+        })
+    };
+    match (call.var.sym.name(), call.args.as_slice()) {
+        ("mapv", [fe, coll]) => one(HofKind::Collect, fe, None, coll),
+        ("reduce", [fe, init, coll]) => one(HofKind::Reduce, fe, Some(init), coll),
+        ("dorun", [inner]) => map_loop(inner, HofKind::Each, call, None),
+        ("vec", [inner]) => map_loop(inner, HofKind::Collect, call, None),
+        ("into", [to @ Expr::VecLit(items, None), inner]) if items.is_empty() => {
+            map_loop(inner, HofKind::Collect, call, Some(to))
+        }
+        _ => None,
+    }
+}
+
+/// `(map F xs)` (a `clojure.core/map` of a literal one-param `fn`) under
+/// the outer call `outer`.
+fn map_loop<'a>(
+    inner: &'a Expr,
+    kind: HofKind,
+    outer: &'a clj_eval::expr::DirectCall,
+    prefix: Option<&'a Expr>,
+) -> Option<HofLoop<'a>> {
+    let Expr::DirectNative(m) = inner else {
+        return None;
+    };
+    let [fe, coll] = m.args.as_slice() else {
+        return None;
+    };
+    if m.var.sym.namespace() != Some("clojure.core") || m.var.sym.name() != "map" {
+        return None;
+    }
+    let (fun, arity) = inline_fn(fe, 1)?;
+    Some(HofLoop {
+        kind,
+        fun,
+        arity,
+        init: None,
+        coll,
+        inner: m,
+        outer: Some((outer, prefix)),
+    })
+}
+
+/// A literal `fn` whose one arity takes exactly `params` symbol params
+/// and never `recur`s to itself: its body can run inline per item (a
+/// named `fn` arrives as a `letfn`, so it never refers to itself here).
+fn inline_fn(e: &Expr, params: usize) -> Option<(&FunExpr, &Arity)> {
+    let Expr::Fn(fun) = e else {
+        return None;
+    };
+    let [arity] = &fun.arities[..] else {
+        return None;
+    };
+    (arity.rest.is_none()
+        && arity.fixed.len() == params
+        && arity.fixed.iter().all(|p| matches!(p, Pattern::Symbol(_)))
+        && !self_recurs(&arity.body))
+    .then_some((fun, arity))
+}
+
 /// Whether every use of local `i` in `body` is a read-only call operand
 /// (#271): an argument of a core call outside the owned-move ops, or of
 /// an invoke. A param used only so keeps reading the caller's argument

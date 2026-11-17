@@ -412,7 +412,7 @@ impl<'ctx> Lowerer<'ctx> {
             .expect("direct local slot")
     }
 
-    fn entry_alloca(
+    pub(super) fn entry_alloca(
         &self,
         f: &FnCtx<'ctx>,
         ty: impl BasicType<'ctx>,
