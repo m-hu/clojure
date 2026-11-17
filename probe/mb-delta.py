@@ -15,6 +15,6 @@ d = {k: (b[k] - a.get(k, 0)) / iters for k in b}
 tot = sum(d.values())
 rows = sorted(d.items(), key=lambda kv: -kv[1])
 print(f'== {name}: {tot:.0f} per iteration')
-for k, v in rows[:14]:
-    if v >= 1:
+for k, v in rows[:25]:
+    if v >= 2000:
         print(f'   {v:7.1f}  {k[:150]}')

@@ -1,7 +1,7 @@
 name: init-profile
 on:
   push:
-    branches: [probe/init-profile-271]
+    branches: [probe/io-271]
 jobs:
   probe:
     runs-on: ubuntu-latest
@@ -23,7 +23,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm
       - name: Profile
         run: |
-          set -o pipefail; bash probe/fixed-cg.sh 2>&1 | tee probe-out.txt
+          set -o pipefail; bash probe/io-cg.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -31,5 +31,5 @@ jobs:
           path: |
             probe-out.txt
             /tmp/prof/
-            /tmp/rss/
+            /tmp/io/
             /tmp/mb/summary.txt
