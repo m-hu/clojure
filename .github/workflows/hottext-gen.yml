@@ -1,0 +1,40 @@
+name: hot-text-aot-gen
+on:
+  push:
+    branches: [probe/hot-text-aot-271]
+  workflow_dispatch:
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time valgrind
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: ./.github/actions/setup-llvm
+      - name: Generate rust/hot-text-aot.ld
+        run: |
+          set -o pipefail
+          bash scripts/bench/hot-text/run.sh --aot /tmp/hot-text-aot.ld 2>&1 | tail -20
+          cp /tmp/hot-text-aot.ld rust/hot-text-aot.ld
+      - name: Measure with the generated order
+        run: |
+          set -euo pipefail
+          cd rust && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib && cd ..
+          bin=rust/target/release/clojure-rs
+          for w in scripts/bench/hot-text/aot-workloads/*.clj scripts/bench/hot-text/workloads/trivial.clj; do
+            in=${w%.clj}.in; [ -f "$in" ] || in=/dev/null
+            "$bin" build "$w" -o /tmp/prog > /dev/null
+            rss=$(for _ in 1 2 3; do { /usr/bin/time -f '%M' /tmp/prog < "$in" > /dev/null; } 2>&1 | tail -1; done | sort -n | head -1)
+            echo "$(basename "$w") maxrss_kb=$rss"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hot-text-aot
+          path: rust/hot-text-aot.ld
