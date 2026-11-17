@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicU64;
 
 use clj_reader::Span;
 use clj_value::{
-    BindCounts, Keyword, Map, Symbol, ThrowClass, Throwable, Value, Var, Vector, new_map,
+    BindCounts, Keyword, List, Map, Set, Symbol, ThrowClass, Throwable, Value, Var, Vector, new_map,
 };
 
 use crate::error::{NativeError, Signal};
@@ -377,6 +377,29 @@ pub fn meta_symbol(ns: Option<&str>, name: &str, kvs: &[Value]) -> Value {
         meta = meta.insert(pair[0].clone(), pair[1].clone());
     }
     Value::Symbol(Symbol::new(ns, name)).with_meta(Some(meta))
+}
+
+/// A metadata-free constant collection over its items, built by the
+/// reader's own constructors (#271: pooled constants skip the reader).
+/// `kind`: 0 list, 1 vector, 2 map (`items` interleave keys and
+/// values), anything else a set.
+#[must_use]
+pub fn const_coll(kind: u64, items: &[Value]) -> Value {
+    match kind {
+        0 if items.is_empty() => Value::List(List::new_sync()),
+        0 => Value::List(List::from_vec(items.to_vec())),
+        1 => Value::Vector(Vector::from_vec(items.to_vec())),
+        2 => {
+            let pairs = items
+                .chunks(2)
+                .map(|p| (p[0].clone(), p[1].clone()))
+                .collect();
+            Value::Map(Map::from_kvs_checked(pairs).expect("constant map keys are distinct"))
+        }
+        _ => Value::Set(
+            Set::from_items_checked(items.to_vec()).expect("constant set items are distinct"),
+        ),
+    }
 }
 
 /// Print a constant for [`read_constant`], with metadata.
@@ -1063,6 +1086,48 @@ mod tests {
             let read = read_constant(text).expect("reads");
             assert_eq!(print_constant(&built), print_constant(&read));
             assert_eq!(built.meta(), read.meta());
+        }
+    }
+
+    #[test]
+    fn const_colls_match_the_reader() {
+        let kw = |n: &str| Value::Keyword(Keyword::new(None, n));
+        let sym = |n: &str| Value::Symbol(Symbol::new(None, n));
+        let vec_of = |xs: Vec<Value>| const_coll(1, &xs);
+        for (kind, items, text) in [
+            (0, vec![], "()"),
+            (
+                0,
+                vec![
+                    vec_of(vec![sym("x")]),
+                    vec_of(vec![sym("x"), sym("&"), sym("y")]),
+                ],
+                "([x] [x & y])",
+            ),
+            (
+                1,
+                vec![Value::Str(std::sync::Arc::from("java.lang.Exception"))],
+                "[\"java.lang.Exception\"]",
+            ),
+            (
+                2,
+                vec![
+                    kw("added"),
+                    Value::Str(std::sync::Arc::from("1.0")),
+                    kw("n"),
+                    Value::Int(2),
+                ],
+                "{:added \"1.0\", :n 2}",
+            ),
+            (3, vec![kw("a"), Value::Int(1)], "#{:a 1}"),
+        ] {
+            let built = const_coll(kind, &items);
+            let read = read_constant(text).expect("reads");
+            assert_eq!(built, read);
+            // Read lists carry their read position; built ones carry none.
+            let shown = |v: &Value| print_constant(&v.clone().with_meta(None));
+            assert_eq!(shown(&built), shown(&read));
+            assert!(built.meta().is_none());
         }
     }
 
