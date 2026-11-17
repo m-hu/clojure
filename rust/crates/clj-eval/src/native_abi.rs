@@ -85,6 +85,29 @@ pub fn vec_lit(items: Vec<Value>, meta: Option<Map>) -> Value {
     Value::Vector(Vector::from_vec(items).with_meta(meta))
 }
 
+/// [`vec_lit`] taking the evaluated items over (each slot left nil, #271):
+/// no clone per item, and all-long items go straight to packed storage
+/// (no intermediate boxed vector).
+pub fn vec_lit_owned(items: &mut [Value], meta: Option<Map>) -> Value {
+    let longs: Option<Vec<i64>> = items
+        .iter()
+        .map(|v| match v {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    let vec = match longs {
+        Some(ns) if !ns.is_empty() => Vector::from_ints(ns),
+        _ => Vector::from_vec(
+            items
+                .iter_mut()
+                .map(|v| std::mem::replace(v, Value::Nil))
+                .collect(),
+        ),
+    };
+    Value::Vector(vec.with_meta(meta))
+}
+
 /// A map literal over evaluated `[k0 v0 k1 v1 …]` (keys realized,
 /// last wins, like the interpreter).
 pub fn map_lit(eval: &mut Evaluator, kvs: &[Value], meta: Option<Map>) -> Step {
@@ -1085,13 +1108,89 @@ pub fn vec_item(v: &Value, i: usize) -> Value {
     }
 }
 
-/// Append `v` to a compiled `mapv` / `vec` loop's vector accumulator
-/// (#271): in place while the loop holds it alone.
-pub fn vec_push(acc: &mut Value, v: Value) {
-    *acc = match std::mem::replace(acc, Value::Nil) {
-        Value::Vector(vec) => Value::Vector(vec.push_back(v)),
-        other => other,
+/// A compiled `mapv` / `vec` / `into []` loop's accumulator (#271): items
+/// gather in a plain buffer, packed while every item is a long (the
+/// storage `mapv` itself freezes to), and become one persistent vector
+/// when the loop ends. Only the loop ever holds it, so pushes take no
+/// lock and no copy-on-write check.
+#[derive(Debug, Default)]
+pub struct VecBuilder {
+    ints: Vec<i64>,
+    items: Vec<Value>,
+    boxed: bool,
+}
+
+impl VecBuilder {
+    fn push(&mut self, v: Value) {
+        match (self.boxed, v) {
+            (false, Value::Int(n)) => self.ints.push(n),
+            (false, other) => {
+                self.items = self.ints.drain(..).map(Value::Int).collect();
+                self.items.push(other);
+                self.boxed = true;
+            }
+            (true, other) => self.items.push(other),
+        }
+    }
+
+    fn freeze(&mut self) -> Vector {
+        if self.boxed {
+            Vector::from_vec(std::mem::take(&mut self.items))
+        } else {
+            Vector::from_ints(std::mem::take(&mut self.ints))
+        }
+    }
+}
+
+impl clj_value::ExtensionValue for VecBuilder {
+    fn class_name(&self) -> String {
+        "clojure.lang.PersistentVector$TransientVector".to_owned()
+    }
+
+    fn print(&self) -> String {
+        "#object[clojure.lang.PersistentVector$TransientVector]".to_owned()
+    }
+
+    fn dyn_eq(&self, other: &dyn clj_value::ExtensionValue) -> bool {
+        std::ptr::addr_eq(self, other)
+    }
+
+    fn dyn_hash(&self, state: &mut dyn std::hash::Hasher) {
+        state.write_usize(std::ptr::from_ref(self).addr());
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+/// A fresh [`VecBuilder`] accumulator.
+#[must_use]
+pub fn vec_builder() -> Value {
+    Value::Extension(Arc::new(VecBuilder::default()))
+}
+
+fn builder(acc: &mut Value) -> Option<&mut VecBuilder> {
+    let Value::Extension(e) = acc else {
+        return None;
     };
+    Arc::get_mut(e)?.as_any_mut()?.downcast_mut::<VecBuilder>()
+}
+
+/// Append `v` to a loop's [`VecBuilder`] accumulator.
+pub fn vec_push(acc: &mut Value, v: Value) {
+    if let Some(b) = builder(acc) {
+        b.push(v);
+    }
+}
+
+/// The loop's result: its [`VecBuilder`] frozen into a persistent vector.
+pub fn vec_done(acc: &mut Value) -> Value {
+    builder(acc).map_or(Value::Nil, |b| Value::Vector(b.freeze()))
 }
 
 /// Unwrap a `reduced` accumulator in place (`true`: it was one, so the
@@ -1142,6 +1241,27 @@ mod tests {
     }
 
     #[test]
+    fn owned_vector_literals_match_the_cloning_ones() {
+        let s = Value::Str(Arc::from("s"));
+        for items in [
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(1), s.clone()],
+            vec![s.clone(), Value::Int(2)],
+            vec![Value::Char('a'), Value::Char('b')],
+            Vec::new(),
+        ] {
+            let mut slots = items.clone();
+            let owned = vec_lit_owned(&mut slots, None);
+            assert_eq!(owned, vec_lit(items.clone(), None), "{items:?}");
+            assert!(
+                slots
+                    .iter()
+                    .all(|v| matches!(v, Value::Nil | Value::Int(_)))
+            );
+        }
+    }
+
+    #[test]
     fn loop_plans_vectors_and_long_ranges() {
         use clj_value::RangeValue;
         let v = Value::Vector(Vector::from_vec(vec![Value::Int(7), Value::Int(8)]));
@@ -1173,12 +1293,41 @@ mod tests {
         assert!(unreduce(&mut reduced));
         assert_eq!(reduced, Value::Int(5));
         assert!(!unreduce(&mut reduced));
-        let mut acc = Value::Vector(Vector::from_vec(Vec::new()));
+        let ints = |xs: &[i64]| {
+            Value::Vector(Vector::from_vec(
+                xs.iter().map(|n| Value::Int(*n)).collect(),
+            ))
+        };
+        let mut acc = vec_builder();
         vec_push(&mut acc, Value::Int(1));
-        assert_eq!(acc, Value::Vector(Vector::from_vec(vec![Value::Int(1)])));
-        let mut not_vec = Value::Int(3);
-        vec_push(&mut not_vec, Value::Int(1));
-        assert_eq!(not_vec, Value::Int(3));
+        vec_push(&mut acc, Value::Int(2));
+        assert_eq!(vec_done(&mut acc), ints(&[1, 2]));
+        let mut mixed = vec_builder();
+        vec_push(&mut mixed, Value::Int(1));
+        vec_push(&mut mixed, Value::Nil);
+        vec_push(&mut mixed, Value::Int(3));
+        let want = Value::Vector(Vector::from_vec(vec![
+            Value::Int(1),
+            Value::Nil,
+            Value::Int(3),
+        ]));
+        assert_eq!(vec_done(&mut mixed), want);
+        let mut not_builder = Value::Int(3);
+        vec_push(&mut not_builder, Value::Int(1));
+        assert_eq!(vec_done(&mut not_builder), Value::Nil);
+        let mut shared = vec_builder();
+        let _other = shared.clone();
+        vec_push(&mut shared, Value::Int(1));
+        assert_eq!(vec_done(&mut shared), Value::Nil);
+        use clj_value::ExtensionValue;
+        let mut b = VecBuilder::default();
+        assert!(b.class_name().ends_with("TransientVector"));
+        assert!(b.print().starts_with("#object["));
+        assert!(b.dyn_eq(&b));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        b.dyn_hash(&mut h);
+        assert!(b.as_any().is::<VecBuilder>());
+        assert!(b.as_any_mut().is_some());
     }
 
     #[test]

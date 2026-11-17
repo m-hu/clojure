@@ -1414,14 +1414,7 @@ impl<'ctx> Lowerer<'ctx> {
                 } else {
                     for (i, fixed) in v.fixed.iter().enumerate() {
                         let item = self.slot(f);
-                        let st = self
-                            .call(
-                                "rt_n_nth_nil",
-                                Some(self.i32t),
-                                &[item.into(), src.into(), self.u64c(i as u64)],
-                            )
-                            .expect("st");
-                        self.check(f, st);
+                        self.emit_nth_nil(f, item, src, i);
                         out.extend(self.bind_pattern(f, fixed, item)?);
                     }
                 }
@@ -1459,6 +1452,47 @@ impl<'ctx> Lowerer<'ctx> {
                 Ok(outs)
             }
         }
+    }
+
+    /// `item = (nth src i nil)` for sequential destructuring (#271): the
+    /// inlined bitcode `nth` (vectors, strings, nil), falling back to
+    /// `rt_n_nth_nil` for every shape it leaves to the runtime.
+    fn emit_nth_nil(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        item: PointerValue<'ctx>,
+        src: PointerValue<'ctx>,
+        i: usize,
+    ) {
+        let done = self.ctx.append_basic_block(f.func, "nth_done");
+        if self.use_bitcode {
+            let idx = self.slot(f);
+            self.write_int(f.func, idx, self.i64t.const_int(i as u64, false));
+            let not_found = self.slot(f);
+            let bc = self.ctx.append_basic_block(f.func, "nth_bc");
+            let slow = self.ctx.append_basic_block(f.func, "nth_slow");
+            self.builder.build_unconditional_branch(bc).expect("br");
+            self.emit_bc_op(
+                f.func,
+                bc,
+                "rt_bc_3_nth",
+                &[src, idx, not_found],
+                item,
+                slow,
+                done,
+            );
+            self.builder.position_at_end(slow);
+        }
+        let st = self
+            .call(
+                "rt_n_nth_nil",
+                Some(self.i32t),
+                &[item.into(), src.into(), self.u64c(i as u64)],
+            )
+            .expect("st");
+        self.check(f, st);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
     }
 
     /// Rebind `pat`'s existing slots from `src` (for `recur`).
@@ -2824,7 +2858,10 @@ impl<'ctx> Lowerer<'ctx> {
         self.builder.position_at_end(exit);
         match hl.kind {
             HofKind::Each => self.write_nil(f.func, dest),
-            HofKind::Collect | HofKind::Reduce => self.move_v(f.func, dest, st.acc),
+            HofKind::Collect => {
+                self.call("rt_n_vec_done", None, &[dest.into(), st.acc.into()]);
+            }
+            HofKind::Reduce => self.move_v(f.func, dest, st.acc),
         }
         Ok(())
     }
@@ -4701,13 +4738,10 @@ impl<'ctx> Lowerer<'ctx> {
             .expect("st");
         self.check(f, st);
         let ns = sym.namespace().unwrap_or("user").to_owned();
-        if let Some(sr) = self
-            .stable
-            .get(&(ns.clone(), sym.name().to_owned()))
-            .copied()
-        {
-            let k = self.var(&ns, sym.name());
-            self.call("rt_n_deref", None, &[sr.root.into(), self.u64c(k)]);
+        if let Some(sr) = self.stable.get(&(ns, sym.name().to_owned())).copied() {
+            // The root is the init value itself (`def_finish` stores a
+            // clone of it): fill the cache from the slot, no var lookup.
+            self.clone_v(f.func, sr.root, value);
             self.builder
                 .build_store(sr.set, self.i8t.const_int(1, false))
                 .expect("store")
@@ -5119,6 +5153,9 @@ impl<'ctx> Lowerer<'ctx> {
                 .map(|(ns, n)| (ns.as_str(), n.as_str()))
                 .collect();
             let caps = clj_eval::aot_boot::lite_caps_for(&var_refs);
+            if self.var_meta {
+                self.call("rt_n_cap_var_meta", None, &[]);
+            }
             for (cap, sym) in [
                 (clj_eval::aot_boot::LiteCaps::IO, "rt_n_cap_io"),
                 (clj_eval::aot_boot::LiteCaps::CORE, "rt_n_cap_core"),
@@ -6391,14 +6428,45 @@ fn sym_key(sym: &Symbol) -> (String, String) {
 /// ([`clj_eval::aot_boot::needs_var_meta`] over every var it names).
 fn program_reads_var_meta(units: &[TopUnit]) -> bool {
     let mut refs = Vec::new();
+    let mut var_objects = false;
     for u in units.iter().filter(|u| !is_inert_meta_statement(&u.expr)) {
         collect_var_refs(&u.expr, &mut refs);
+        // A unit that is just `(var name)` closes a split `defn`.
+        var_objects |= !matches!(u.expr, Expr::VarRef(_)) && holds_var_object(&u.expr);
     }
     let refs: Vec<(&str, &str)> = refs
         .iter()
         .map(|(ns, name)| (ns.as_str(), name.as_str()))
         .collect();
-    clj_eval::aot_boot::needs_var_meta(&refs)
+    clj_eval::aot_boot::needs_var_meta(&refs, var_objects)
+}
+
+/// Whether `e` can hand the program a var object: a `#'v` anywhere but
+/// `defn`'s own forms (its inert metadata writes, and the `(var name)`
+/// closing a `do` that defines `name`).
+fn holds_var_object(e: &Expr) -> bool {
+    match e {
+        Expr::VarRef(_) => true,
+        Expr::Do(body) => body.iter().enumerate().any(|(i, s)| match s {
+            _ if is_inert_meta_statement(s) => false,
+            Expr::VarRef(v) if i + 1 == body.len() && defines_name(&body[..i], v.sym.name()) => {
+                false
+            }
+            _ => holds_var_object(s),
+        }),
+        _ => {
+            let mut found = false;
+            for_each_child(e, &mut |c| found = found || holds_var_object(c));
+            found
+        }
+    }
+}
+
+/// Whether one of `forms` is a `def` of `name`.
+fn defines_name(forms: &[Expr], name: &str) -> bool {
+    forms
+        .iter()
+        .any(|f| matches!(f, Expr::Def { sym, .. } if sym.name() == name))
 }
 
 fn collect_var_refs(e: &Expr, out: &mut Vec<(String, String)>) {
@@ -6472,7 +6540,7 @@ fn is_inert_assoc(kvs: &[Expr]) -> bool {
 fn is_inert_merge(args: &[Expr]) -> bool {
     match args {
         [Expr::Literal(Value::Map(m)) | Expr::Quote(Value::Map(m))] => {
-            m.iter().all(|(k, _)| is_inert_def_meta_key(k))
+            m.iter().all(|(k, _)| is_inert_write_key(k))
         }
         _ => false,
     }
@@ -6480,8 +6548,19 @@ fn is_inert_merge(args: &[Expr]) -> bool {
 
 /// A metadata `key value` pair with an inert key and a constant value.
 fn is_inert_meta_pair(k: &Expr, v: &Expr) -> bool {
-    matches!(k, Expr::Literal(key) if is_inert_def_meta_key(key))
+    matches!(k, Expr::Literal(key) if is_inert_write_key(key))
         && matches!(v, Expr::Literal(_) | Expr::Quote(_))
+}
+
+/// Whether a discarded constant metadata write of `key` (`defn`'s
+/// `:arglists`, an attr map's `:added`, …) is unobservable without a
+/// var-metadata reader (#271): any unqualified keyword except the keys
+/// the runtime acts on (`:dynamic`, `:private` for `refer`, `:macro`,
+/// `:redef`). A type hint (`:tag`) only steers analysis, which ran at
+/// build time.
+fn is_inert_write_key(key: &Value) -> bool {
+    matches!(key, Value::Keyword(k) if k.namespace().is_none()
+        && !matches!(k.name(), "dynamic" | "private" | "macro" | "redef"))
 }
 
 /// Whether `key` names a [`clj_eval::aot_boot::LITE_INERT_DEF_META`] key.
