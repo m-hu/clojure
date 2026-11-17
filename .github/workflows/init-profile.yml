@@ -23,7 +23,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm
       - name: Profile
         run: |
-          set -o pipefail; bash probe/fixed-cg.sh 2>&1 | tee probe-out.txt
+          set -o pipefail; bash probe/rss-smaps.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -31,3 +31,4 @@ jobs:
           path: |
             probe-out.txt
             /tmp/prof/
+            /tmp/rss/
