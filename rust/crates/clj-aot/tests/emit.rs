@@ -923,6 +923,31 @@ fn native_emit_splices_clojure_set_under_lite_only() {
     assert!(report.starts_with("aot: native 0/0 defns"), "{report}");
     assert!(full.contains("@rt_n_main("), "{full}");
     assert!(!full.contains("_clojure_set_union"), "{full}");
+    // `clojure.string` splices only what no Lite native covers
+    // (`replace` and its helper); redefining a native-served var still
+    // takes the full boot.
+    let (_, lite) = emit(
+        "string",
+        "(ns demo.str (:require [clojure.string :as str]))
+         (println (str/replace \"a1\" #\"\\d\" \"x\") (str/join [1]))",
+    );
+    assert!(lite.contains("@rt_n_main_lite("), "{lite}");
+    assert!(lite.contains("_clojure_string_replace_by"), "{lite}");
+    assert!(!lite.contains("_clojure_string_join"), "{lite}");
+    let (_, redef) = emit(
+        "string-redef",
+        "(ns demo.strr (:require [clojure.string :as str]))
+         (in-ns 'clojure.string)
+         (defn trim [s] s)
+         (in-ns 'demo.strr)
+         (println (str/trim \" a \"))",
+    );
+    assert!(redef.contains("@rt_n_main("), "{redef}");
+    let (_, core) = emit(
+        "core-def",
+        "(in-ns 'clojure.core) (def x-271 1) (in-ns 'user) (println clojure.core/x-271)",
+    );
+    assert!(core.contains("@rt_n_main("), "{core}");
 }
 
 #[test]

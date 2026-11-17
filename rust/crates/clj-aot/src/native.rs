@@ -66,6 +66,15 @@ enum Const {
     StaticField(String, String),
     Class(String),
     Read(String),
+    /// A symbol whose metadata maps keywords to simple values (`defn-`'s
+    /// `^{:private true}` names), built without the reader (#271). Its
+    /// metadata is self-contained: the init cannot read other pool
+    /// constants before the pool freezes.
+    MetaSymbol {
+        ns: Option<String>,
+        name: String,
+        meta: Vec<(MetaVal, MetaVal)>,
+    },
     /// An empty collection literal without metadata (`[]`, `{}`, `#{}`):
     /// one value per form, as under `run` — built once by its literal
     /// shim, `site` keeping each form's value its own.
@@ -73,6 +82,33 @@ enum Const {
         helper: &'static str,
         site: usize,
     },
+}
+
+/// A [`Const::MetaSymbol`] metadata key or value, built in place: a
+/// scalar written inline, or a keyword, symbol, or string made by name.
+#[derive(Clone, Debug, PartialEq)]
+enum MetaVal {
+    Inline(Value),
+    Keyword(Option<String>, String),
+    Symbol(Option<String>, String),
+    Str(String),
+}
+
+/// The [`MetaVal`] for `v` (`None`: not a simple metadata value).
+fn meta_val(v: &Value) -> Option<MetaVal> {
+    Some(match v {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Double(_) | Value::Char(_) => {
+            MetaVal::Inline(v.clone())
+        }
+        Value::Keyword(k) => {
+            MetaVal::Keyword(k.namespace().map(str::to_owned), k.name().to_owned())
+        }
+        Value::Symbol(s) if s.meta().is_none() => {
+            MetaVal::Symbol(s.namespace().map(str::to_owned), s.name().to_owned())
+        }
+        Value::Str(s) => MetaVal::Str(s.to_string()),
+        _ => return None,
+    })
 }
 
 /// One compiled arity: `(fixed, variadic, code)`.
@@ -487,7 +523,7 @@ impl<'ctx> Lowerer<'ctx> {
     /// else through the printed-and-read fallback, checked to round
     /// trip at build time).
     fn value_const(&mut self, v: &Value) -> Result<u64, Unsupported> {
-        let c = match scalar_const(v) {
+        let c = match scalar_const(v).or_else(|| meta_symbol_const(v)) {
             Some(c) => c,
             None => Const::Read(readable_text(v)?),
         };
@@ -4203,6 +4239,9 @@ impl<'ctx> Lowerer<'ctx> {
                     let p = self.str_ptr(text);
                     self.call("rt_n_read", None, &[t.into(), p.into()]);
                 }
+                Const::MetaSymbol { ns, name, meta } => {
+                    self.init_meta_symbol(&mut f, t, ns.as_deref(), name, meta);
+                }
                 Const::EmptyColl { helper, .. } => {
                     let empty = self.const_slice(self.ptr.const_null(), 0);
                     let args = [t.into(), empty.into(), self.u64c(NONE)];
@@ -4218,6 +4257,64 @@ impl<'ctx> Lowerer<'ctx> {
         }
         let result = self.slot(&mut f);
         self.end_fn(f, result)
+    }
+
+    /// Build a [`Const::MetaSymbol`] into `t`: its metadata pairs into a
+    /// slot array, then `rt_n_meta_sym`.
+    fn init_meta_symbol(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        t: PointerValue<'ctx>,
+        ns: Option<&str>,
+        name: &str,
+        meta: &[(MetaVal, MetaVal)],
+    ) {
+        let n = meta.len() * 2;
+        let (arr, elems) = self.slot_array(f, n);
+        for ((key, val), pair) in meta.iter().zip(elems.chunks(2)) {
+            self.init_meta_val(f.func, key, pair[0]);
+            self.init_meta_val(f.func, val, pair[1]);
+        }
+        let kvs = self.slots_ref(f, arr, n);
+        let np = self.opt_str_ptr(ns);
+        let p = self.str_ptr(name);
+        self.call(
+            "rt_n_meta_sym",
+            None,
+            &[t.into(), np.into(), p.into(), kvs.into()],
+        );
+        self.drop_slots(f.func, &elems);
+    }
+
+    /// Write one [`MetaVal`] into `slot`.
+    fn init_meta_val(&mut self, func: FunctionValue<'ctx>, v: &MetaVal, slot: PointerValue<'ctx>) {
+        match v {
+            MetaVal::Inline(v) => self
+                .lower_const(func, v, slot)
+                .expect("inline scalars lower"),
+            MetaVal::Keyword(ns, name) | MetaVal::Symbol(ns, name) => {
+                let np = self.opt_str_ptr(ns.as_deref());
+                let p = self.str_ptr(name);
+                let h = if matches!(v, MetaVal::Keyword(..)) {
+                    "rt_n_kw"
+                } else {
+                    "rt_n_sym"
+                };
+                self.call(h, None, &[slot.into(), np.into(), p.into()]);
+            }
+            MetaVal::Str(s) => {
+                let p = self.str_ptr(s);
+                self.call("rt_n_str", None, &[slot.into(), p.into()]);
+            }
+        }
+    }
+
+    /// A string constant pointer, or null for `None`.
+    fn opt_str_ptr(&mut self, s: Option<&str>) -> PointerValue<'ctx> {
+        match s {
+            Some(s) => self.str_ptr(s),
+            None => self.ptr.const_null(),
+        }
     }
 
     /// No-op targets for the Linux static link's `--wrap` of crtbeginT's
@@ -4588,6 +4685,24 @@ fn scalar_const(v: &Value) -> Option<Const> {
             Const::Symbol(s.namespace().map(str::to_owned), s.name().to_owned())
         }
         _ => return host_const(v),
+    })
+}
+
+/// A symbol whose metadata maps keywords to simple values, built
+/// without the reader (#271; `None`: anything else).
+fn meta_symbol_const(v: &Value) -> Option<Const> {
+    let Value::Symbol(s) = v else {
+        return None;
+    };
+    let mut meta = Vec::new();
+    for (k, val) in s.meta()?.iter() {
+        let key = matches!(k, Value::Keyword(_)).then(|| meta_val(k))??;
+        meta.push((key, meta_val(val)?));
+    }
+    Some(Const::MetaSymbol {
+        ns: s.namespace().map(str::to_owned),
+        name: s.name().to_owned(),
+        meta,
     })
 }
 
@@ -5208,7 +5323,13 @@ fn mentions_rebinding(e: &Expr) -> bool {
         Expr::WithRedefs { .. } => true,
         Expr::Global(v) | Expr::VarRef(v) => core_rebind(v),
         Expr::DirectNative(c) => core_rebind(&c.var),
-        Expr::Def { sym, .. } => matches!(sym.namespace(), Some("clojure.core" | "clojure.string")),
+        // Redefining a `clojure.string` var only conflicts with a Lite
+        // native that serves it (a spliced definition has none, #271).
+        Expr::Def { sym, .. } => match sym.namespace() {
+            Some("clojure.core") => true,
+            Some("clojure.string") => clj_eval::aot_boot::is_lite_string_var(sym.name()),
+            _ => false,
+        },
         _ => false,
     };
     let mut found = hit;
@@ -5426,7 +5547,12 @@ fn var_lite_ok(sym: &Symbol, defined: &BTreeSet<(String, String)>) -> bool {
     let name = sym.name();
     match ns {
         "clojure.core" => clj_eval::aot_boot::is_lite_core_var(name),
-        "clojure.string" => clj_eval::aot_boot::is_lite_string_var(name),
+        // A `clojure.string` var without a Lite native may be spliced
+        // in (#271): defined by the program's own units.
+        "clojure.string" => {
+            clj_eval::aot_boot::is_lite_string_var(name)
+                || defined.contains(&(ns.to_owned(), name.to_owned()))
+        }
         _ => defined.contains(&(ns.to_owned(), name.to_owned())),
     }
 }
@@ -5515,6 +5641,37 @@ fn expr_lite_ok(e: &Expr, scope: &LiteScope<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_symbols_pool_without_the_reader() {
+        use clj_value::{Keyword, List, new_map};
+        let kw = |n: &str| Value::Keyword(Keyword::new(None, n));
+        let named = |pairs: Vec<(Value, Value)>| {
+            let meta = pairs
+                .into_iter()
+                .fold(new_map(), |m, (k, v)| m.insert(k, v));
+            Value::Symbol(Symbol::new(Some("user"), "f")).with_meta(Some(meta))
+        };
+        let simple = named(vec![
+            (kw("private"), Value::Bool(true)),
+            (kw("k"), Value::Keyword(Keyword::new(Some("a"), "b"))),
+            (kw("tag"), Value::Symbol(Symbol::new(None, "String"))),
+            (kw("doc"), Value::Str(std::sync::Arc::from("d"))),
+        ]);
+        assert!(matches!(
+            meta_symbol_const(&simple),
+            Some(Const::MetaSymbol { ns, name, meta })
+                if ns.as_deref() == Some("user") && name == "f" && meta.len() == 4
+        ));
+        // Anything else reads back: a non-keyword key, a nested value, a
+        // symbol carrying its own metadata, a plain symbol, a non-symbol.
+        let list = Value::List(List::from_vec(vec![Value::Int(1)]));
+        assert!(meta_symbol_const(&named(vec![(Value::Int(1), Value::Nil)])).is_none());
+        assert!(meta_symbol_const(&named(vec![(kw("arglists"), list)])).is_none());
+        assert!(meta_symbol_const(&named(vec![(kw("tag"), simple.clone())])).is_none());
+        assert!(meta_symbol_const(&Value::Symbol(Symbol::new(None, "plain"))).is_none());
+        assert!(meta_symbol_const(&Value::Int(1)).is_none());
+    }
 
     #[test]
     fn static_call_op_needs_literal_class_and_member() {

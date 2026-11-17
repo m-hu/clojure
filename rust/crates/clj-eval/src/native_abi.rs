@@ -366,6 +366,19 @@ pub fn read_constant(text: &str) -> Result<Value, String> {
     .map_err(|e| e.message())
 }
 
+/// `^{k v …} ns/name` exactly as [`read_constant`] builds it — the
+/// metadata pairs (`kvs`, interleaved) inserted one by one into an empty
+/// map, like the reader's merge — so pooled symbol constants with
+/// metadata (`defn-`'s `{:private true}`) skip the reader (#271).
+#[must_use]
+pub fn meta_symbol(ns: Option<&str>, name: &str, kvs: &[Value]) -> Value {
+    let mut meta = new_map();
+    for pair in kvs.chunks(2) {
+        meta = meta.insert(pair[0].clone(), pair[1].clone());
+    }
+    Value::Symbol(Symbol::new(ns, name)).with_meta(Some(meta))
+}
+
 /// Print a constant for [`read_constant`], with metadata.
 #[must_use]
 pub fn print_constant(value: &Value) -> String {
@@ -1019,6 +1032,39 @@ pub fn apply_own(id: u32, args: &mut [Value]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_symbols_match_their_read_back() {
+        let kw = |n: &str| Value::Keyword(Keyword::new(None, n));
+        for (ns, name, kvs, text) in [
+            (
+                Some("user"),
+                "f",
+                vec![kw("private"), Value::Bool(true)],
+                "^{:private true} user/f",
+            ),
+            (
+                None,
+                "g",
+                vec![
+                    kw("tag"),
+                    Value::Symbol(Symbol::new(None, "String")),
+                    kw("dynamic"),
+                    Value::Bool(true),
+                    kw("doc"),
+                    Value::Str(std::sync::Arc::from("d")),
+                    kw("n"),
+                    Value::Int(3),
+                ],
+                "^{:tag String :dynamic true :doc \"d\" :n 3} g",
+            ),
+        ] {
+            let built = meta_symbol(ns, name, &kvs);
+            let read = read_constant(text).expect("reads");
+            assert_eq!(print_constant(&built), print_constant(&read));
+            assert_eq!(built.meta(), read.meta());
+        }
+    }
 
     #[test]
     fn only_throws_carry_a_throwable() {

@@ -240,6 +240,19 @@ pub extern "C" fn rt_n_sym(out: &mut Value, ns: Option<&CSlice<u8>>, name: &CSli
     *out = Value::Symbol(Symbol::new(ns.as_deref(), &name.as_str()));
 }
 
+/// `out = ^{…} ns/name`: a symbol with metadata (`kvs`: interleaved
+/// keys and values), built as the reader would without reading (#271).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_meta_sym(
+    out: &mut Value,
+    ns: Option<&CSlice<u8>>,
+    name: &CSlice<u8>,
+    kvs: &CSlice<Value>,
+) {
+    let ns = ns.map(CSlice::as_str);
+    *out = native_abi::meta_symbol(ns.as_deref(), &name.as_str(), kvs.get());
+}
+
 /// `out = #"…"` (the pattern source).
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_n_regex(out: &mut Value, s: &CSlice<u8>) {
@@ -1051,6 +1064,7 @@ pub fn native_symbols() -> Vec<(&'static str, usize)> {
         rt_n_str,
         rt_n_kw,
         rt_n_sym,
+        rt_n_meta_sym,
         rt_n_regex,
         rt_n_static_field,
         rt_n_class,

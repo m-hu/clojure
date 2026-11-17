@@ -2194,6 +2194,9 @@ fn native_get_in(eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeEr
 
 fn native_zipmap(eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeError> {
     check_arity("clojure.core/zipmap", args, &[2])?;
+    if let Some(map) = zipmap_chars_longs(&args[0], &args[1]) {
+        return Ok(Value::Map(map));
+    }
     let mut ks = seq_value(eval, &args[0]).map_err(signal_to_native)?;
     let mut vs = seq_value(eval, &args[1]).map_err(signal_to_native)?;
     let mut out = ZipmapBuild::default();
@@ -2201,6 +2204,27 @@ fn native_zipmap(eval: &mut Evaluator, args: &[Value]) -> Result<Value, NativeEr
         out.push(k, v);
     }
     Ok(Value::Map(out.finish()))
+}
+
+/// `(zipmap "0123456789" (range))` (most snippets) without the walk
+/// (#271): a string's chars against the core `(range)` iterate or a
+/// counted long range run no user code and memoize nothing anyone else
+/// sees, so the pairs are the walk's own, fed to the same build. `None`:
+/// anything else, or a value past the long range (the walk promotes or
+/// throws there).
+fn zipmap_chars_longs(keys: &Value, vals: &Value) -> Option<Map> {
+    let Value::Str(s) = keys else {
+        return None;
+    };
+    let (start, step, count) = crate::lazy::core_long_iterate_head(vals)
+        .map(|start| (start, 1, i64::MAX))
+        .or_else(|| crate::seqs::long_range(vals))?;
+    let mut out = ZipmapBuild::default();
+    for (i, c) in (0..count).zip(s.chars()) {
+        let v = i.checked_mul(step).and_then(|d| start.checked_add(d))?;
+        out.push(Value::Char(c), Value::Int(v));
+    }
+    Some(out.finish())
 }
 
 /// `zipmap`'s next pair, forcing like `core.clj`'s loop: both heads,
