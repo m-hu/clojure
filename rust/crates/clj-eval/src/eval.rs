@@ -2346,10 +2346,12 @@ impl Evaluator {
         span: Span,
     ) -> Value {
         let dynamic = Self::dynamic_of(sym);
-        let meta = if self.skip_var_meta && name_meta.is_none() {
-            None
-        } else {
-            Some(self.def_var_meta(sym, name_meta.as_ref(), doc, span))
+        // Nothing reads var metadata in a `skip_var_meta` (Lite) program:
+        // only the name's own keys stay (`refer` consults `:private`),
+        // without the auto keys (#271).
+        let meta = match name_meta {
+            name_meta if self.skip_var_meta => name_meta,
+            name_meta => Some(self.def_var_meta(sym, name_meta.as_ref(), doc, span)),
         };
         self.registry.with_state_mut(id, |state| {
             if let Some(v) = value {

@@ -253,6 +253,14 @@ pub extern "C" fn rt_n_meta_sym(
     *out = native_abi::meta_symbol(ns.as_deref(), &name.as_str(), kvs.get());
 }
 
+/// `out =` a metadata-free constant collection over `items` (`kind`: 0
+/// list, 1 vector, 2 map of interleaved keys and values, else a set),
+/// built without the reader (#271).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_coll(out: &mut Value, kind: u64, items: &CSlice<Value>) {
+    *out = native_abi::const_coll(kind, items.get());
+}
+
 /// `out = #"…"` (the pattern source).
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_n_regex(out: &mut Value, s: &CSlice<u8>) {
@@ -1065,6 +1073,7 @@ pub fn native_symbols() -> Vec<(&'static str, usize)> {
         rt_n_kw,
         rt_n_sym,
         rt_n_meta_sym,
+        rt_n_coll,
         rt_n_regex,
         rt_n_static_field,
         rt_n_class,

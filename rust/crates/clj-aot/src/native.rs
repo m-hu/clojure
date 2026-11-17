@@ -75,6 +75,10 @@ enum Const {
         name: String,
         meta: Vec<(MetaVal, MetaVal)>,
     },
+    /// A metadata-free collection of simple forms (quoted data, catch
+    /// class lists, `:arglists`), built in place by the reader's own
+    /// constructors (#271); `rt_n_coll`'s kind code.
+    Coll(u64, Vec<ConstForm>),
     /// An empty collection literal without metadata (`[]`, `{}`, `#{}`):
     /// one value per form, as under `run` — built once by its literal
     /// shim, `site` keeping each form's value its own.
@@ -93,6 +97,18 @@ enum MetaVal {
     Symbol(Option<String>, String),
     Str(String),
 }
+
+/// One item of a [`Const::Coll`], built in place.
+#[derive(Clone, Debug, PartialEq)]
+enum ConstForm {
+    Simple(MetaVal),
+    MetaSym(Option<String>, String, Vec<(MetaVal, MetaVal)>),
+    Coll(u64, Vec<ConstForm>),
+}
+
+/// How many forms a [`Const::Coll`] may hold (larger ones read back:
+/// their text is the compact encoding).
+const COLL_FORMS_MAX: usize = 256;
 
 /// The [`MetaVal`] for `v` (`None`: not a simple metadata value).
 fn meta_val(v: &Value) -> Option<MetaVal> {
@@ -523,7 +539,10 @@ impl<'ctx> Lowerer<'ctx> {
     /// else through the printed-and-read fallback, checked to round
     /// trip at build time).
     fn value_const(&mut self, v: &Value) -> Result<u64, Unsupported> {
-        let c = match scalar_const(v).or_else(|| meta_symbol_const(v)) {
+        let c = match scalar_const(v)
+            .or_else(|| meta_symbol_const(v))
+            .or_else(|| coll_const(v))
+        {
             Some(c) => c,
             None => Const::Read(readable_text(v)?),
         };
@@ -4242,6 +4261,7 @@ impl<'ctx> Lowerer<'ctx> {
                 Const::MetaSymbol { ns, name, meta } => {
                     self.init_meta_symbol(&mut f, t, ns.as_deref(), name, meta);
                 }
+                Const::Coll(kind, items) => self.init_coll(&mut f, t, *kind, items),
                 Const::EmptyColl { helper, .. } => {
                     let empty = self.const_slice(self.ptr.const_null(), 0);
                     let args = [t.into(), empty.into(), self.u64c(NONE)];
@@ -4283,6 +4303,30 @@ impl<'ctx> Lowerer<'ctx> {
             None,
             &[t.into(), np.into(), p.into(), kvs.into()],
         );
+        self.drop_slots(f.func, &elems);
+    }
+
+    /// Build a [`Const::Coll`] (or a nested collection) into `t`: its
+    /// items into a slot array, then `rt_n_coll`.
+    fn init_coll(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        t: PointerValue<'ctx>,
+        kind: u64,
+        items: &[ConstForm],
+    ) {
+        let (arr, elems) = self.slot_array(f, items.len());
+        for (item, slot) in items.iter().zip(&elems) {
+            match item {
+                ConstForm::Simple(v) => self.init_meta_val(f.func, v, *slot),
+                ConstForm::MetaSym(ns, name, meta) => {
+                    self.init_meta_symbol(f, *slot, ns.as_deref(), name, meta);
+                }
+                ConstForm::Coll(k, nested) => self.init_coll(f, *slot, *k, nested),
+            }
+        }
+        let r = self.slots_ref(f, arr, items.len());
+        self.call("rt_n_coll", None, &[t.into(), self.u64c(kind), r.into()]);
         self.drop_slots(f.func, &elems);
     }
 
@@ -4704,6 +4748,84 @@ fn meta_symbol_const(v: &Value) -> Option<Const> {
         name: s.name().to_owned(),
         meta,
     })
+}
+
+/// A metadata-free collection of simple forms as a [`Const::Coll`],
+/// kept only when building it prints exactly as `v` does (#271).
+fn coll_const(v: &Value) -> Option<Const> {
+    let mut budget = COLL_FORMS_MAX;
+    let (kind, items) = coll_parts(v, &mut budget)?;
+    let built =
+        clj_eval::native_abi::const_coll(kind, &items.iter().map(form_value).collect::<Vec<_>>());
+    let same = native_abi::print_constant(&built) == native_abi::print_constant(v);
+    same.then_some(Const::Coll(kind, items))
+}
+
+/// `v`'s [`ConstForm`] collection kind and items (within `budget` forms).
+fn coll_parts(v: &Value, budget: &mut usize) -> Option<(u64, Vec<ConstForm>)> {
+    let (kind, items) = coll_items(v)?;
+    *budget = budget.checked_sub(items.len() + 1)?;
+    let forms = items
+        .iter()
+        .map(|item| item_form(item, budget))
+        .collect::<Option<_>>()?;
+    Some((kind, forms))
+}
+
+/// A metadata-free unsorted collection's kind (`rt_n_coll`'s code) and
+/// items (a map's keys and values interleaved).
+fn coll_items(v: &Value) -> Option<(u64, Vec<Value>)> {
+    Some(match v {
+        Value::List(l) if l.meta().is_none() => (0, l.iter().cloned().collect()),
+        Value::Vector(x) if x.meta().is_none() => (1, x.iter().collect()),
+        Value::Map(m) if m.meta().is_none() && !m.is_sorted() => (
+            2,
+            m.iter()
+                .flat_map(|(k, val)| [k.clone(), val.clone()])
+                .collect(),
+        ),
+        Value::Set(s) if s.meta().is_none() && !s.is_sorted() => (3, s.iter().cloned().collect()),
+        _ => return None,
+    })
+}
+
+/// One collection item as a [`ConstForm`].
+fn item_form(v: &Value, budget: &mut usize) -> Option<ConstForm> {
+    if let Some(item) = meta_val(v) {
+        return Some(ConstForm::Simple(item));
+    }
+    if let Some(Const::MetaSymbol { ns, name, meta }) = meta_symbol_const(v) {
+        return Some(ConstForm::MetaSym(ns, name, meta));
+    }
+    coll_parts(v, budget).map(|(kind, items)| ConstForm::Coll(kind, items))
+}
+
+/// The value a [`ConstForm`] builds (the compiler-side twin of the
+/// constant init, for [`coll_const`]'s check).
+fn form_value(form: &ConstForm) -> Value {
+    match form {
+        ConstForm::Simple(v) => meta_val_value(v),
+        ConstForm::MetaSym(ns, name, meta) => {
+            let kvs: Vec<Value> = meta
+                .iter()
+                .flat_map(|(k, v)| [meta_val_value(k), meta_val_value(v)])
+                .collect();
+            native_abi::meta_symbol(ns.as_deref(), name, &kvs)
+        }
+        ConstForm::Coll(kind, items) => {
+            native_abi::const_coll(*kind, &items.iter().map(form_value).collect::<Vec<_>>())
+        }
+    }
+}
+
+/// The value a [`MetaVal`] builds.
+fn meta_val_value(v: &MetaVal) -> Value {
+    match v {
+        MetaVal::Inline(v) => v.clone(),
+        MetaVal::Keyword(ns, name) => Value::Keyword(clj_value::Keyword::new(ns.as_deref(), name)),
+        MetaVal::Symbol(ns, name) => Value::Symbol(Symbol::new(ns.as_deref(), name)),
+        MetaVal::Str(s) => Value::Str(std::sync::Arc::from(s.as_str())),
+    }
 }
 
 /// Host-derived constants rebuilt by name at startup (regexes,
@@ -5641,6 +5763,35 @@ fn expr_lite_ok(e: &Expr, scope: &LiteScope<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_collections_pool_without_the_reader() {
+        use clj_value::{Keyword, List, SortSpec, new_map};
+        let reads = |text: &str| native_abi::read_constant(text).expect("reads");
+        // Nested data, catch class lists, and arglists with a tagged param.
+        for text in [
+            "[\"java.lang.Exception\"]",
+            "{:a [1 2.5 \\c] \"b\" #{x/y nil}}",
+            "([^CharSequence s re f] [])",
+        ] {
+            let v = reads(text).with_meta(None);
+            assert!(matches!(coll_const(&v), Some(Const::Coll(..))), "{text}");
+        }
+        // Anything else reads back: metadata, a sorted map, an item with
+        // no simple form, more forms than the cap, a non-collection.
+        let tagged = Value::List(List::from_vec(vec![Value::Int(1)])).with_meta(Some(
+            new_map().insert(Value::Keyword(Keyword::new(None, "line")), Value::Int(1)),
+        ));
+        let sorted = Value::Map(new_map().with_sort(Some(SortSpec::Natural)));
+        let big = reads("[1N]");
+        let wide = Value::Vector(clj_value::Vector::from_vec(vec![
+            Value::Int(0);
+            COLL_FORMS_MAX
+        ]));
+        for v in [tagged, sorted, big, wide, Value::Int(1)] {
+            assert!(coll_const(&v).is_none(), "{v:?}");
+        }
+    }
 
     #[test]
     fn meta_symbols_pool_without_the_reader() {
