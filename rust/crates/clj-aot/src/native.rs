@@ -23,13 +23,14 @@
 //! indexes the frame chain, so a fn created at frame length `base`
 //! captures exactly the `Local(i < base)` its arities mention.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use clj_eval::aot_front::{FrontEnd, TopUnit, for_each_child, names_lib, pattern_children};
 use clj_eval::expr::{Arity, CaseTest, Expr, FunExpr, NsClause, Pattern};
 use clj_eval::native_abi;
 use clj_value::{Map, Symbol, Value, Vector};
 use inkwell::AddressSpace;
+use inkwell::AtomicOrdering;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -229,6 +230,28 @@ pub struct Lowerer<'ctx> {
     direct: HashMap<(String, String), (usize, Vec<ArityCode<'ctx>>)>,
     /// Single-def top-level fn arities eligible for scalar-loop callee inlining.
     callees: HashMap<(String, String), std::sync::Arc<[Arity]>>,
+    /// Global holding the frozen constant table's base
+    /// (`rt_n_consts_base`), stored on entry to `cljtop_0`: call
+    /// operands borrow pooled constants in place (#271).
+    consts_base: PointerValue<'ctx>,
+    /// A Lite program's stable vars ([`stable_vars`]) and their root
+    /// caches: call operands borrow the cached root, other reads clone
+    /// it, never going through the var (#271).
+    stable: HashMap<(String, String), StableRoot<'ctx>>,
+    /// The index of the unit being lowered: code in a unit after a
+    /// stable var's `def` runs only once that `def` has run, so it reads
+    /// the cache without checking it is set.
+    unit: usize,
+}
+
+/// A stable var's root cache: the unit of its one `def`, a module
+/// global the `def` fills with the root right after it runs, and that
+/// global's set flag (#271).
+#[derive(Clone, Copy)]
+struct StableRoot<'ctx> {
+    unit: usize,
+    root: PointerValue<'ctx>,
+    set: PointerValue<'ctx>,
 }
 
 impl<'ctx> Lowerer<'ctx> {
@@ -247,6 +270,9 @@ impl<'ctx> Lowerer<'ctx> {
             g.set_linkage(Linkage::Internal);
             g.as_pointer_value()
         });
+        let consts_base = module.add_global(ptr, None, "clj_consts");
+        consts_base.set_initializer(&ptr.const_null());
+        consts_base.set_linkage(Linkage::Internal);
         Self {
             ctx,
             module,
@@ -273,6 +299,9 @@ impl<'ctx> Lowerer<'ctx> {
             reserved: HashMap::new(),
             direct: HashMap::new(),
             callees: HashMap::new(),
+            consts_base: consts_base.as_pointer_value(),
+            stable: HashMap::new(),
+            unit: 0,
         }
     }
 
@@ -293,11 +322,15 @@ impl<'ctx> Lowerer<'ctx> {
         self.inline_arith = !units.iter().any(|u| mentions_rebinding(&u.expr));
         self.var_meta = !self.lite || program_reads_var_meta(units);
         self.reserve_defns(units);
+        if self.lite {
+            self.reserve_stable(units);
+        }
         let mut tops = Vec::with_capacity(units.len());
-        for unit in units {
+        for (ui, unit) in units.iter().enumerate() {
             if self.drops(&unit.expr) {
                 continue;
             }
+            self.unit = ui;
             let i = tops.len();
             tops.push(self.lower_thunk(&format!("cljtop_{i}"), &unit.expr, i == 0)?);
         }
@@ -306,6 +339,36 @@ impl<'ctx> Lowerer<'ctx> {
         self.lower_frame_registry_wraps();
         crate::lower::verify_module(&self.module).map_err(Unsupported)?;
         Ok(self.module)
+    }
+
+    /// A root cache for each of the program's stable vars
+    /// ([`stable_vars`]): an internal global holding `nil` until the var's
+    /// `def` copies the root in, and its set flag. Globals are numbered in
+    /// var order so the module text is reproducible.
+    fn reserve_stable(&mut self, units: &[TopUnit]) {
+        let mut found: Vec<((String, String), usize)> = stable_vars(units).into_iter().collect();
+        found.sort();
+        for (i, (key, unit)) in found.into_iter().enumerate() {
+            let root = self
+                .module
+                .add_global(self.slot_ty, None, &format!("clj_root{i}"));
+            root.set_initializer(&self.slot_ty.const_zero());
+            root.set_linkage(Linkage::Internal);
+            root.set_alignment(8);
+            let set = self
+                .module
+                .add_global(self.i8t, None, &format!("clj_root_set{i}"));
+            set.set_initializer(&self.i8t.const_zero());
+            set.set_linkage(Linkage::Internal);
+            self.stable.insert(
+                key,
+                StableRoot {
+                    unit,
+                    root: root.as_pointer_value(),
+                    set: set.as_pointer_value(),
+                },
+            );
+        }
     }
 
     /// Reserve every top-level `(def name (fn …))` whose var is defined
@@ -1103,9 +1166,15 @@ impl<'ctx> Lowerer<'ctx> {
         init_fast_vars: bool,
     ) -> Result<FunctionValue<'ctx>, Unsupported> {
         let mut f = self.begin_fn(name, Vec::new());
-        if init_fast_vars && let Some(gv) = self.fast_vars {
-            let fv = self.call_ptr("rt_n_fast_vars", &[]);
-            self.builder.build_store(gv, fv).expect("store");
+        if init_fast_vars {
+            if let Some(gv) = self.fast_vars {
+                let fv = self.call_ptr("rt_n_fast_vars", &[]);
+                self.builder.build_store(gv, fv).expect("store");
+            }
+            let base = self.call_ptr("rt_n_consts_base", &[]);
+            self.builder
+                .build_store(self.consts_base, base)
+                .expect("store");
         }
         f.moves = collect_body_moves(std::slice::from_ref(expr), 0, &f.env, &[]);
         let result = self.slot(&mut f);
@@ -1252,7 +1321,7 @@ impl<'ctx> Lowerer<'ctx> {
         let probe = collect_body_moves(body, captures_end, &f.env, &symbols);
         let taken: Vec<usize> = symbols
             .into_iter()
-            .filter(|i| probe.iter().any(|m| m.1 == *i))
+            .filter(|i| probe.iter().any(|m| m.1 == *i) && !borrow_only(body, *i))
             .collect();
         if taken.is_empty() {
             return taken;
@@ -1530,7 +1599,10 @@ impl<'ctx> Lowerer<'ctx> {
             Expr::Local(i) => self.lower_local(f, expr, *i, dest),
             Expr::Global(var) => {
                 let k = self.var_of(var);
-                self.emit_deref(f.func, dest, k);
+                match self.stable_of(var) {
+                    Some(sr) => self.clone_stable(f, sr, k, dest),
+                    None => self.emit_deref(f.func, dest, k),
+                }
                 Ok(())
             }
             Expr::VarRef(var) => {
@@ -2100,7 +2172,9 @@ impl<'ctx> Lowerer<'ctx> {
         if self.direct_target(head, args.len()).is_some() {
             return self.lower_direct_invoke(f, head, args, dest);
         }
-        if self.try_lower_static(f, head, args, dest)? {
+        if self.try_lower_static(f, head, args, dest)?
+            || self.try_lower_kw_invoke(f, head, args, dest)?
+        {
             return Ok(());
         }
         let h = self.slot(f);
@@ -2122,6 +2196,65 @@ impl<'ctx> Lowerer<'ctx> {
         self.write_tag(h, 0);
         self.drop_and_nil_slots(f.func, &elems);
         Ok(())
+    }
+
+    /// `(:k coll)` / `(:k coll not-found)` with a literal keyword head
+    /// (#271): the bitcode `get` over borrowed operands (the keyword in
+    /// place in the constant pool), falling back to the keyword's own
+    /// invoke for any shape the helper leaves to the runtime. Both read
+    /// through the interpreter's `lookup`, so results match exactly.
+    fn try_lower_kw_invoke(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        head: &Expr,
+        args: &[Expr],
+        dest: PointerValue<'ctx>,
+    ) -> Result<bool, Unsupported> {
+        let (Expr::Literal(kw @ Value::Keyword(_)) | Expr::Quote(kw @ Value::Keyword(_))) = head
+        else {
+            return Ok(false);
+        };
+        let shim = match (args.len(), self.use_bitcode) {
+            (1, true) => "rt_bc_2_get",
+            (2, true) => "rt_bc_3_get",
+            _ => return Ok(false),
+        };
+        let kref = {
+            let k = self.value_const(kw)?;
+            self.const_ref(k)
+        };
+        let (args_refs, temps, moved) = self.arg_refs(f, args, dest)?;
+        let mut refs = vec![args_refs[0], kref];
+        refs.extend(args_refs.iter().skip(1));
+        let bc = self.ctx.append_basic_block(f.func, "kw_get");
+        let slow = self.ctx.append_basic_block(f.func, "kw_slow");
+        let done = self.ctx.append_basic_block(f.func, "kw_done");
+        self.builder.build_unconditional_branch(bc).expect("br");
+        self.emit_bc_op(f.func, bc, shim, &refs, dest, slow, done);
+        self.builder.position_at_end(slow);
+        let h = self.slot(f);
+        self.lower_const(f.func, kw, h)?;
+        let (arr, elems) = self.slot_array(f, args.len());
+        for (e, r) in elems.iter().zip(&args_refs) {
+            self.copy_bits(*e, *r);
+        }
+        let aref = self.slots_ref(f, arr, args.len());
+        let st = self
+            .call(
+                "rt_n_invoke",
+                Some(self.i32t),
+                &[dest.into(), h.into(), aref.into()],
+            )
+            .expect("st");
+        self.clear_aliases(&elems);
+        self.check(f, st);
+        self.drop_v(f.func, h);
+        self.write_tag(h, 0);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
+        self.drop_and_nil_slots(f.func, &temps);
+        self.drop_and_nil_slots(f.func, &moved);
+        Ok(true)
     }
 
     fn try_lower_static(
@@ -2399,18 +2532,29 @@ impl<'ctx> Lowerer<'ctx> {
                 if is_move(f, a) {
                     moved.push(p);
                 }
+            } else if let Some((p, fallback)) = self.borrowed(f, a)? {
+                self.copy_bits(*e, p);
+                aliases.push(*e);
+                temps.extend(fallback);
             } else {
                 self.lower(f, a, *e)?;
                 temps.push(*e);
             }
         }
-        let ok = self
-            .call(
+        // A stable `defn`'s root is its compiled fn once the `def` has
+        // run, and a direct call can run no earlier from its own unit (the
+        // init is the `fn` itself) or any later one: only the call depth
+        // needs checking there (#271).
+        let entered = if self.stable_of(&var).is_some_and(|sr| self.unit >= sr.unit) {
+            self.call("rt_n_enter", Some(self.i8t), &[])
+        } else {
+            self.call(
                 "rt_n_enter_fn",
                 Some(self.i8t),
                 &[self.u64c(vk), self.u64c(k as u64)],
             )
-            .expect("ok");
+        };
+        let ok = entered.expect("ok");
         let go = self
             .builder
             .build_int_compare(IntPredicate::NE, ok, self.i8t.const_zero(), "go")
@@ -2786,6 +2930,9 @@ impl<'ctx> Lowerer<'ctx> {
                 if is_move(f, a) {
                     moved.push(p);
                 }
+            } else if let Some((p, fallback)) = self.borrowed(f, a)? {
+                refs.push(p);
+                temps.extend(fallback);
             } else {
                 let t = self.slot(f);
                 self.lower(f, a, t)?;
@@ -2794,6 +2941,154 @@ impl<'ctx> Lowerer<'ctx> {
             }
         }
         Ok((refs, temps, moved))
+    }
+
+    /// A clone-free reference to `e`'s value for a call that only reads
+    /// it (#271): a pooled constant in place in the frozen table, or a
+    /// stable var's cached root (with the temporary a not-yet-filled
+    /// cache derefs into, for the caller to drop after the call). `None`
+    /// for anything else.
+    #[allow(clippy::type_complexity)]
+    fn borrowed(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        e: &Expr,
+    ) -> Result<Option<(PointerValue<'ctx>, Option<PointerValue<'ctx>>)>, Unsupported> {
+        match e {
+            Expr::Literal(v) | Expr::Quote(v) if is_pooled(v) => {
+                let k = self.value_const(v)?;
+                Ok(Some((self.const_ref(k), None)))
+            }
+            Expr::Global(var) => Ok(self.stable_of(var).map(|sr| {
+                let k = self.var_of(var);
+                self.stable_ref(f, sr, k)
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Pooled constant `k` in place: the frozen table's base plus `k`
+    /// values.
+    fn const_ref(&self, k: u64) -> PointerValue<'ctx> {
+        let base = self
+            .builder
+            .build_load(self.ptr, self.consts_base, "consts")
+            .expect("load")
+            .into_pointer_value();
+        let addr = self
+            .builder
+            .build_ptr_to_int(base, self.i64t, "cbase")
+            .expect("p2i");
+        let off = self
+            .builder
+            .build_int_mul(
+                self.slot_ty.size_of().expect("sized"),
+                self.i64t.const_int(k, false),
+                "coff",
+            )
+            .expect("mul");
+        let at = self.builder.build_int_add(addr, off, "caddr").expect("add");
+        self.builder
+            .build_int_to_ptr(at, self.ptr, "cref")
+            .expect("i2p")
+    }
+
+    /// The stable root cache entry of `var`, if it has one.
+    fn stable_of(&self, var: &clj_value::Var) -> Option<StableRoot<'ctx>> {
+        let key = (
+            var.sym.namespace().unwrap_or("user").to_owned(),
+            var.sym.name().to_owned(),
+        );
+        self.stable.get(&key).copied()
+    }
+
+    /// Whether `sr`'s cache must be checked here: only code in the
+    /// `def`'s own unit or an earlier one can run before the `def`.
+    fn stable_unchecked(&self, sr: StableRoot<'ctx>) -> bool {
+        self.unit > sr.unit
+    }
+
+    /// `sr`'s set flag (acquire: the root's bytes are visible once set).
+    fn stable_is_set(&self, sr: StableRoot<'ctx>) -> IntValue<'ctx> {
+        let flag = self
+            .builder
+            .build_load(self.i8t, sr.set, "rset")
+            .expect("load");
+        flag.as_instruction_value()
+            .expect("load instr")
+            .set_atomic_ordering(AtomicOrdering::Acquire)
+            .expect("acquire");
+        flag.as_instruction_value()
+            .expect("load instr")
+            .set_alignment(1)
+            .expect("align");
+        self.builder
+            .build_int_compare(
+                IntPredicate::NE,
+                flag.into_int_value(),
+                self.i8t.const_zero(),
+                "is_set",
+            )
+            .expect("cmp")
+    }
+
+    /// A reference to stable var `k`'s root: the cache itself where it is
+    /// surely filled, else the cache once set and a fresh deref
+    /// (returned for dropping) before.
+    fn stable_ref(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        sr: StableRoot<'ctx>,
+        k: u64,
+    ) -> (PointerValue<'ctx>, Option<PointerValue<'ctx>>) {
+        if self.stable_unchecked(sr) {
+            return (sr.root, None);
+        }
+        let t = self.slot(f);
+        let set = self.stable_is_set(sr);
+        let here = self.builder.get_insert_block().expect("positioned");
+        let slow = self.ctx.append_basic_block(f.func, "stable_slow");
+        let done = self.ctx.append_basic_block(f.func, "stable_done");
+        self.builder
+            .build_conditional_branch(set, done, slow)
+            .expect("br");
+        self.builder.position_at_end(slow);
+        self.emit_deref(f.func, t, k);
+        let slow_end = self.builder.get_insert_block().expect("positioned");
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
+        let phi = self.builder.build_phi(self.ptr, "sref").expect("phi");
+        phi.add_incoming(&[(&sr.root, here), (&t, slow_end)]);
+        (phi.as_basic_value().into_pointer_value(), Some(t))
+    }
+
+    /// `dest =` a clone of stable var `k`'s root (the var itself only
+    /// while the cache may still be unfilled).
+    fn clone_stable(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        sr: StableRoot<'ctx>,
+        k: u64,
+        dest: PointerValue<'ctx>,
+    ) {
+        if self.stable_unchecked(sr) {
+            self.clone_v(f.func, dest, sr.root);
+            return;
+        }
+        let set = self.stable_is_set(sr);
+        let hit = self.ctx.append_basic_block(f.func, "stable_hit");
+        let miss = self.ctx.append_basic_block(f.func, "stable_miss");
+        let done = self.ctx.append_basic_block(f.func, "stable_done");
+        self.builder
+            .build_conditional_branch(set, hit, miss)
+            .expect("br");
+        self.builder.position_at_end(hit);
+        self.clone_v(f.func, dest, sr.root);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(miss);
+        self.emit_deref(f.func, dest, k);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
     }
 
     /// The slot holding local `idx`'s value, when it can be borrowed
@@ -4077,6 +4372,20 @@ impl<'ctx> Lowerer<'ctx> {
             )
             .expect("st");
         self.check(f, st);
+        let ns = sym.namespace().unwrap_or("user").to_owned();
+        if let Some(sr) = self
+            .stable
+            .get(&(ns.clone(), sym.name().to_owned()))
+            .copied()
+        {
+            let k = self.var(&ns, sym.name());
+            self.call("rt_n_deref", None, &[sr.root.into(), self.u64c(k)]);
+            self.builder
+                .build_store(sr.set, self.i8t.const_int(1, false))
+                .expect("store")
+                .set_atomic_ordering(AtomicOrdering::Release)
+                .expect("release");
+        }
         Ok(())
     }
 
@@ -4861,6 +5170,31 @@ fn self_recurs(body: &[Expr]) -> bool {
 
 /// Whether a direct call has an owned-args entry that can reuse moved
 /// (`Arc::strong_count == 1`) collections or release consumed inputs early.
+/// Whether every use of local `i` in `body` is a read-only call operand
+/// (#271): an argument of a core call outside the owned-move ops, or of
+/// an invoke. A param used only so keeps reading the caller's argument
+/// array: an owned copy at entry buys no in-place update.
+fn borrow_only(body: &[Expr], i: usize) -> bool {
+    fn walk(e: &Expr, i: usize) -> bool {
+        let operand = |a: &Expr| matches!(a, Expr::Local(j) if *j == i) || walk(a, i);
+        match e {
+            Expr::Local(j) => *j != i,
+            Expr::DirectNative(c)
+                if !is_owned_move_op(c.var.sym.namespace(), c.var.sym.name(), c.args.len()) =>
+            {
+                c.args.iter().all(operand)
+            }
+            Expr::Invoke { head, args, .. } => walk(head, i) && args.iter().all(operand),
+            _ => {
+                let mut ok = true;
+                for_each_child(e, &mut |c| ok = ok && walk(c, i));
+                ok
+            }
+        }
+    }
+    body.iter().all(|e| walk(e, i))
+}
+
 fn is_owned_move_op(ns: Option<&str>, name: &str, argc: usize) -> bool {
     match (ns, name) {
         (Some("clojure.string"), "join") => argc == 2,
@@ -5415,6 +5749,97 @@ fn arity_free(arity: &Arity, base: usize, out: &mut BTreeSet<usize>) {
         arities: std::sync::Arc::from([arity.clone()]),
     });
     for_each_child(&probe, &mut |c| walk(c, base, out));
+}
+
+/// Data and fn vars whose root never changes after their one top-level
+/// `def`, mapped to that `def`'s unit index (#271). Only a Lite program
+/// has them: no unit of one can re-root an arbitrary var
+/// ([`can_lite_program`] rejects [`mentions_rebinding`]'s
+/// `alter-var-root`, `with-redefs`, var-resolving fns, …, and `eval` is
+/// not Lite). A var qualifies when exactly one `def` with an init names
+/// it anywhere in the program, that `def` is a whole unit (it runs once,
+/// at its place in program order), it is not `^:dynamic`, and the
+/// program never `set!`s it or takes it as a var object (`#'v`) outside
+/// the inert units `defn` itself emits.
+fn stable_vars(units: &[TopUnit]) -> HashMap<(String, String), usize> {
+    debug_assert!(!units.iter().any(|u| mentions_rebinding(&u.expr)));
+    let key = |sym: &Symbol| {
+        (
+            sym.namespace().unwrap_or("user").to_owned(),
+            sym.name().to_owned(),
+        )
+    };
+    let mut defs: HashMap<(String, String), usize> = HashMap::new();
+    let mut tainted: HashSet<(String, String)> = HashSet::new();
+    for u in units {
+        let inert = matches!(u.expr, Expr::VarRef(_)) || is_inert_meta_statement(&u.expr);
+        visit_var_uses(&u.expr, inert, &mut |sym, defines| {
+            if defines {
+                *defs.entry(key(sym)).or_default() += 1;
+            } else {
+                tainted.insert(key(sym));
+            }
+        });
+    }
+    units
+        .iter()
+        .enumerate()
+        .filter_map(|(i, u)| match &u.expr {
+            Expr::Def {
+                sym,
+                init: Some(_),
+                meta,
+                ..
+            } if !is_dynamic_def(sym, meta.as_deref())
+                && defs.get(&key(sym)) == Some(&1)
+                && !tainted.contains(&key(sym)) =>
+            {
+                Some((key(sym), i))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Report every var `e` defines with an init (`true`) or exposes to a
+/// root change (`false`: a `set!` target, or `#'v` outside an `inert`
+/// unit), recursively.
+fn visit_var_uses(e: &Expr, inert: bool, report: &mut dyn FnMut(&Symbol, bool)) {
+    match e {
+        Expr::Def {
+            sym, init: Some(_), ..
+        } => report(sym, true),
+        Expr::Set { var, .. } => report(&var.sym, false),
+        Expr::VarRef(v) if !inert => report(&v.sym, false),
+        _ => {}
+    }
+    for_each_child(e, &mut |c| visit_var_uses(c, inert, report));
+}
+
+/// Whether a `def`'s name metadata (constant, on the symbol, or as
+/// forms) carries `:dynamic`.
+fn is_dynamic_def(sym: &Symbol, meta: Option<&[(Expr, Expr)]>) -> bool {
+    let dynamic = Value::Keyword(clj_value::Keyword::new(None, "dynamic"));
+    sym.meta().is_some_and(|m| m.get(&dynamic).is_some())
+        || meta.is_some_and(|pairs| {
+            pairs
+                .iter()
+                .any(|(k, _)| matches!(k, Expr::Literal(v) | Expr::Quote(v) if *v == dynamic))
+        })
+}
+
+/// Whether constant `v` lives in the pool (everything `lower_const`
+/// does not write inline).
+fn is_pooled(v: &Value) -> bool {
+    !matches!(
+        v,
+        Value::Nil
+            | Value::Int(_)
+            | Value::Bool(_)
+            | Value::Double(_)
+            | Value::Char(_)
+            | Value::Var(_)
+    )
 }
 
 /// Whether a unit can rebind a core var at run time (then inline

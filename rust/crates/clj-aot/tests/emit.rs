@@ -1067,3 +1067,88 @@ fn native_emit_ir_lowers_scalar_loops_and_branch_conds_271() {
     assert!(text.contains("sc_hdr"), "{text}");
     assert!(text.contains("sc_deopt"), "{text}");
 }
+
+/// Stable vars (#271): a single-`def` var reads from its root cache —
+/// borrowed by calls, cloned elsewhere, checked only where code can run
+/// before the `def` — while dynamic, re-`def`ed, nested, `set!`, and
+/// `#'`-taken vars keep the deref, and a program that can re-root any
+/// var keeps no caches at all. Keyword invokes go through the bitcode
+/// `get` with the keyword borrowed from the constant pool.
+#[test]
+fn native_emit_ir_caches_stable_var_roots_271() {
+    let emit = |src: &str, name: &str| {
+        let ir = tmp(name);
+        clj_aot::build_str(
+            src,
+            "f.clj",
+            &tmp("nope"),
+            &EmitOptions {
+                emit_ir: Some(ir.clone()),
+                emit_obj: None,
+            },
+            &no_link(),
+            clj_aot::BuildMode::Mixed,
+        )
+        .expect("native build");
+        let text = std::fs::read_to_string(&ir).expect("ir");
+        std::fs::remove_file(&ir).expect("cleanup");
+        text
+    };
+    let src = "\
+(declare tbl)
+(defn early [x] (if x (nth tbl 0) (count [tbl])))
+(def tbl [10 20 30])
+(def ^:dynamic *dyn* 1)
+(def ^{:dynamic (not false)} formed 2)
+(def twice 1)
+(def twice 2)
+(defn setter [] (def inner 3))
+(def taken 4)
+(def m {:a 1 :b 2})
+(defn late [i] (+ (nth tbl i) (:a m) (:z m 0) (get m :b) (count tbl)))
+(def wrapped [tbl (get '{a 1} 'a)])
+(defn bump [] (set! *dyn* 2))
+(defn odd-arity [] (:k {} 1 2))
+(println (early false) (late 1) *dyn* formed twice (setter) inner @#'taken (:k [1]) wrapped)
+";
+    let text = emit(src, "stable.ll");
+    for needle in [
+        "@clj_root0 = internal global [4 x i64] zeroinitializer",
+        "load atomic i8, ptr @clj_root_set",
+        "store atomic i8 1, ptr @clj_root_set",
+        "@rt_n_consts_base",
+        "kw_slow",
+    ] {
+        assert!(text.contains(needle), "missing {needle}:\n{text}");
+    }
+    // bump, early, late, m, odd-arity, setter, tbl, and wrapped are
+    // stable (roots 0-7); the dynamic, re-`def`ed, nested, `set!`, and
+    // `#'`-taken vars are not.
+    assert!(text.contains("@clj_root7 = "), "{text}");
+    assert!(!text.contains("@clj_root8 = "), "{text}");
+    // Direct calls (#271 Slice 4b): a stable `defn` called from its own
+    // unit or a later one skips the root check; a forward call keeps it.
+    // Params only read as call operands keep reading the caller's array.
+    let text = emit(
+        "\
+(declare later)
+(defn first-of [w i] (nth w i))
+(defn relay [w] (first-of w 0))
+(defn grow [w x] (conj w x))
+(defn kept [w] (let [v w] (count v)))
+(defn ahead [x] (if (pos? x) (later (dec x)) 0))
+(defn later [x] (+ x (ahead x)))
+(println (relay [1 2]) (grow [1] 2) (kept [3]) (later 2))
+",
+        "calls.ll",
+    );
+    for needle in ["@rt_n_enter()", "@rt_n_enter_fn("] {
+        assert!(text.contains(needle), "missing {needle}:\n{text}");
+    }
+    // Any var-rooting call anywhere disables the caches.
+    let text = emit(
+        "(def a [1]) (defn f [] (nth a 0)) (alter-var-root #'a conj 2) (println (f))",
+        "stable-off.ll",
+    );
+    assert!(!text.contains("@clj_root0"), "{text}");
+}

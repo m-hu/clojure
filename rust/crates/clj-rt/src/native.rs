@@ -308,6 +308,13 @@ pub(crate) fn constant(k: usize) -> &'static Value {
     &tables().consts[k]
 }
 
+/// The frozen constant table's first slot: the table never moves or
+/// changes after [`freeze`], so `base + k` is constant `k` for the rest
+/// of the run.
+pub(crate) fn consts_base() -> *const Value {
+    tables().consts.as_ptr()
+}
+
 /// Var `k`, interned on first use (in the then-current registry).
 pub(crate) fn var(k: usize) -> &'static Var {
     let t = tables();
