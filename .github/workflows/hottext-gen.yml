@@ -6,7 +6,7 @@ on:
 jobs:
   gen:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
@@ -16,7 +16,7 @@ jobs:
       - name: Install tools
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time gdb valgrind
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time gdb
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -24,11 +24,11 @@ jobs:
       - uses: ./.github/actions/setup-llvm
       - name: RSS by mapping with the committed order
         run: |
-          set -o pipefail; bash probe/linux-fns.sh 2>&1 | tee probe-out.txt
+          set -o pipefail; bash probe/rss-smaps.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: linux-fns
+          name: hot-text-rss
           path: |
             probe-out.txt
-            /tmp/linux-fns.tgz
+            /tmp/rss/
