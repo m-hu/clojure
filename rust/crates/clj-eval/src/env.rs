@@ -1387,9 +1387,13 @@ impl SharedRegistry {
         self.lock().registry.ns_for_handle(name, id).cloned()
     }
 
-    /// Drop a namespace (see [`NamespaceRegistry::remove_ns`]).
+    /// Drop a namespace (see [`NamespaceRegistry::remove_ns`]). A
+    /// mutation like any other: by-name caches keyed on the epoch
+    /// (`Evaluator::core_read`) must not outlive the namespace.
     pub fn remove_ns(&self, name: &str) -> bool {
-        self.lock().registry.remove_ns(name)
+        let mut inner = self.lock();
+        let _epoch = self.begin_mutation();
+        inner.registry.remove_ns(name)
     }
 
     /// Qualify an unqualified symbol against an explicit namespace.

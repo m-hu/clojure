@@ -1302,11 +1302,8 @@ pub(crate) fn set_arglists_multi(eval: &mut Evaluator, name: &str, arities: &[&[
 
 /// The visible value of a `clojure.core` var (total fallback nil —
 /// boot installs every var the loader touches).
-pub(crate) fn deref_core(eval: &Evaluator, name: &str) -> Value {
-    match core_var(eval, name) {
-        Some(id) => eval.deref_var_unforced(id, &Symbol::new(Some("clojure.core"), name)),
-        None => Value::Nil,
-    }
+pub(crate) fn deref_core(eval: &Evaluator, name: &'static str) -> Value {
+    eval.core_read(name)
 }
 
 /// The visible `*loaded-libs*` set: the var holds a `Ref`

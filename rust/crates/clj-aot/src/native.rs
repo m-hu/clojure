@@ -1911,6 +1911,8 @@ impl<'ctx> Lowerer<'ctx> {
         body: &[Expr],
         dest: PointerValue<'ctx>,
     ) -> Result<(), Unsupported> {
+        // The Lite boot installs the stream var a program declares.
+        self.var("clojure.core", "*out*");
         let k = self.value_const(&Value::Symbol(out.clone()))?;
         let b = self.slot(f);
         self.body_closure(f, 0, body, b)?;
@@ -1933,6 +1935,7 @@ impl<'ctx> Lowerer<'ctx> {
         body: &[Expr],
         dest: PointerValue<'ctx>,
     ) -> Result<(), Unsupported> {
+        self.var("clojure.core", "*in*");
         let k = self.value_const(&Value::Symbol(input.clone()))?;
         let sv = self.slot(f);
         self.lower(f, s, sv)?;
