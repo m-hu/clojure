@@ -23,13 +23,14 @@
 //! indexes the frame chain, so a fn created at frame length `base`
 //! captures exactly the `Local(i < base)` its arities mention.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use clj_eval::aot_front::{FrontEnd, TopUnit, for_each_child, names_lib, pattern_children};
 use clj_eval::expr::{Arity, CaseTest, Expr, FunExpr, NsClause, Pattern};
 use clj_eval::native_abi;
 use clj_value::{Map, Symbol, Value, Vector};
 use inkwell::AddressSpace;
+use inkwell::AtomicOrdering;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -201,7 +202,6 @@ pub struct Lowerer<'ctx> {
     var_index: HashMap<(String, String), usize>,
     fns: Vec<FnInfo<'ctx>>,
     strings: HashMap<String, PointerValue<'ctx>>,
-    byte_strings: HashMap<String, PointerValue<'ctx>>,
     fn_seq: usize,
     /// Inline the analyzer's `FastArith` int ops (off when the program
     /// can rebind vars, so core arithmetic always means the native).
@@ -229,6 +229,28 @@ pub struct Lowerer<'ctx> {
     direct: HashMap<(String, String), (usize, Vec<ArityCode<'ctx>>)>,
     /// Single-def top-level fn arities eligible for scalar-loop callee inlining.
     callees: HashMap<(String, String), std::sync::Arc<[Arity]>>,
+    /// Global holding the frozen constant table's base
+    /// (`rt_n_consts_base`), stored on entry to `cljtop_0`: call
+    /// operands borrow pooled constants in place (#271).
+    consts_base: PointerValue<'ctx>,
+    /// A Lite program's stable vars ([`stable_vars`]) and their root
+    /// caches: call operands borrow the cached root, other reads clone
+    /// it, never going through the var (#271).
+    stable: HashMap<(String, String), StableRoot<'ctx>>,
+    /// The index of the unit being lowered: code in a unit after a
+    /// stable var's `def` runs only once that `def` has run, so it reads
+    /// the cache without checking it is set.
+    unit: usize,
+}
+
+/// A stable var's root cache: the unit of its one `def`, a module
+/// global the `def` fills with the root right after it runs, and that
+/// global's set flag (#271).
+#[derive(Clone, Copy)]
+struct StableRoot<'ctx> {
+    unit: usize,
+    root: PointerValue<'ctx>,
+    set: PointerValue<'ctx>,
 }
 
 impl<'ctx> Lowerer<'ctx> {
@@ -247,6 +269,9 @@ impl<'ctx> Lowerer<'ctx> {
             g.set_linkage(Linkage::Internal);
             g.as_pointer_value()
         });
+        let consts_base = module.add_global(ptr, None, "clj_consts");
+        consts_base.set_initializer(&ptr.const_null());
+        consts_base.set_linkage(Linkage::Internal);
         Self {
             ctx,
             module,
@@ -263,7 +288,6 @@ impl<'ctx> Lowerer<'ctx> {
             var_index: HashMap::new(),
             fns: Vec::new(),
             strings: HashMap::new(),
-            byte_strings: HashMap::new(),
             fn_seq: 0,
             inline_arith: true,
             var_meta: true,
@@ -273,6 +297,9 @@ impl<'ctx> Lowerer<'ctx> {
             reserved: HashMap::new(),
             direct: HashMap::new(),
             callees: HashMap::new(),
+            consts_base: consts_base.as_pointer_value(),
+            stable: HashMap::new(),
+            unit: 0,
         }
     }
 
@@ -293,11 +320,15 @@ impl<'ctx> Lowerer<'ctx> {
         self.inline_arith = !units.iter().any(|u| mentions_rebinding(&u.expr));
         self.var_meta = !self.lite || program_reads_var_meta(units);
         self.reserve_defns(units);
+        if self.lite {
+            self.reserve_stable(units);
+        }
         let mut tops = Vec::with_capacity(units.len());
-        for unit in units {
+        for (ui, unit) in units.iter().enumerate() {
             if self.drops(&unit.expr) {
                 continue;
             }
+            self.unit = ui;
             let i = tops.len();
             tops.push(self.lower_thunk(&format!("cljtop_{i}"), &unit.expr, i == 0)?);
         }
@@ -306,6 +337,36 @@ impl<'ctx> Lowerer<'ctx> {
         self.lower_frame_registry_wraps();
         crate::lower::verify_module(&self.module).map_err(Unsupported)?;
         Ok(self.module)
+    }
+
+    /// A root cache for each of the program's stable vars
+    /// ([`stable_vars`]): an internal global holding `nil` until the var's
+    /// `def` copies the root in, and its set flag. Globals are numbered in
+    /// var order so the module text is reproducible.
+    fn reserve_stable(&mut self, units: &[TopUnit]) {
+        let mut found: Vec<((String, String), usize)> = stable_vars(units).into_iter().collect();
+        found.sort();
+        for (i, (key, unit)) in found.into_iter().enumerate() {
+            let root = self
+                .module
+                .add_global(self.slot_ty, None, &format!("clj_root{i}"));
+            root.set_initializer(&self.slot_ty.const_zero());
+            root.set_linkage(Linkage::Internal);
+            root.set_alignment(8);
+            let set = self
+                .module
+                .add_global(self.i8t, None, &format!("clj_root_set{i}"));
+            set.set_initializer(&self.i8t.const_zero());
+            set.set_linkage(Linkage::Internal);
+            self.stable.insert(
+                key,
+                StableRoot {
+                    unit,
+                    root: root.as_pointer_value(),
+                    set: set.as_pointer_value(),
+                },
+            );
+        }
     }
 
     /// Reserve every top-level `(def name (fn …))` whose var is defined
@@ -504,24 +565,11 @@ impl<'ctx> Lowerer<'ctx> {
         p
     }
 
-    /// A private constant global holding `text`'s bytes (cached).
+    /// A private constant global holding `text`'s bytes (callers
+    /// dedupe: [`str_lit`](Self::str_lit) caches its headers).
     fn str_bytes(&mut self, text: &str) -> PointerValue<'ctx> {
-        if let Some(p) = self.byte_strings.get(text) {
-            return *p;
-        }
         let value = self.ctx.const_string(text.as_bytes(), false);
-        let bytes = self.const_global(&value, "cljs");
-        self.byte_strings.insert(text.to_owned(), bytes);
-        bytes
-    }
-
-    /// A `CSlice<u8>` header value (not a global) over `text`.
-    fn str_slice_value(&mut self, text: &str) -> inkwell::values::StructValue<'ctx> {
-        let bytes = self.str_bytes(text);
-        self.slice_ty().const_named_struct(&[
-            bytes.into(),
-            self.i64t.const_int(text.len() as u64, false).into(),
-        ])
+        self.const_global(&value, "cljs")
     }
 
     fn constant(&mut self, c: Const) -> u64 {
@@ -1103,9 +1151,15 @@ impl<'ctx> Lowerer<'ctx> {
         init_fast_vars: bool,
     ) -> Result<FunctionValue<'ctx>, Unsupported> {
         let mut f = self.begin_fn(name, Vec::new());
-        if init_fast_vars && let Some(gv) = self.fast_vars {
-            let fv = self.call_ptr("rt_n_fast_vars", &[]);
-            self.builder.build_store(gv, fv).expect("store");
+        if init_fast_vars {
+            if let Some(gv) = self.fast_vars {
+                let fv = self.call_ptr("rt_n_fast_vars", &[]);
+                self.builder.build_store(gv, fv).expect("store");
+            }
+            let base = self.call_ptr("rt_n_consts_base", &[]);
+            self.builder
+                .build_store(self.consts_base, base)
+                .expect("store");
         }
         f.moves = collect_body_moves(std::slice::from_ref(expr), 0, &f.env, &[]);
         let result = self.slot(&mut f);
@@ -1252,7 +1306,7 @@ impl<'ctx> Lowerer<'ctx> {
         let probe = collect_body_moves(body, captures_end, &f.env, &symbols);
         let taken: Vec<usize> = symbols
             .into_iter()
-            .filter(|i| probe.iter().any(|m| m.1 == *i))
+            .filter(|i| probe.iter().any(|m| m.1 == *i) && !borrow_only(body, *i))
             .collect();
         if taken.is_empty() {
             return taken;
@@ -1345,14 +1399,7 @@ impl<'ctx> Lowerer<'ctx> {
                 } else {
                     for (i, fixed) in v.fixed.iter().enumerate() {
                         let item = self.slot(f);
-                        let st = self
-                            .call(
-                                "rt_n_nth_nil",
-                                Some(self.i32t),
-                                &[item.into(), src.into(), self.u64c(i as u64)],
-                            )
-                            .expect("st");
-                        self.check(f, st);
+                        self.emit_nth_nil(f, item, src, i);
                         out.extend(self.bind_pattern(f, fixed, item)?);
                     }
                 }
@@ -1390,6 +1437,47 @@ impl<'ctx> Lowerer<'ctx> {
                 Ok(outs)
             }
         }
+    }
+
+    /// `item = (nth src i nil)` for sequential destructuring (#271): the
+    /// inlined bitcode `nth` (vectors, strings, nil), falling back to
+    /// `rt_n_nth_nil` for every shape it leaves to the runtime.
+    fn emit_nth_nil(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        item: PointerValue<'ctx>,
+        src: PointerValue<'ctx>,
+        i: usize,
+    ) {
+        let done = self.ctx.append_basic_block(f.func, "nth_done");
+        if self.use_bitcode {
+            let idx = self.slot(f);
+            self.write_int(f.func, idx, self.i64t.const_int(i as u64, false));
+            let not_found = self.slot(f);
+            let bc = self.ctx.append_basic_block(f.func, "nth_bc");
+            let slow = self.ctx.append_basic_block(f.func, "nth_slow");
+            self.builder.build_unconditional_branch(bc).expect("br");
+            self.emit_bc_op(
+                f.func,
+                bc,
+                "rt_bc_3_nth",
+                &[src, idx, not_found],
+                item,
+                slow,
+                done,
+            );
+            self.builder.position_at_end(slow);
+        }
+        let st = self
+            .call(
+                "rt_n_nth_nil",
+                Some(self.i32t),
+                &[item.into(), src.into(), self.u64c(i as u64)],
+            )
+            .expect("st");
+        self.check(f, st);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
     }
 
     /// Rebind `pat`'s existing slots from `src` (for `recur`).
@@ -1530,7 +1618,10 @@ impl<'ctx> Lowerer<'ctx> {
             Expr::Local(i) => self.lower_local(f, expr, *i, dest),
             Expr::Global(var) => {
                 let k = self.var_of(var);
-                self.emit_deref(f.func, dest, k);
+                match self.stable_of(var) {
+                    Some(sr) => self.clone_stable(f, sr, k, dest),
+                    None => self.emit_deref(f.func, dest, k),
+                }
                 Ok(())
             }
             Expr::VarRef(var) => {
@@ -1805,6 +1896,8 @@ impl<'ctx> Lowerer<'ctx> {
         body: &[Expr],
         dest: PointerValue<'ctx>,
     ) -> Result<(), Unsupported> {
+        // The Lite boot installs the stream var a program declares.
+        self.var("clojure.core", "*out*");
         let k = self.value_const(&Value::Symbol(out.clone()))?;
         let b = self.slot(f);
         self.body_closure(f, 0, body, b)?;
@@ -1827,6 +1920,7 @@ impl<'ctx> Lowerer<'ctx> {
         body: &[Expr],
         dest: PointerValue<'ctx>,
     ) -> Result<(), Unsupported> {
+        self.var("clojure.core", "*in*");
         let k = self.value_const(&Value::Symbol(input.clone()))?;
         let sv = self.slot(f);
         self.lower(f, s, sv)?;
@@ -2100,7 +2194,9 @@ impl<'ctx> Lowerer<'ctx> {
         if self.direct_target(head, args.len()).is_some() {
             return self.lower_direct_invoke(f, head, args, dest);
         }
-        if self.try_lower_static(f, head, args, dest)? {
+        if self.try_lower_static(f, head, args, dest)?
+            || self.try_lower_kw_invoke(f, head, args, dest)?
+        {
             return Ok(());
         }
         let h = self.slot(f);
@@ -2122,6 +2218,65 @@ impl<'ctx> Lowerer<'ctx> {
         self.write_tag(h, 0);
         self.drop_and_nil_slots(f.func, &elems);
         Ok(())
+    }
+
+    /// `(:k coll)` / `(:k coll not-found)` with a literal keyword head
+    /// (#271): the bitcode `get` over borrowed operands (the keyword in
+    /// place in the constant pool), falling back to the keyword's own
+    /// invoke for any shape the helper leaves to the runtime. Both read
+    /// through the interpreter's `lookup`, so results match exactly.
+    fn try_lower_kw_invoke(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        head: &Expr,
+        args: &[Expr],
+        dest: PointerValue<'ctx>,
+    ) -> Result<bool, Unsupported> {
+        let (Expr::Literal(kw @ Value::Keyword(_)) | Expr::Quote(kw @ Value::Keyword(_))) = head
+        else {
+            return Ok(false);
+        };
+        let shim = match (args.len(), self.use_bitcode) {
+            (1, true) => "rt_bc_2_get",
+            (2, true) => "rt_bc_3_get",
+            _ => return Ok(false),
+        };
+        let kref = {
+            let k = self.value_const(kw)?;
+            self.const_ref(k)
+        };
+        let (args_refs, temps, moved) = self.arg_refs(f, args, dest)?;
+        let mut refs = vec![args_refs[0], kref];
+        refs.extend(args_refs.iter().skip(1));
+        let bc = self.ctx.append_basic_block(f.func, "kw_get");
+        let slow = self.ctx.append_basic_block(f.func, "kw_slow");
+        let done = self.ctx.append_basic_block(f.func, "kw_done");
+        self.builder.build_unconditional_branch(bc).expect("br");
+        self.emit_bc_op(f.func, bc, shim, &refs, dest, slow, done);
+        self.builder.position_at_end(slow);
+        let h = self.slot(f);
+        self.lower_const(f.func, kw, h)?;
+        let (arr, elems) = self.slot_array(f, args.len());
+        for (e, r) in elems.iter().zip(&args_refs) {
+            self.copy_bits(*e, *r);
+        }
+        let aref = self.slots_ref(f, arr, args.len());
+        let st = self
+            .call(
+                "rt_n_invoke",
+                Some(self.i32t),
+                &[dest.into(), h.into(), aref.into()],
+            )
+            .expect("st");
+        self.clear_aliases(&elems);
+        self.check(f, st);
+        self.drop_v(f.func, h);
+        self.write_tag(h, 0);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
+        self.drop_and_nil_slots(f.func, &temps);
+        self.drop_and_nil_slots(f.func, &moved);
+        Ok(true)
     }
 
     fn try_lower_static(
@@ -2399,18 +2554,29 @@ impl<'ctx> Lowerer<'ctx> {
                 if is_move(f, a) {
                     moved.push(p);
                 }
+            } else if let Some((p, fallback)) = self.borrowed(f, a)? {
+                self.copy_bits(*e, p);
+                aliases.push(*e);
+                temps.extend(fallback);
             } else {
                 self.lower(f, a, *e)?;
                 temps.push(*e);
             }
         }
-        let ok = self
-            .call(
+        // A stable `defn`'s root is its compiled fn once the `def` has
+        // run, and a direct call can run no earlier from its own unit (the
+        // init is the `fn` itself) or any later one: only the call depth
+        // needs checking there (#271).
+        let entered = if self.stable_of(&var).is_some_and(|sr| self.unit >= sr.unit) {
+            self.call("rt_n_enter", Some(self.i8t), &[])
+        } else {
+            self.call(
                 "rt_n_enter_fn",
                 Some(self.i8t),
                 &[self.u64c(vk), self.u64c(k as u64)],
             )
-            .expect("ok");
+        };
+        let ok = entered.expect("ok");
         let go = self
             .builder
             .build_int_compare(IntPredicate::NE, ok, self.i8t.const_zero(), "go")
@@ -2497,10 +2663,341 @@ impl<'ctx> Lowerer<'ctx> {
             }
             return Ok(());
         }
-        if self.try_lower_assoc_conj(f, call, Some(dest))? {
+        if self.try_lower_assoc_conj(f, call, Some(dest))?
+            || (self.inline_arith && self.try_lower_hof_loop(f, call, dest)?)
+        {
             return Ok(());
         }
         self.lower_direct_with(f, call, None, dest)
+    }
+
+    /// Run a [`HofLoop`] inline (#271 Slice 4c). The collection (and a
+    /// `reduce` init) evaluate in argument order; then a persistent vector
+    /// or long range runs the `fn`'s body per item right here, with its
+    /// params bound like a `let` (no closure, no lazy seq, no call). Any
+    /// other collection takes the general call, the `fn` made into a
+    /// closure, over the already-evaluated collection: exactly what `run`
+    /// does, lazy forcing order included.
+    fn try_lower_hof_loop(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        call: &clj_eval::expr::DirectCall,
+        dest: PointerValue<'ctx>,
+    ) -> Result<bool, Unsupported> {
+        let Some(hl) = hof_loop(call) else {
+            return Ok(false);
+        };
+        let base = f.env.len();
+        // The analysis saw the `fn` capture its free locals before the
+        // collection (and init) evaluated, so it may let those move a local
+        // the body still reads. Here the body runs after them, and the
+        // general path's closure is made after them: keep those locals.
+        let mut free = BTreeSet::new();
+        arity_free(hl.arity, base, &mut free);
+        let enclosing = f.moves.clone();
+        f.moves.retain(|m| !free.contains(&m.1));
+        let lowered = self.lower_hof_loop(f, &hl, base, dest);
+        f.moves = enclosing;
+        lowered?;
+        Ok(true)
+    }
+
+    /// [`try_lower_hof_loop`] once the moves are safe.
+    fn lower_hof_loop(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        hl: &HofLoop<'_>,
+        base: usize,
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        let acc = self.slot(f);
+        match hl.init {
+            Some(init) => self.lower(f, init, acc)?,
+            None => {
+                if hl.kind == HofKind::Collect {
+                    self.call("rt_n_vec_new", None, &[acc.into()]);
+                }
+            }
+        }
+        let coll = self.slot(f);
+        self.lower(f, hl.coll, coll)?;
+        let plan_ty = self.ctx.struct_type(&[self.i64t.into(); 3], false);
+        let plan = self.entry_alloca(f, plan_ty, "plan");
+        let kind = self
+            .call(
+                "rt_n_iter_plan",
+                Some(self.i8t),
+                &[coll.into(), plan.into()],
+            )
+            .expect("kind");
+        let direct = self.ctx.append_basic_block(f.func, "loop_direct");
+        let general = self.ctx.append_basic_block(f.func, "loop_general");
+        let done = self.ctx.append_basic_block(f.func, "loop_done");
+        let is_direct = self
+            .builder
+            .build_int_compare(IntPredicate::NE, kind, self.i8t.const_zero(), "direct")
+            .expect("cmp");
+        self.builder
+            .build_conditional_branch(is_direct, direct, general)
+            .expect("br");
+        self.builder.position_at_end(direct);
+        let fields = (0..3)
+            .map(|i| {
+                let p = self
+                    .builder
+                    .build_struct_gep(plan_ty, plan, i, "plan_field")
+                    .expect("gep");
+                self.builder
+                    .build_load(self.i64t, p, "plan_v")
+                    .expect("load")
+                    .into_int_value()
+            })
+            .collect::<Vec<_>>();
+        let state = LoopState {
+            acc,
+            coll,
+            kind,
+            n: fields[0],
+            start: fields[1],
+            step: fields[2],
+        };
+        self.emit_hof_direct(f, hl, base, &state, dest)?;
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(general);
+        self.emit_hof_general(f, hl, base, acc, coll, dest)?;
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
+        self.drop_and_nil_slots(f.func, &[coll, acc]);
+        Ok(())
+    }
+
+    /// The inline loop of [`try_lower_hof_loop`] over a vector (items by
+    /// index) or a long range (items by arithmetic): binds the params,
+    /// lowers the body with its own moves (a param or a body local may be
+    /// moved; an enclosing local is read afresh every item), and folds the
+    /// result into the accumulator. Leaves the loop's value in `dest`.
+    fn emit_hof_direct(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        hl: &HofLoop<'_>,
+        base: usize,
+        st: &LoopState<'ctx>,
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        let i_ptr = self.entry_alloca(f, self.i64t, "loop_i");
+        let cur_ptr = self.entry_alloca(f, self.i64t, "loop_cur");
+        self.builder
+            .build_store(i_ptr, self.i64t.const_zero())
+            .expect("store");
+        self.builder.build_store(cur_ptr, st.start).expect("store");
+        let head = self.ctx.append_basic_block(f.func, "loop_head");
+        let body = self.ctx.append_basic_block(f.func, "loop_body");
+        let exit = self.ctx.append_basic_block(f.func, "loop_exit");
+        self.builder.build_unconditional_branch(head).expect("br");
+        self.builder.position_at_end(head);
+        let i = self
+            .builder
+            .build_load(self.i64t, i_ptr, "i")
+            .expect("load")
+            .into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, i, st.n, "more")
+            .expect("cmp");
+        self.builder
+            .build_conditional_branch(more, body, exit)
+            .expect("br");
+        self.builder.position_at_end(body);
+        let item = self.slot(f);
+        self.emit_loop_item(f, st, item, i, cur_ptr);
+        let next = self
+            .builder
+            .build_int_add(i, self.i64t.const_int(1, false), "i_next")
+            .expect("add");
+        self.builder.build_store(i_ptr, next).expect("store");
+        let params = match hl.kind {
+            HofKind::Reduce => vec![st.acc, item],
+            HofKind::Each | HofKind::Collect => vec![item],
+        };
+        let res = self.slot(f);
+        self.lower_inline_body(f, hl.arity, base, &params, res)?;
+        match hl.kind {
+            HofKind::Each => self.drop_and_nil_slots(f.func, &[res]),
+            HofKind::Collect => {
+                self.call("rt_n_vec_push", None, &[st.acc.into(), res.into()]);
+            }
+            HofKind::Reduce => self.move_v(f.func, st.acc, res),
+        }
+        self.drop_and_nil_slots(f.func, &[item]);
+        if hl.kind == HofKind::Reduce {
+            let stop = self
+                .call("rt_n_unreduce", Some(self.i8t), &[st.acc.into()])
+                .expect("stop");
+            let stopped = self
+                .builder
+                .build_int_compare(IntPredicate::NE, stop, self.i8t.const_zero(), "stopped")
+                .expect("cmp");
+            self.builder
+                .build_conditional_branch(stopped, exit, head)
+                .expect("br");
+        } else {
+            self.builder.build_unconditional_branch(head).expect("br");
+        }
+        self.builder.position_at_end(exit);
+        match hl.kind {
+            HofKind::Each => self.write_nil(f.func, dest),
+            HofKind::Collect => {
+                self.call("rt_n_vec_done", None, &[dest.into(), st.acc.into()]);
+            }
+            HofKind::Reduce => self.move_v(f.func, dest, st.acc),
+        }
+        Ok(())
+    }
+
+    /// `item =` the loop's `i`th item: a vector's element (by index), or a
+    /// long range's current value (then advanced by its step; wrapping, so
+    /// the never-used value after the last cannot trap).
+    fn emit_loop_item(
+        &mut self,
+        f: &FnCtx<'ctx>,
+        st: &LoopState<'ctx>,
+        item: PointerValue<'ctx>,
+        i: IntValue<'ctx>,
+        cur_ptr: PointerValue<'ctx>,
+    ) {
+        let vec_b = self.ctx.append_basic_block(f.func, "loop_vec_item");
+        let range_b = self.ctx.append_basic_block(f.func, "loop_range_item");
+        let got = self.ctx.append_basic_block(f.func, "loop_item");
+        let is_vec = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                st.kind,
+                self.i8t.const_int(1, false),
+                "is_vec",
+            )
+            .expect("cmp");
+        self.builder
+            .build_conditional_branch(is_vec, vec_b, range_b)
+            .expect("br");
+        self.builder.position_at_end(vec_b);
+        self.call(
+            "rt_n_vec_item",
+            None,
+            &[item.into(), st.coll.into(), i.into()],
+        );
+        self.builder.build_unconditional_branch(got).expect("br");
+        self.builder.position_at_end(range_b);
+        let cur = self
+            .builder
+            .build_load(self.i64t, cur_ptr, "cur")
+            .expect("load")
+            .into_int_value();
+        self.write_int(f.func, item, cur);
+        let after = self
+            .builder
+            .build_int_add(cur, st.step, "cur_next")
+            .expect("add");
+        self.builder.build_store(cur_ptr, after).expect("store");
+        self.builder.build_unconditional_branch(got).expect("br");
+        self.builder.position_at_end(got);
+    }
+
+    /// Lower a literal `fn` arity's body in place, its params bound to
+    /// `params` like a `let` (at env index `base` onward, where the
+    /// analyzer placed them) and the body's own last uses as its moves.
+    fn lower_inline_body(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        arity: &Arity,
+        base: usize,
+        params: &[PointerValue<'ctx>],
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        for p in params {
+            f.env.push(Some(LocalRef::Slot(*p)));
+        }
+        let owned: Vec<usize> = (base..base + params.len()).collect();
+        let moves = collect_body_moves(&arity.body, base, &f.env, &owned);
+        let saved = std::mem::replace(&mut f.moves, moves);
+        let lowered = self.lower_body(f, &arity.body, dest);
+        f.moves = saved;
+        f.env.truncate(base);
+        lowered
+    }
+
+    /// The general path of [`try_lower_hof_loop`]: the `fn` as a closure,
+    /// then the original core calls (`map` then `dorun` / `vec` / `into`,
+    /// or `mapv` / `reduce`) over the evaluated collection.
+    fn emit_hof_general(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        hl: &HofLoop<'_>,
+        base: usize,
+        acc: PointerValue<'ctx>,
+        coll: PointerValue<'ctx>,
+        dest: PointerValue<'ctx>,
+    ) -> Result<(), Unsupported> {
+        let closure = self.slot(f);
+        self.make_closure(f, hl.fun, base, closure)?;
+        let mut args = vec![closure];
+        if hl.kind == HofKind::Reduce {
+            args.push(acc);
+        }
+        args.push(coll);
+        let Some((outer, prefix)) = hl.outer else {
+            self.core_call_owned(f, hl.inner, &args, dest);
+            return Ok(());
+        };
+        let seq = self.slot(f);
+        self.core_call_owned(f, hl.inner, &args, seq);
+        let mut outer_args = Vec::new();
+        if let Some(p) = prefix {
+            let s = self.slot(f);
+            self.lower(f, p, s)?;
+            outer_args.push(s);
+        }
+        outer_args.push(seq);
+        self.core_call_owned(f, outer, &outer_args, dest);
+        Ok(())
+    }
+
+    /// `dest = (var args…)` through the core var's native, the `args`
+    /// slots moved over (left nil), as the original call took its
+    /// temporaries: a `map` seq reaches `dorun` / `vec` uniquely held, so
+    /// the walk can fuse it (`walk_sole_map`).
+    fn core_call_owned(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        call: &clj_eval::expr::DirectCall,
+        args: &[PointerValue<'ctx>],
+        dest: PointerValue<'ctx>,
+    ) {
+        let k = self.var_of(&call.var);
+        let n = args.len();
+        let (arr, elems) = self.slot_array(f, n);
+        for (e, a) in elems.iter().zip(args) {
+            self.move_v(f.func, *e, *a);
+        }
+        let name = call.var.sym.name();
+        let op = native_abi::own_op(name, n)
+            .or_else(|| native_abi::inline_op(name, n))
+            .unwrap_or(u32::MAX);
+        let aref = self.slots_ref(f, arr, n);
+        let st = self
+            .call(
+                "rt_n_core_own",
+                Some(self.i32t),
+                &[
+                    dest.into(),
+                    self.i32t.const_int(u64::from(op), false).into(),
+                    self.u64c(k),
+                    aref.into(),
+                ],
+            )
+            .expect("st");
+        self.check(f, st);
+        self.drop_slots(f.func, &elems);
     }
 
     fn lower_direct_with(
@@ -2786,6 +3283,9 @@ impl<'ctx> Lowerer<'ctx> {
                 if is_move(f, a) {
                     moved.push(p);
                 }
+            } else if let Some((p, fallback)) = self.borrowed(f, a)? {
+                refs.push(p);
+                temps.extend(fallback);
             } else {
                 let t = self.slot(f);
                 self.lower(f, a, t)?;
@@ -2794,6 +3294,154 @@ impl<'ctx> Lowerer<'ctx> {
             }
         }
         Ok((refs, temps, moved))
+    }
+
+    /// A clone-free reference to `e`'s value for a call that only reads
+    /// it (#271): a pooled constant in place in the frozen table, or a
+    /// stable var's cached root (with the temporary a not-yet-filled
+    /// cache derefs into, for the caller to drop after the call). `None`
+    /// for anything else.
+    #[allow(clippy::type_complexity)]
+    fn borrowed(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        e: &Expr,
+    ) -> Result<Option<(PointerValue<'ctx>, Option<PointerValue<'ctx>>)>, Unsupported> {
+        match e {
+            Expr::Literal(v) | Expr::Quote(v) if is_pooled(v) => {
+                let k = self.value_const(v)?;
+                Ok(Some((self.const_ref(k), None)))
+            }
+            Expr::Global(var) => Ok(self.stable_of(var).map(|sr| {
+                let k = self.var_of(var);
+                self.stable_ref(f, sr, k)
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Pooled constant `k` in place: the frozen table's base plus `k`
+    /// values.
+    fn const_ref(&self, k: u64) -> PointerValue<'ctx> {
+        let base = self
+            .builder
+            .build_load(self.ptr, self.consts_base, "consts")
+            .expect("load")
+            .into_pointer_value();
+        let addr = self
+            .builder
+            .build_ptr_to_int(base, self.i64t, "cbase")
+            .expect("p2i");
+        let off = self
+            .builder
+            .build_int_mul(
+                self.slot_ty.size_of().expect("sized"),
+                self.i64t.const_int(k, false),
+                "coff",
+            )
+            .expect("mul");
+        let at = self.builder.build_int_add(addr, off, "caddr").expect("add");
+        self.builder
+            .build_int_to_ptr(at, self.ptr, "cref")
+            .expect("i2p")
+    }
+
+    /// The stable root cache entry of `var`, if it has one.
+    fn stable_of(&self, var: &clj_value::Var) -> Option<StableRoot<'ctx>> {
+        let key = (
+            var.sym.namespace().unwrap_or("user").to_owned(),
+            var.sym.name().to_owned(),
+        );
+        self.stable.get(&key).copied()
+    }
+
+    /// Whether `sr`'s cache must be checked here: only code in the
+    /// `def`'s own unit or an earlier one can run before the `def`.
+    fn stable_unchecked(&self, sr: StableRoot<'ctx>) -> bool {
+        self.unit > sr.unit
+    }
+
+    /// `sr`'s set flag (acquire: the root's bytes are visible once set).
+    fn stable_is_set(&self, sr: StableRoot<'ctx>) -> IntValue<'ctx> {
+        let flag = self
+            .builder
+            .build_load(self.i8t, sr.set, "rset")
+            .expect("load");
+        flag.as_instruction_value()
+            .expect("load instr")
+            .set_atomic_ordering(AtomicOrdering::Acquire)
+            .expect("acquire");
+        flag.as_instruction_value()
+            .expect("load instr")
+            .set_alignment(1)
+            .expect("align");
+        self.builder
+            .build_int_compare(
+                IntPredicate::NE,
+                flag.into_int_value(),
+                self.i8t.const_zero(),
+                "is_set",
+            )
+            .expect("cmp")
+    }
+
+    /// A reference to stable var `k`'s root: the cache itself where it is
+    /// surely filled, else the cache once set and a fresh deref
+    /// (returned for dropping) before.
+    fn stable_ref(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        sr: StableRoot<'ctx>,
+        k: u64,
+    ) -> (PointerValue<'ctx>, Option<PointerValue<'ctx>>) {
+        if self.stable_unchecked(sr) {
+            return (sr.root, None);
+        }
+        let t = self.slot(f);
+        let set = self.stable_is_set(sr);
+        let here = self.builder.get_insert_block().expect("positioned");
+        let slow = self.ctx.append_basic_block(f.func, "stable_slow");
+        let done = self.ctx.append_basic_block(f.func, "stable_done");
+        self.builder
+            .build_conditional_branch(set, done, slow)
+            .expect("br");
+        self.builder.position_at_end(slow);
+        self.emit_deref(f.func, t, k);
+        let slow_end = self.builder.get_insert_block().expect("positioned");
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
+        let phi = self.builder.build_phi(self.ptr, "sref").expect("phi");
+        phi.add_incoming(&[(&sr.root, here), (&t, slow_end)]);
+        (phi.as_basic_value().into_pointer_value(), Some(t))
+    }
+
+    /// `dest =` a clone of stable var `k`'s root (the var itself only
+    /// while the cache may still be unfilled).
+    fn clone_stable(
+        &mut self,
+        f: &mut FnCtx<'ctx>,
+        sr: StableRoot<'ctx>,
+        k: u64,
+        dest: PointerValue<'ctx>,
+    ) {
+        if self.stable_unchecked(sr) {
+            self.clone_v(f.func, dest, sr.root);
+            return;
+        }
+        let set = self.stable_is_set(sr);
+        let hit = self.ctx.append_basic_block(f.func, "stable_hit");
+        let miss = self.ctx.append_basic_block(f.func, "stable_miss");
+        let done = self.ctx.append_basic_block(f.func, "stable_done");
+        self.builder
+            .build_conditional_branch(set, hit, miss)
+            .expect("br");
+        self.builder.position_at_end(hit);
+        self.clone_v(f.func, dest, sr.root);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(miss);
+        self.emit_deref(f.func, dest, k);
+        self.builder.build_unconditional_branch(done).expect("br");
+        self.builder.position_at_end(done);
     }
 
     /// The slot holding local `idx`'s value, when it can be borrowed
@@ -4077,6 +4725,17 @@ impl<'ctx> Lowerer<'ctx> {
             )
             .expect("st");
         self.check(f, st);
+        let ns = sym.namespace().unwrap_or("user").to_owned();
+        if let Some(sr) = self.stable.get(&(ns, sym.name().to_owned())).copied() {
+            // The root is the init value itself (`def_finish` stores a
+            // clone of it): fill the cache from the slot, no var lookup.
+            self.clone_v(f.func, sr.root, value);
+            self.builder
+                .build_store(sr.set, self.i8t.const_int(1, false))
+                .expect("store")
+                .set_atomic_ordering(AtomicOrdering::Release)
+                .expect("release");
+        }
         Ok(())
     }
 
@@ -4391,6 +5050,44 @@ impl<'ctx> Lowerer<'ctx> {
             .expect("ret");
     }
 
+    /// One names text (each namespace once, then every var name) and
+    /// one `clj_rt::nabi::VarRow` per var, in index order: its spans in
+    /// the text and its Lite native hint (#271: the runtime validates and
+    /// copies the text once, no allocation per var).
+    fn declare_vars(&mut self) {
+        let row_ty = self.ctx.struct_type(&[self.i32t.into(); 5], false);
+        let vars = self.vars.clone();
+        let mut text = String::new();
+        let mut homes: Vec<(&str, u64)> = Vec::new();
+        let mut rows = Vec::with_capacity(vars.len());
+        for (ns, name) in &vars {
+            let ns_at = match homes.iter().find(|(home, _)| *home == ns.as_str()) {
+                Some(&(_, at)) => at,
+                None => {
+                    let at = text.len() as u64;
+                    text.push_str(ns);
+                    homes.push((ns, at));
+                    at
+                }
+            };
+            let at = text.len() as u64;
+            text.push_str(name);
+            let hint = u64::from(clj_eval::aot_boot::lite_native_hint(ns, name));
+            let fields = [ns_at, ns.len() as u64, at, name.len() as u64, hint]
+                .map(|v| self.i32t.const_int(v, false).into());
+            rows.push(row_ty.const_named_struct(&fields));
+        }
+        let names = self.str_bytes(&text);
+        let names_ref = self.const_slice(names, text.len() as u64);
+        let table = self.const_global(&row_ty.const_array(&rows), "cljv");
+        let rows_ref = self.const_slice(table, vars.len() as u64);
+        self.call(
+            "rt_n_declare_vars",
+            None,
+            &[names_ref.into(), rows_ref.into()],
+        );
+    }
+
     fn lower_main(&mut self, path: &str, init: FunctionValue<'ctx>, tops: &[FunctionValue<'ctx>]) {
         let ty = self
             .i32t
@@ -4398,27 +5095,7 @@ impl<'ctx> Lowerer<'ctx> {
         let main = self.module.add_function("main", ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
         self.builder.position_at_end(entry);
-        // One `clj_rt::nabi::VarDecl` table: `ns/name` and the Lite
-        // native hint of every var, in index order.
-        let slice_ty = self.slice_ty();
-        let decl_ty = self
-            .ctx
-            .struct_type(&[slice_ty.into(), slice_ty.into(), self.i32t.into()], false);
-        let vars = self.vars.clone();
-        let mut decls = Vec::with_capacity(vars.len());
-        for (ns, name) in &vars {
-            let ns_slice = self.str_slice_value(ns);
-            let name_slice = self.str_slice_value(name);
-            let hint = clj_eval::aot_boot::lite_native_hint(ns, name);
-            decls.push(decl_ty.const_named_struct(&[
-                ns_slice.into(),
-                name_slice.into(),
-                self.i32t.const_int(u64::from(hint), false).into(),
-            ]));
-        }
-        let table = self.const_global(&decl_ty.const_array(&decls), "cljv");
-        let decls_ref = self.const_slice(table, vars.len() as u64);
-        self.call("rt_n_declare_vars", None, &[decls_ref.into()]);
+        self.declare_vars();
         let fns: Vec<(String, Vec<ArityCode>)> = self
             .fns
             .iter()
@@ -4482,6 +5159,9 @@ impl<'ctx> Lowerer<'ctx> {
                 .map(|(ns, n)| (ns.as_str(), n.as_str()))
                 .collect();
             let caps = clj_eval::aot_boot::lite_caps_for(&var_refs);
+            if self.var_meta {
+                self.call("rt_n_cap_var_meta", None, &[]);
+            }
             for (cap, sym) in [
                 (clj_eval::aot_boot::LiteCaps::IO, "rt_n_cap_io"),
                 (clj_eval::aot_boot::LiteCaps::CORE, "rt_n_cap_core"),
@@ -4861,6 +5541,143 @@ fn self_recurs(body: &[Expr]) -> bool {
 
 /// Whether a direct call has an owned-args entry that can reuse moved
 /// (`Arc::strong_count == 1`) collections or release consumed inputs early.
+/// Which eager traversal a [`HofLoop`] runs: a `doseq` (`dorun` of a
+/// `map`), a vector build (`mapv`, `vec` / `into []` of a `map`), or a
+/// `reduce`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HofKind {
+    Each,
+    Collect,
+    Reduce,
+}
+
+/// A core traversal over a literal `fn` that a compiled loop can run
+/// inline (#271 Slice 4c), with the calls the general path makes: the
+/// inner one (`map`, `mapv`, or `reduce`) and, for `dorun` / `vec` /
+/// `into []`, the outer one with its leading argument.
+struct HofLoop<'a> {
+    kind: HofKind,
+    fun: &'a FunExpr,
+    arity: &'a Arity,
+    init: Option<&'a Expr>,
+    coll: &'a Expr,
+    inner: &'a clj_eval::expr::DirectCall,
+    outer: Option<(&'a clj_eval::expr::DirectCall, Option<&'a Expr>)>,
+}
+
+/// A compiled loop's runtime state: the accumulator and collection
+/// slots, the [`rt_n_iter_plan`] kind, and the plan's count, start, step.
+struct LoopState<'ctx> {
+    acc: PointerValue<'ctx>,
+    coll: PointerValue<'ctx>,
+    kind: IntValue<'ctx>,
+    n: IntValue<'ctx>,
+    start: IntValue<'ctx>,
+    step: IntValue<'ctx>,
+}
+
+/// `call` as a [`HofLoop`]: `(mapv F xs)`, `(reduce F init xs)`, or
+/// `(dorun (map F xs))` / `(vec (map F xs))` / `(into [] (map F xs))`,
+/// all `clojure.core`.
+fn hof_loop(call: &clj_eval::expr::DirectCall) -> Option<HofLoop<'_>> {
+    if call.var.sym.namespace() != Some("clojure.core") {
+        return None;
+    }
+    let one = |kind, fe, init, coll| {
+        let (fun, arity) = inline_fn(fe, if kind == HofKind::Reduce { 2 } else { 1 })?;
+        Some(HofLoop {
+            kind,
+            fun,
+            arity,
+            init,
+            coll,
+            inner: call,
+            outer: None,
+        })
+    };
+    match (call.var.sym.name(), call.args.as_slice()) {
+        ("mapv", [fe, coll]) => one(HofKind::Collect, fe, None, coll),
+        ("reduce", [fe, init, coll]) => one(HofKind::Reduce, fe, Some(init), coll),
+        ("dorun", [inner]) => map_loop(inner, HofKind::Each, call, None),
+        ("vec", [inner]) => map_loop(inner, HofKind::Collect, call, None),
+        ("into", [to @ Expr::VecLit(items, None), inner]) if items.is_empty() => {
+            map_loop(inner, HofKind::Collect, call, Some(to))
+        }
+        _ => None,
+    }
+}
+
+/// `(map F xs)` (a `clojure.core/map` of a literal one-param `fn`) under
+/// the outer call `outer`.
+fn map_loop<'a>(
+    inner: &'a Expr,
+    kind: HofKind,
+    outer: &'a clj_eval::expr::DirectCall,
+    prefix: Option<&'a Expr>,
+) -> Option<HofLoop<'a>> {
+    let Expr::DirectNative(m) = inner else {
+        return None;
+    };
+    let [fe, coll] = m.args.as_slice() else {
+        return None;
+    };
+    if m.var.sym.namespace() != Some("clojure.core") || m.var.sym.name() != "map" {
+        return None;
+    }
+    let (fun, arity) = inline_fn(fe, 1)?;
+    Some(HofLoop {
+        kind,
+        fun,
+        arity,
+        init: None,
+        coll,
+        inner: m,
+        outer: Some((outer, prefix)),
+    })
+}
+
+/// A literal `fn` whose one arity takes exactly `params` symbol params
+/// and never `recur`s to itself: its body can run inline per item (a
+/// named `fn` arrives as a `letfn`, so it never refers to itself here).
+fn inline_fn(e: &Expr, params: usize) -> Option<(&FunExpr, &Arity)> {
+    let Expr::Fn(fun) = e else {
+        return None;
+    };
+    let [arity] = &fun.arities[..] else {
+        return None;
+    };
+    (arity.rest.is_none()
+        && arity.fixed.len() == params
+        && arity.fixed.iter().all(|p| matches!(p, Pattern::Symbol(_)))
+        && !self_recurs(&arity.body))
+    .then_some((fun, arity))
+}
+
+/// Whether every use of local `i` in `body` is a read-only call operand
+/// (#271): an argument of a core call outside the owned-move ops, or of
+/// an invoke. A param used only so keeps reading the caller's argument
+/// array: an owned copy at entry buys no in-place update.
+fn borrow_only(body: &[Expr], i: usize) -> bool {
+    fn walk(e: &Expr, i: usize) -> bool {
+        let operand = |a: &Expr| matches!(a, Expr::Local(j) if *j == i) || walk(a, i);
+        match e {
+            Expr::Local(j) => *j != i,
+            Expr::DirectNative(c)
+                if !is_owned_move_op(c.var.sym.namespace(), c.var.sym.name(), c.args.len()) =>
+            {
+                c.args.iter().all(operand)
+            }
+            Expr::Invoke { head, args, .. } => walk(head, i) && args.iter().all(operand),
+            _ => {
+                let mut ok = true;
+                for_each_child(e, &mut |c| ok = ok && walk(c, i));
+                ok
+            }
+        }
+    }
+    body.iter().all(|e| walk(e, i))
+}
+
 fn is_owned_move_op(ns: Option<&str>, name: &str, argc: usize) -> bool {
     match (ns, name) {
         (Some("clojure.string"), "join") => argc == 2,
@@ -5417,6 +6234,97 @@ fn arity_free(arity: &Arity, base: usize, out: &mut BTreeSet<usize>) {
     for_each_child(&probe, &mut |c| walk(c, base, out));
 }
 
+/// Data and fn vars whose root never changes after their one top-level
+/// `def`, mapped to that `def`'s unit index (#271). Only a Lite program
+/// has them: no unit of one can re-root an arbitrary var
+/// ([`can_lite_program`] rejects [`mentions_rebinding`]'s
+/// `alter-var-root`, `with-redefs`, var-resolving fns, …, and `eval` is
+/// not Lite). A var qualifies when exactly one `def` with an init names
+/// it anywhere in the program, that `def` is a whole unit (it runs once,
+/// at its place in program order), it is not `^:dynamic`, and the
+/// program never `set!`s it or takes it as a var object (`#'v`) outside
+/// the inert units `defn` itself emits.
+fn stable_vars(units: &[TopUnit]) -> HashMap<(String, String), usize> {
+    debug_assert!(!units.iter().any(|u| mentions_rebinding(&u.expr)));
+    let key = |sym: &Symbol| {
+        (
+            sym.namespace().unwrap_or("user").to_owned(),
+            sym.name().to_owned(),
+        )
+    };
+    let mut defs: HashMap<(String, String), usize> = HashMap::new();
+    let mut tainted: HashSet<(String, String)> = HashSet::new();
+    for u in units {
+        let inert = matches!(u.expr, Expr::VarRef(_)) || is_inert_meta_statement(&u.expr);
+        visit_var_uses(&u.expr, inert, &mut |sym, defines| {
+            if defines {
+                *defs.entry(key(sym)).or_default() += 1;
+            } else {
+                tainted.insert(key(sym));
+            }
+        });
+    }
+    units
+        .iter()
+        .enumerate()
+        .filter_map(|(i, u)| match &u.expr {
+            Expr::Def {
+                sym,
+                init: Some(_),
+                meta,
+                ..
+            } if !is_dynamic_def(sym, meta.as_deref())
+                && defs.get(&key(sym)) == Some(&1)
+                && !tainted.contains(&key(sym)) =>
+            {
+                Some((key(sym), i))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Report every var `e` defines with an init (`true`) or exposes to a
+/// root change (`false`: a `set!` target, or `#'v` outside an `inert`
+/// unit), recursively.
+fn visit_var_uses(e: &Expr, inert: bool, report: &mut dyn FnMut(&Symbol, bool)) {
+    match e {
+        Expr::Def {
+            sym, init: Some(_), ..
+        } => report(sym, true),
+        Expr::Set { var, .. } => report(&var.sym, false),
+        Expr::VarRef(v) if !inert => report(&v.sym, false),
+        _ => {}
+    }
+    for_each_child(e, &mut |c| visit_var_uses(c, inert, report));
+}
+
+/// Whether a `def`'s name metadata (constant, on the symbol, or as
+/// forms) carries `:dynamic`.
+fn is_dynamic_def(sym: &Symbol, meta: Option<&[(Expr, Expr)]>) -> bool {
+    let dynamic = Value::Keyword(clj_value::Keyword::new(None, "dynamic"));
+    sym.meta().is_some_and(|m| m.get(&dynamic).is_some())
+        || meta.is_some_and(|pairs| {
+            pairs
+                .iter()
+                .any(|(k, _)| matches!(k, Expr::Literal(v) | Expr::Quote(v) if *v == dynamic))
+        })
+}
+
+/// Whether constant `v` lives in the pool (everything `lower_const`
+/// does not write inline).
+fn is_pooled(v: &Value) -> bool {
+    !matches!(
+        v,
+        Value::Nil
+            | Value::Int(_)
+            | Value::Bool(_)
+            | Value::Double(_)
+            | Value::Char(_)
+            | Value::Var(_)
+    )
+}
+
 /// Whether a unit can rebind a core var at run time (then inline
 /// arithmetic would not mean the current root).
 fn mentions_rebinding(e: &Expr) -> bool {
@@ -5526,14 +6434,45 @@ fn sym_key(sym: &Symbol) -> (String, String) {
 /// ([`clj_eval::aot_boot::needs_var_meta`] over every var it names).
 fn program_reads_var_meta(units: &[TopUnit]) -> bool {
     let mut refs = Vec::new();
+    let mut var_objects = false;
     for u in units.iter().filter(|u| !is_inert_meta_statement(&u.expr)) {
         collect_var_refs(&u.expr, &mut refs);
+        // A unit that is just `(var name)` closes a split `defn`.
+        var_objects |= !matches!(u.expr, Expr::VarRef(_)) && holds_var_object(&u.expr);
     }
     let refs: Vec<(&str, &str)> = refs
         .iter()
         .map(|(ns, name)| (ns.as_str(), name.as_str()))
         .collect();
-    clj_eval::aot_boot::needs_var_meta(&refs)
+    clj_eval::aot_boot::needs_var_meta(&refs, var_objects)
+}
+
+/// Whether `e` can hand the program a var object: a `#'v` anywhere but
+/// `defn`'s own forms (its inert metadata writes, and the `(var name)`
+/// closing a `do` that defines `name`).
+fn holds_var_object(e: &Expr) -> bool {
+    match e {
+        Expr::VarRef(_) => true,
+        Expr::Do(body) => body.iter().enumerate().any(|(i, s)| match s {
+            _ if is_inert_meta_statement(s) => false,
+            Expr::VarRef(v) if i + 1 == body.len() && defines_name(&body[..i], v.sym.name()) => {
+                false
+            }
+            _ => holds_var_object(s),
+        }),
+        _ => {
+            let mut found = false;
+            for_each_child(e, &mut |c| found = found || holds_var_object(c));
+            found
+        }
+    }
+}
+
+/// Whether one of `forms` is a `def` of `name`.
+fn defines_name(forms: &[Expr], name: &str) -> bool {
+    forms
+        .iter()
+        .any(|f| matches!(f, Expr::Def { sym, .. } if sym.name() == name))
 }
 
 fn collect_var_refs(e: &Expr, out: &mut Vec<(String, String)>) {
@@ -5607,7 +6546,7 @@ fn is_inert_assoc(kvs: &[Expr]) -> bool {
 fn is_inert_merge(args: &[Expr]) -> bool {
     match args {
         [Expr::Literal(Value::Map(m)) | Expr::Quote(Value::Map(m))] => {
-            m.iter().all(|(k, _)| is_inert_def_meta_key(k))
+            m.iter().all(|(k, _)| is_inert_write_key(k))
         }
         _ => false,
     }
@@ -5615,8 +6554,19 @@ fn is_inert_merge(args: &[Expr]) -> bool {
 
 /// A metadata `key value` pair with an inert key and a constant value.
 fn is_inert_meta_pair(k: &Expr, v: &Expr) -> bool {
-    matches!(k, Expr::Literal(key) if is_inert_def_meta_key(key))
+    matches!(k, Expr::Literal(key) if is_inert_write_key(key))
         && matches!(v, Expr::Literal(_) | Expr::Quote(_))
+}
+
+/// Whether a discarded constant metadata write of `key` (`defn`'s
+/// `:arglists`, an attr map's `:added`, …) is unobservable without a
+/// var-metadata reader (#271): any unqualified keyword except the keys
+/// the runtime acts on (`:dynamic`, `:private` for `refer`, `:macro`,
+/// `:redef`). A type hint (`:tag`) only steers analysis, which ran at
+/// build time.
+fn is_inert_write_key(key: &Value) -> bool {
+    matches!(key, Value::Keyword(k) if k.namespace().is_none()
+        && !matches!(k.name(), "dynamic" | "private" | "macro" | "redef"))
 }
 
 /// Whether `key` names a [`clj_eval::aot_boot::LITE_INERT_DEF_META`] key.

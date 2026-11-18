@@ -52,11 +52,30 @@ pub(crate) struct FnDesc {
 /// One declared var: its qualified name (interned on first use) and
 /// the compiler's Lite native hint for it.
 pub(crate) struct VarSlot {
-    ns: Arc<str>,
-    name: Arc<str>,
+    /// The namespace and name as byte spans `(at, len)` of the
+    /// program's names text ([`Tables::names`]).
+    ns: (u32, u32),
+    name: (u32, u32),
     hint: u32,
     var: OnceLock<Var>,
     core: OnceLock<Option<native_abi::CoreEntry>>,
+}
+
+impl VarSlot {
+    fn ns<'a>(&self, names: &'a str) -> &'a str {
+        span(names, self.ns)
+    }
+
+    fn name<'a>(&self, names: &'a str) -> &'a str {
+        span(names, self.name)
+    }
+}
+
+/// `names[at..at + len]` (empty out of range: generated code emits
+/// in-range spans on character boundaries).
+fn span(names: &str, (at, len): (u32, u32)) -> &str {
+    let at = at as usize;
+    names.get(at..at + len as usize).unwrap_or("")
 }
 
 /// A Lite program's registered capability tables, kept past boot for
@@ -81,6 +100,8 @@ impl LiteSet {
 /// Tables under construction (startup only).
 #[derive(Default)]
 struct Building {
+    /// Every declared namespace and var name, spanned by [`VarSlot`]s.
+    names: Arc<str>,
     vars: Vec<VarSlot>,
     consts: Vec<Value>,
     fns: Vec<Option<FnDesc>>,
@@ -88,6 +109,9 @@ struct Building {
     lite_owned_caps: Vec<clj_eval::aot_boot::LiteOwnedSlice>,
     lite_libs: Vec<(&'static str, &'static [clj_eval::aot_boot::LiteNativeSlice])>,
     lite_seq_helpers: bool,
+    /// Set by `rt_n_cap_var_meta`: the compiled program can observe var
+    /// metadata, so `def`s keep it (#271).
+    lite_var_meta: bool,
     /// Set by a Lite run: freezing keeps the tables above as a [`LiteSet`].
     lite: bool,
 }
@@ -99,6 +123,8 @@ pub(crate) struct Tables {
     /// A Lite run's capability tables (its declared natives install on
     /// first use); `None` under the full boot.
     lite: Option<LiteSet>,
+    /// Every declared namespace and var name, spanned by [`VarSlot`]s.
+    names: Arc<str>,
     vars: Box<[VarSlot]>,
     consts: Box<[Value]>,
     fns: Box<[FnDesc]>,
@@ -198,30 +224,31 @@ pub(crate) fn settle(step: Step) -> (i32, Value) {
     }
 }
 
-/// Declare the program's vars — `(ns, name, Lite native hint)` in
-/// index order — in one step (one table, each namespace name shared).
-pub(crate) fn declare_vars<S: AsRef<str>>(decls: impl ExactSizeIterator<Item = (S, S, u32)>) {
-    let mut homes: Vec<Arc<str>> = Vec::new();
-    let mut vars = Vec::with_capacity(decls.len());
-    for (ns, name, hint) in decls {
-        let ns = ns.as_ref();
-        let home = match homes.iter().find(|h| ***h == *ns) {
-            Some(h) => Arc::clone(h),
-            None => {
-                let h: Arc<str> = Arc::from(ns);
-                homes.push(Arc::clone(&h));
-                h
-            }
-        };
-        vars.push(VarSlot {
-            ns: home,
-            name: Arc::from(name.as_ref()),
+/// Declare the program's vars in index order: each var's namespace and
+/// name as spans of `names` (one shared text, #271: no allocation per
+/// var) and its Lite native hint.
+pub(crate) fn declare_vars(
+    names: Arc<str>,
+    rows: impl Iterator<Item = ((u32, u32), (u32, u32), u32)>,
+) {
+    let vars = rows
+        .map(|(ns, name, hint)| VarSlot {
+            ns,
+            name,
             hint,
             var: OnceLock::new(),
             core: OnceLock::new(),
-        });
-    }
-    building(|b| b.vars = vars);
+        })
+        .collect();
+    building(|b| {
+        b.names = names;
+        b.vars = vars;
+    });
+}
+
+/// The compiled program can observe var metadata (`rt_n_cap_var_meta`).
+pub(crate) fn declare_lite_var_meta() {
+    building(|b| b.lite_var_meta = true);
 }
 
 /// Register one `BootMode::Lite` core native capability group.
@@ -288,6 +315,7 @@ pub(crate) fn freeze(reg_epoch: Arc<AtomicU64>) {
     });
     let tables: &'static Tables = Box::leak(Box::new(Tables {
         lite,
+        names: b.names,
         vars: b.vars.into_boxed_slice(),
         consts: b.consts.into_boxed_slice(),
         fns: fns.into_boxed_slice(),
@@ -308,17 +336,24 @@ pub(crate) fn constant(k: usize) -> &'static Value {
     &tables().consts[k]
 }
 
+/// The frozen constant table's first slot: the table never moves or
+/// changes after [`freeze`], so `base + k` is constant `k` for the rest
+/// of the run.
+pub(crate) fn consts_base() -> *const Value {
+    tables().consts.as_ptr()
+}
+
 /// Var `k`, interned on first use (in the then-current registry).
 pub(crate) fn var(k: usize) -> &'static Var {
     let t = tables();
     let slot = &t.vars[k];
     slot.var.get_or_init(|| {
+        let (ns, name) = (slot.ns(&t.names), slot.name(&t.names));
         with_active(|eval| {
             if let Some(lite) = &t.lite {
-                let decl = (&*slot.ns, &*slot.name, slot.hint);
-                clj_eval::aot_boot::install_lazy(eval, decl, lite.tables());
+                clj_eval::aot_boot::install_lazy(eval, (ns, name, slot.hint), lite.tables());
             }
-            native_abi::intern_var(eval, &slot.ns, &slot.name)
+            native_abi::intern_var(eval, ns, name)
         })
     })
 }
@@ -451,7 +486,7 @@ pub(crate) fn core_entry(eval: &mut Evaluator, k: usize) -> Option<&'static nati
             // A Lite native called directly needs no var: its entry comes
             // from the tables and its install stays lazy (value uses and
             // `#'f` still install it through `var`).
-            let decl = (&*slot.ns, &*slot.name, slot.hint);
+            let decl = (slot.ns(&t.names), slot.name(&t.names), slot.hint);
             t.lite
                 .as_ref()
                 .and_then(|lite| native_abi::lite_core_entry(decl, lite.tables()))
@@ -624,24 +659,23 @@ pub(crate) fn run_main_lite(
     need_stdin: bool,
 ) -> i32 {
     reset_thread_caches();
-    let (declared, core_caps, owned_caps, lib_caps, seq_helpers) = building(|b| {
+    let (names, declared, core_caps, owned_caps, lib_caps, seq_helpers, var_meta) = building(|b| {
         b.lite = true;
-        let declared: Vec<(Arc<str>, Arc<str>, u32)> = b
-            .vars
-            .iter()
-            .map(|v| (Arc::clone(&v.ns), Arc::clone(&v.name), v.hint))
-            .collect();
+        let declared: Vec<((u32, u32), (u32, u32), u32)> =
+            b.vars.iter().map(|v| (v.ns, v.name, v.hint)).collect();
         (
+            Arc::clone(&b.names),
             declared,
             b.lite_core_caps.clone(),
             b.lite_owned_caps.clone(),
             b.lite_libs.clone(),
             b.lite_seq_helpers,
+            b.lite_var_meta,
         )
     });
     let refs: Vec<(&str, &str)> = declared
         .iter()
-        .map(|(ns, name, _)| (&**ns, &**name))
+        .map(|&(ns, name, _)| (span(&names, ns), span(&names, name)))
         .collect();
     let hints: Vec<u32> = declared.iter().map(|&(_, _, hint)| hint).collect();
     let mut eval = clj_eval::aot_boot::boot_lite_with_caps(
@@ -654,6 +688,7 @@ pub(crate) fn run_main_lite(
             lib_tables: &lib_caps,
         },
         seq_helpers,
+        var_meta,
     );
     let code = clj_eval::aot_boot::run_with_cli_frame(&mut eval, path, args, move |eval| {
         execute_units(eval, init, &tops)
@@ -902,17 +937,24 @@ mod tests {
         let mut eval = clj_eval::boot();
         eval.eval_source("(def plain (fn [x] (* 2 x)))")
             .expect("def");
-        // Index order; the repeated namespace shares its name.
+        // Index order over one names text; the repeated namespace spans
+        // the same text.
         let none = clj_eval::aot_boot::NO_LITE_HINT;
+        let names: Arc<str> = Arc::from("clojure.coreincuserplaindec");
         declare_vars(
+            Arc::clone(&names),
             [
-                ("clojure.core", "inc", none),
-                ("user", "plain", none),
-                ("clojure.core", "dec", none),
+                ((0, 12), (12, 3), none),
+                ((15, 4), (19, 5), none),
+                ((0, 12), (24, 3), none),
             ]
             .into_iter(),
         );
-        building(|b| assert!(Arc::ptr_eq(&b.vars[0].ns, &b.vars[2].ns)));
+        building(|b| {
+            assert_eq!(b.vars[0].ns, b.vars[2].ns);
+            assert_eq!(b.vars[1].name(&b.names), "plain");
+            assert_eq!(span(&b.names, (40, 2)), "");
+        });
         extern "C" fn stub_code(_: *mut Value, _: *const Value, _: usize, _: *const Value) -> i32 {
             0
         }

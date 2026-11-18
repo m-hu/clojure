@@ -136,23 +136,30 @@ fn argv_strings(argv: &CSlice<*const c_char>) -> Vec<String> {
 
 // ---- program tables --------------------------------------------------
 
-/// One declared var as the compiler lays it out: `ns/name` and its
-/// Lite native hint (`clj_eval::aot_boot::lite_native_hint`).
+/// One declared var as generated code describes it: its namespace and
+/// name as byte spans `(at, len)` of the program's names text, and its
+/// Lite native hint.
 #[repr(C)]
-pub struct VarDecl {
-    ns: CSlice<u8>,
-    name: CSlice<u8>,
+pub struct VarRow {
+    ns_at: u32,
+    ns_len: u32,
+    at: u32,
+    len: u32,
     hint: u32,
 }
 
-/// Declare the program's vars, in index order.
+/// Declare the program's vars, in index order: `names` holds each
+/// namespace once and every var name, and each row spans its var's
+/// namespace and name in it (#271: the text is validated and copied
+/// once, with no allocation per var).
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_n_declare_vars(decls: &CSlice<VarDecl>) {
+pub extern "C" fn rt_n_declare_vars(names: &CSlice<u8>, rows: &CSlice<VarRow>) {
+    let text: std::sync::Arc<str> = std::sync::Arc::from(names.as_str().as_ref());
     native::declare_vars(
-        decls
-            .get()
+        text,
+        rows.get()
             .iter()
-            .map(|d| (d.ns.as_str(), d.name.as_str(), d.hint)),
+            .map(|r| ((r.ns_at, r.ns_len), (r.at, r.len), r.hint)),
     );
 }
 
@@ -305,6 +312,55 @@ pub extern "C" fn rt_n_drop(v: &mut Value) {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_n_const(out: &mut Value, k: u64) {
     *out = native::constant(k as usize).clone();
+}
+
+/// A compiled loop's iteration plan for `coll` (#271 Slice 4c): `plan` =
+/// (count, start, step); returns 1 for a persistent vector, 2 for a long
+/// range, and 0 when the loop must take the general call.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_iter_plan(coll: &Value, plan: &mut [i64; 3]) -> u8 {
+    let Some((kind, n, start, step)) = native_abi::iter_plan(coll) else {
+        return 0;
+    };
+    *plan = [n, start, step];
+    kind
+}
+
+/// `out = v[i]` (a persistent vector and an in-range index).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_item(out: &mut Value, v: &Value, i: u64) {
+    *out = native_abi::vec_item(v, i as usize);
+}
+
+/// `out =` a fresh accumulator for a compiled `mapv` / `vec` loop.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_new(out: &mut Value) {
+    *out = native_abi::vec_builder();
+}
+
+/// `out =` accumulator `acc` frozen into a persistent vector.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_done(out: &mut Value, acc: &mut Value) {
+    *out = native_abi::vec_done(acc);
+}
+
+/// Append `v` (taken: left nil) to accumulator `acc`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_push(acc: &mut Value, v: &mut Value) {
+    native_abi::vec_push(acc, std::mem::replace(v, Value::Nil));
+}
+
+/// Unwrap a `reduced` accumulator in place: 1 when it was one.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_unreduce(v: &mut Value) -> u8 {
+    u8::from(native_abi::unreduce(v))
+}
+
+/// The frozen constant table's first slot (#271): generated code borrows
+/// `&consts[k]` in place of cloning constant `k` into a temporary.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_consts_base() -> *const Value {
+    native::consts_base()
 }
 
 /// `out = @var k`.
@@ -484,7 +540,15 @@ pub extern "C" fn rt_n_enter_fn(k: u64, desc: u64) -> u8 {
     })
 }
 
-/// Leave a call entered by [`rt_n_enter_fn`].
+/// Enter a direct call to a stable `defn` (#271): [`rt_n_enter_fn`]'s
+/// call-depth check without its root check (the var holds that fn for
+/// the rest of the run). 1 = call the code, 0 = take the general invoke.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_enter() -> u8 {
+    with_active(|eval| u8::from(native_abi::enter_call(eval)))
+}
+
+/// Leave a call entered by [`rt_n_enter_fn`] or [`rt_n_enter`].
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_n_leave() {
     with_active(native_abi::leave_call);
@@ -552,9 +616,11 @@ fn def_finish_named(
     meta: Option<&CSlice<Value>>,
     (line, col): (u32, u32),
 ) -> i32 {
-    let doc = (doc_k != NONE).then(|| str_const(doc_k));
     let value = value.cloned();
     let step = with_active(|eval| {
+        // A program that keeps no var metadata never reads the doc
+        // (#271: no string built per def).
+        let doc = (doc_k != NONE && native_abi::keeps_var_meta(eval)).then(|| str_const(doc_k));
         let name_meta = match meta {
             Some(kvs) => Some(native_abi::map_pairs(eval, kvs.get())?),
             None => sym.meta().cloned(),
@@ -568,8 +634,8 @@ fn def_finish_named(
 
 /// `out = [items…]` with optional constant metadata `meta_k`.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_n_vec_lit(out: &mut Value, items: &CSlice<Value>, meta_k: u64) {
-    *out = native_abi::vec_lit(items.get().to_vec(), meta_of(meta_k));
+pub extern "C" fn rt_n_vec_lit(out: &mut Value, items: &mut CSlice<Value>, meta_k: u64) {
+    *out = native_abi::vec_lit_owned(items.get_mut(), meta_of(meta_k));
 }
 
 /// `out = {k v …}` (keys and values interleaved).
@@ -682,6 +748,13 @@ pub extern "C" fn rt_n_ns_lite(out: &mut Value, name: &CSlice<u8>) {
     let ns = name.as_str();
     with_active(|eval| clj_eval::aot_boot::ensure_ns_lite(eval, &ns));
     *out = Value::Nil;
+}
+
+/// The compiled Lite program can observe var metadata: its `def`s keep it
+/// (#271; called before `rt_n_main_lite`).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_cap_var_meta() {
+    native::declare_lite_var_meta();
 }
 
 /// Register `BootMode::Lite` I/O capability natives (`println`, `slurp`, …).
@@ -1074,6 +1147,15 @@ pub fn native_symbols() -> Vec<(&'static str, usize)> {
         rt_n_sym,
         rt_n_meta_sym,
         rt_n_coll,
+        rt_n_consts_base,
+        rt_n_enter,
+        rt_n_iter_plan,
+        rt_n_cap_var_meta,
+        rt_n_vec_item,
+        rt_n_vec_new,
+        rt_n_vec_push,
+        rt_n_vec_done,
+        rt_n_unreduce,
         rt_n_regex,
         rt_n_static_field,
         rt_n_class,

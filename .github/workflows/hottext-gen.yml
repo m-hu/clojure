@@ -16,19 +16,19 @@ jobs:
       - name: Install tools
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time gdb
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q time gdb valgrind
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - uses: ./.github/actions/setup-llvm
-      - name: RSS by mapping with the committed order
+      - name: Executed functions per program (Linux, empty stdin)
         run: |
-          set -o pipefail; bash probe/rss-smaps.sh 2>&1 | tee probe-out.txt
+          set -o pipefail; bash probe/linux-fns.sh 2>&1 | tee probe-out.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hot-text-rss
+          name: linux-fns
           path: |
             probe-out.txt
-            /tmp/rss/
+            /tmp/linux-fns.tgz

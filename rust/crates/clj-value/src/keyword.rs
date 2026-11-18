@@ -130,11 +130,15 @@ impl Keyword {
 impl PartialEq for Keyword {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Interned arcs (see [`new`](Keyword::new)): pointer
-        // equality decides first, so map-key scans and `=` over
-        // keywords skip the string compare; the content compare
-        // covers any uninterned pair (#235).
-        self.ptr_eq(other) || (self.0.ns == other.0.ns && self.0.name == other.0.name)
+        // Every keyword is interned ([`new`](Keyword::new) is the only
+        // constructor, and the table keeps each entry for the life of
+        // the process), so pointer equality is exact: map-key scans and
+        // `=` over keywords never compare strings (#235, #271).
+        debug_assert_eq!(
+            self.ptr_eq(other),
+            self.0.ns == other.0.ns && self.0.name == other.0.name
+        );
+        self.ptr_eq(other)
     }
 }
 

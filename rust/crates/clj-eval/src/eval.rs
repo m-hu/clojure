@@ -195,6 +195,15 @@ pub(crate) struct LazyHooks {
     pub(crate) eval_expr: fn(&mut Evaluator, &Expr, &crate::env::Env) -> Result<Value, Signal>,
 }
 
+/// [`Evaluator::core_read`]'s cache: `(name, var id or none, root once
+/// read)` per probed `clojure.core` name, under the lineage epoch it
+/// was filled in.
+#[derive(Default)]
+pub(crate) struct CoreReads {
+    epoch: u64,
+    vars: Vec<(&'static str, Option<u64>, Option<Value>)>,
+}
+
 /// The evaluator: shared lineage state (namespace registry plus
 /// identity counters), per-thread bindings, load path, spawned
 /// future threads, and the ambient native call span. `Send + Sync`
@@ -251,6 +260,10 @@ pub struct Evaluator {
     root_cache: FxHashMap<u64, Value>,
     /// The lineage epoch [`root_cache`](Self::root_cache) was filled under.
     root_epoch: u64,
+    /// [`core_read`](Self::core_read)'s `clojure.core` names → var ids
+    /// and roots (#271: printing reads ~13 settings vars by name per
+    /// call).
+    core_reads: std::sync::Mutex<CoreReads>,
     /// The VM's per-site caches (`vm` numbers its global reads and
     /// direct calls): a value or a validation verdict, valid while
     /// both the lineage epoch and the bindings version match.
@@ -376,6 +389,7 @@ impl Evaluator {
             vm_sites: Vec::new(),
             vm_direct: Vec::new(),
             root_epoch: 0,
+            core_reads: std::sync::Mutex::default(),
             call_depth: 0,
             recur_pool: Vec::new(),
             eager_tier: false,
@@ -435,6 +449,7 @@ impl Evaluator {
             vm_sites: Vec::new(),
             vm_direct: Vec::new(),
             root_epoch: self.registry.epoch(),
+            core_reads: std::sync::Mutex::default(),
             // A fork starts unwound (its stack is its own).
             call_depth: 0,
             // A fork starts with an empty pool (buffers never
@@ -1196,6 +1211,38 @@ impl Evaluator {
     /// [`deref_var`](Self::deref_var) for shared-borrow readers of
     /// boot-installed vars (never lazy `core.clj` ones, so nothing
     /// to force).
+    /// `clojure.core/<name>`'s visible value, unforced, like
+    /// [`deref_var_unforced`](Self::deref_var_unforced) over a by-name
+    /// lookup (`Nil` when no such var). Each name's id (or absence) and
+    /// root are kept while the lineage epoch holds: every root write,
+    /// namespace mutation and new var bumps it, and ids are never
+    /// reused. Names are literals, so most probes match by address.
+    pub(crate) fn core_read(&self, name: &'static str) -> Value {
+        let epoch = self.registry.epoch();
+        let mut reads = self.core_reads.lock().unwrap_or_else(|e| e.into_inner());
+        if reads.epoch != epoch {
+            reads.vars.clear();
+            reads.epoch = epoch;
+        }
+        let found = (reads.vars.iter()).position(|(n, _, _)| std::ptr::eq(*n, name) || *n == name);
+        let slot = found.unwrap_or_else(|| {
+            let id = self.registry.lookup_str("clojure.core", name);
+            reads.vars.push((name, id, None));
+            reads.vars.len() - 1
+        });
+        let (_, id, root) = &mut reads.vars[slot];
+        let Some(id) = id else {
+            return Value::Nil;
+        };
+        if let Some(v) = self.bindings.get(*id) {
+            return v.clone();
+        }
+        root.get_or_insert_with(|| {
+            (self.registry).root_or_unbound(*id, &Symbol::new(Some("clojure.core"), name))
+        })
+        .clone()
+    }
+
     pub(crate) fn deref_var_unforced(&self, id: u64, sym: &Symbol) -> Value {
         if let Some(v) = self.bindings.get(id) {
             return v.clone();
@@ -1603,6 +1650,20 @@ impl Evaluator {
     /// analyzer heads and VM-internal bindings reach here;
     /// analyzer-captured paths (`Global`/`VarRef`/`Set`/`Binding`/
     /// `WithRedefs`) carry their ids and never re-resolve (#79).
+    /// A `with-out-str`/`with-in-str` stream var (`*out*`, `*in*`): the
+    /// name as the current namespace maps it, so a user shadow wins
+    /// like a `binding` target, else `clojure.core`'s. Under `run`,
+    /// `user` refers `clojure.core`. A compiled (Lite) program refers
+    /// nothing, and the miss would intern a fresh, non-dynamic var
+    /// (#271).
+    fn stream_var_id(&mut self, sym: &Symbol) -> u64 {
+        let unmapped = sym.namespace().is_none() && self.registry.lookup(sym).is_none();
+        unmapped
+            .then(|| (self.registry).lookup(&Symbol::new(Some("clojure.core"), sym.name())))
+            .flatten()
+            .unwrap_or_else(|| self.var_id(sym))
+    }
+
     pub(crate) fn var_id(&mut self, sym: &Symbol) -> u64 {
         self.registry
             .lookup(sym)
@@ -1851,7 +1912,7 @@ impl Evaluator {
     ) -> Result<Value, Signal> {
         let writer = crate::io::string_writer(self);
         let var = Var {
-            id: self.var_id(out),
+            id: self.stream_var_id(out),
             sym: out.clone(),
         };
         crate::native_abi::binding_call_with(self, vec![(var, writer.clone())], body)?;
@@ -1886,7 +1947,7 @@ impl Evaluator {
         };
         let reader = crate::reader::string_reader(self, text);
         let var = Var {
-            id: self.var_id(input),
+            id: self.stream_var_id(input),
             sym: input.clone(),
         };
         crate::native_abi::binding_call_with(self, vec![(var, reader)], body)
