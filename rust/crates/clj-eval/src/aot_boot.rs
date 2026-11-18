@@ -506,7 +506,15 @@ pub fn boot_lite(vars: &[(&str, &str)], need_stdin: bool) -> Evaluator {
         owned_groups: &[LITE_OWNED_CORE, LITE_OWNED_SEQ, LITE_OWNED_STRING],
         lib_tables: &[("clojure.string", LITE_CAP_STRING)],
     };
-    boot_lite_impl(vars, &[], need_stdin, tables, true, true)
+    boot_lite_impl(
+        vars,
+        &[],
+        need_stdin,
+        tables,
+        true,
+        true,
+        needs_var_meta(vars, true),
+    )
 }
 
 /// The capability tables a Lite boot installs natives from (the ones
@@ -532,8 +540,17 @@ pub fn boot_lite_with_caps(
     need_stdin: bool,
     tables: LiteTables,
     seq_helpers: bool,
+    var_meta: bool,
 ) -> Evaluator {
-    boot_lite_impl(vars, hints, need_stdin, tables, seq_helpers, false)
+    boot_lite_impl(
+        vars,
+        hints,
+        need_stdin,
+        tables,
+        seq_helpers,
+        false,
+        var_meta,
+    )
 }
 
 fn has_core_ref(vars: &[(&str, &str)], name: &str) -> bool {
@@ -573,25 +590,23 @@ fn needs_stdout_dynamics(vars: &[(&str, &str)]) -> bool {
 
 /// Whether a Lite program can observe var metadata (it references a
 /// reader of it). When it cannot, `def`s keep no metadata at all, and
-/// the compiler drops [`LITE_INERT_DEF_META`] from `def` names.
+/// the compiler drops [`LITE_INERT_DEF_META`] from `def` names. The
+/// by-name readers (`doc`, `macro?`, the var-resolving fns) find the var
+/// themselves; the value readers (`meta`, `vary-meta`, `alter-meta!`,
+/// `reset-meta!`) see a var's metadata only when the program can hold a
+/// var object (`var_objects`: a `#'v` outside `defn`'s own inert forms),
+/// so `(meta coll)` alone keeps none (#271: `clojure.set`'s `select` and
+/// `rename` read their relation's metadata).
 #[must_use]
-pub fn needs_var_meta(vars: &[(&str, &str)]) -> bool {
+pub fn needs_var_meta(vars: &[(&str, &str)], var_objects: bool) -> bool {
     vars.iter().any(|&(ns, name)| {
         ns == "clojure.core"
-            && matches!(
-                name,
-                "meta"
-                    | "doc"
-                    | "alter-meta!"
-                    | "reset-meta!"
-                    | "vary-meta"
-                    | "macro?"
-                    | "resolve"
-                    | "ns-resolve"
-                    | "ns-publics"
-                    | "ns-interns"
-                    | "ns-refers"
-            )
+            && match name {
+                "meta" | "alter-meta!" | "reset-meta!" | "vary-meta" => var_objects,
+                "doc" | "macro?" | "resolve" | "ns-resolve" | "ns-publics" | "ns-interns"
+                | "ns-refers" => true,
+                _ => false,
+            }
     })
 }
 
@@ -686,10 +701,11 @@ fn boot_lite_impl(
     tables: LiteTables,
     seq_helpers: bool,
     all_dynamics: bool,
+    var_meta: bool,
 ) -> Evaluator {
     let mut eval = Evaluator::new_bare("user");
     eval.print_defaults_only = true;
-    eval.skip_var_meta = !all_dynamics && !needs_var_meta(vars);
+    eval.skip_var_meta = !all_dynamics && !var_meta;
     eval.registry.set_bare_vars(eval.skip_var_meta);
     eval.registry.ensure_ns("clojure.core");
     let user_id = eval.registry.ensure_ns("user");
@@ -936,13 +952,27 @@ mod tests {
     }
 
     #[test]
+    fn value_readers_see_var_meta_only_given_a_var() {
+        let core = |name| ("clojure.core", name);
+        for name in ["meta", "vary-meta", "alter-meta!", "reset-meta!"] {
+            assert!(!needs_var_meta(&[core(name)], false), "{name}");
+            assert!(needs_var_meta(&[core(name)], true), "{name}");
+        }
+        for name in ["doc", "macro?", "resolve", "ns-publics"] {
+            assert!(needs_var_meta(&[core(name)], false), "{name}");
+        }
+        assert!(!needs_var_meta(&[core("map"), ("user", "meta")], true));
+    }
+
+    #[test]
     fn lazy_installs_skip_installed_foreign_and_unknown_names() {
         let tables = LiteTables {
             core_groups: &[LITE_CORE_CORE],
             owned_groups: &[],
             lib_tables: &[("clojure.string", LITE_CAP_STRING)],
         };
-        let mut eval = boot_lite_with_caps(&[("clojure.core", "inc")], &[], false, tables, false);
+        let mut eval =
+            boot_lite_with_caps(&[("clojure.core", "inc")], &[], false, tables, false, false);
         assert!(core_var(&eval, "inc").is_none(), "installed on first use");
         install_lazy(&mut eval, ("clojure.core", "inc", NO_LITE_HINT), tables);
         let id = core_var(&eval, "inc").expect("installed");
@@ -984,7 +1014,14 @@ mod tests {
         // Hinted and scanned (no hints) boots install the same entries;
         // `conj` is declared and an internal helper (installed once).
         for hints in [&hints[..], &[]] {
-            let mut eval = boot_lite_with_caps(&vars, hints, true, tables, true);
+            let mut eval = boot_lite_with_caps(
+                &vars,
+                hints,
+                true,
+                tables,
+                true,
+                needs_var_meta(&vars, true),
+            );
             // Boot installs the by-name `assoc` and the helpers; `inc`
             // and `join` wait for first use.
             assert!(core_var(&eval, "inc").is_none());
@@ -1018,7 +1055,14 @@ mod tests {
             owned_groups: &[],
             lib_tables: &[("clojure.string", LITE_CAP_STRING)],
         };
-        let mut eval = boot_lite_with_caps(&vars, &hints, false, tables, false);
+        let mut eval = boot_lite_with_caps(
+            &vars,
+            &hints,
+            false,
+            tables,
+            false,
+            needs_var_meta(&vars, true),
+        );
         resolve_all(&mut eval, &vars, &hints, tables);
         assert!(core_var(&eval, "inc").is_some());
         assert!(core_var(&eval, "dec").is_some());
@@ -1323,7 +1367,14 @@ mod tests {
             owned_groups: &[],
             lib_tables: &[],
         };
-        let mut io_only = boot_lite_with_caps(&io_vars, &[], false, io_tables, false);
+        let mut io_only = boot_lite_with_caps(
+            &io_vars,
+            &[],
+            false,
+            io_tables,
+            false,
+            needs_var_meta(&io_vars, true),
+        );
         resolve_all(&mut io_only, &io_vars, &[], io_tables);
         assert!(core_var(&io_only, "println").is_some());
         assert!(core_var(&io_only, "conj").is_none());
@@ -1338,7 +1389,14 @@ mod tests {
             owned_groups: &[],
             lib_tables: &[("clojure.string", LITE_CAP_STRING)],
         };
-        let mut quiet = boot_lite_with_caps(&quiet_vars, &[], false, quiet_tables, false);
+        let mut quiet = boot_lite_with_caps(
+            &quiet_vars,
+            &[],
+            false,
+            quiet_tables,
+            false,
+            needs_var_meta(&quiet_vars, true),
+        );
         resolve_all(&mut quiet, &quiet_vars, &[], quiet_tables);
         assert!(core_var(&quiet, "inc").is_some());
         assert!(core_var(&quiet, "*out*").is_none());

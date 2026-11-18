@@ -325,10 +325,16 @@ pub extern "C" fn rt_n_vec_item(out: &mut Value, v: &Value, i: u64) {
     *out = native_abi::vec_item(v, i as usize);
 }
 
-/// `out = []`: a compiled `mapv` / `vec` loop's accumulator.
+/// `out =` a fresh accumulator for a compiled `mapv` / `vec` loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_n_vec_new(out: &mut Value) {
-    *out = Value::Vector(clj_value::Vector::from_vec(Vec::new()));
+    *out = native_abi::vec_builder();
+}
+
+/// `out =` accumulator `acc` frozen into a persistent vector.
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_vec_done(out: &mut Value, acc: &mut Value) {
+    *out = native_abi::vec_done(acc);
 }
 
 /// Append `v` (taken: left nil) to accumulator `acc`.
@@ -619,8 +625,8 @@ fn def_finish_named(
 
 /// `out = [items…]` with optional constant metadata `meta_k`.
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_n_vec_lit(out: &mut Value, items: &CSlice<Value>, meta_k: u64) {
-    *out = native_abi::vec_lit(items.get().to_vec(), meta_of(meta_k));
+pub extern "C" fn rt_n_vec_lit(out: &mut Value, items: &mut CSlice<Value>, meta_k: u64) {
+    *out = native_abi::vec_lit_owned(items.get_mut(), meta_of(meta_k));
 }
 
 /// `out = {k v …}` (keys and values interleaved).
@@ -733,6 +739,13 @@ pub extern "C" fn rt_n_ns_lite(out: &mut Value, name: &CSlice<u8>) {
     let ns = name.as_str();
     with_active(|eval| clj_eval::aot_boot::ensure_ns_lite(eval, &ns));
     *out = Value::Nil;
+}
+
+/// The compiled Lite program can observe var metadata: its `def`s keep it
+/// (#271; called before `rt_n_main_lite`).
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_n_cap_var_meta() {
+    native::declare_lite_var_meta();
 }
 
 /// Register `BootMode::Lite` I/O capability natives (`println`, `slurp`, …).
@@ -1128,9 +1141,11 @@ pub fn native_symbols() -> Vec<(&'static str, usize)> {
         rt_n_consts_base,
         rt_n_enter,
         rt_n_iter_plan,
+        rt_n_cap_var_meta,
         rt_n_vec_item,
         rt_n_vec_new,
         rt_n_vec_push,
+        rt_n_vec_done,
         rt_n_unreduce,
         rt_n_regex,
         rt_n_static_field,

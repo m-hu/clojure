@@ -1156,6 +1156,7 @@ fn native_emit_ir_caches_stable_var_roots_271() {
 (println (into [] (map (fn [x] x) v)) (reduce (fn [a x] (+ a x)) 0 v))
 (println (reduce (fn [a x] a) 0 '(1)) (mapv (fn [x & r] x) v) (into [1] (map (fn [x] x) v)))
 (println (mapv (fn self [x] (if (pos? x) (self (dec x)) x)) v) (mapv (fn [[a]] a) [[1]]))
+(println (mapv (fn ([x] x) ([x y] y)) v))
 (println (map (fn [x] x) v) (dorun (map inc v)) (mapv (fn [x] (recur (dec x))) []))
 ",
         "loops.ll",
@@ -1168,6 +1169,22 @@ fn native_emit_ir_caches_stable_var_roots_271() {
     ] {
         assert!(text.contains(needle), "missing {needle}:\n{text}");
     }
+    // Var metadata (#271): `(meta coll)` alone (clojure.set's `select`)
+    // and constant attr-map writes (`{:added …, :tag …}`) keep none; a
+    // `#'v` with a value reader keeps it.
+    let set_only = emit(
+        "(ns user (:require [clojure.set :as set]))\n(println (set/union #{1} #{2}) (meta (with-meta [1] {:a 1})))\n",
+        "meta-off.ll",
+    );
+    assert!(
+        !set_only.contains("call void @rt_n_cap_var_meta"),
+        "{set_only}"
+    );
+    let reads = emit(
+        "(defn f {:added \"1\"} [^String x] x)\n(println (:added (meta #'f)) (f 1))\n",
+        "meta-on.ll",
+    );
+    assert!(reads.contains("call void @rt_n_cap_var_meta"), "{reads}");
     // Any var-rooting call anywhere disables the caches.
     let text = emit(
         "(def a [1]) (defn f [] (nth a 0)) (alter-var-root #'a conj 2) (println (f))",

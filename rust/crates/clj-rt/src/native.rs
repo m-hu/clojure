@@ -88,6 +88,9 @@ struct Building {
     lite_owned_caps: Vec<clj_eval::aot_boot::LiteOwnedSlice>,
     lite_libs: Vec<(&'static str, &'static [clj_eval::aot_boot::LiteNativeSlice])>,
     lite_seq_helpers: bool,
+    /// Set by `rt_n_cap_var_meta`: the compiled program can observe var
+    /// metadata, so `def`s keep it (#271).
+    lite_var_meta: bool,
     /// Set by a Lite run: freezing keeps the tables above as a [`LiteSet`].
     lite: bool,
 }
@@ -222,6 +225,11 @@ pub(crate) fn declare_vars<S: AsRef<str>>(decls: impl ExactSizeIterator<Item = (
         });
     }
     building(|b| b.vars = vars);
+}
+
+/// The compiled program can observe var metadata (`rt_n_cap_var_meta`).
+pub(crate) fn declare_lite_var_meta() {
+    building(|b| b.lite_var_meta = true);
 }
 
 /// Register one `BootMode::Lite` core native capability group.
@@ -631,7 +639,7 @@ pub(crate) fn run_main_lite(
     need_stdin: bool,
 ) -> i32 {
     reset_thread_caches();
-    let (declared, core_caps, owned_caps, lib_caps, seq_helpers) = building(|b| {
+    let (declared, core_caps, owned_caps, lib_caps, seq_helpers, var_meta) = building(|b| {
         b.lite = true;
         let declared: Vec<(Arc<str>, Arc<str>, u32)> = b
             .vars
@@ -644,6 +652,7 @@ pub(crate) fn run_main_lite(
             b.lite_owned_caps.clone(),
             b.lite_libs.clone(),
             b.lite_seq_helpers,
+            b.lite_var_meta,
         )
     });
     let refs: Vec<(&str, &str)> = declared
@@ -661,6 +670,7 @@ pub(crate) fn run_main_lite(
             lib_tables: &lib_caps,
         },
         seq_helpers,
+        var_meta,
     );
     let code = clj_eval::aot_boot::run_with_cli_frame(&mut eval, path, args, move |eval| {
         execute_units(eval, init, &tops)
