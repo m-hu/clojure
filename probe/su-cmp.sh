@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Probe (throwaway, #271): exact Linux startup (callgrind, empty stdin)
-# of the baseline b4a57992 vs this tree, per script.
+# of the baseline f469938a vs this tree, per script.
 set -euo pipefail
 root=$(pwd)
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q valgrind > /dev/null
 build() { (cd "$1/rust" && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib) > /tmp/build-$2.log 2>&1; }
-git fetch -q --depth 50 origin b4a57992 2>/dev/null || git fetch -q origin
-git worktree add -q /tmp/base b4a57992
+git fetch -q --depth 50 origin f469938a 2>/dev/null || git fetch -q origin
+git worktree add -q /tmp/base f469938a
 build /tmp/base base
 build "$root" new
 mkdir -p /tmp/su

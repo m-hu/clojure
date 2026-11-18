@@ -93,6 +93,12 @@ impl Drop for DirLock {
 fn acquire_lock(lock_dir: &std::path::Path) -> DirLock {
     let stale = std::time::Duration::from_secs(600);
     let wait = std::time::Duration::from_millis(25);
+    // Windows refuses to create a directory whose previous instance is
+    // still pending deletion ("Access is denied", os error 5): a lock
+    // just released by another test process. That is a held lock, not a
+    // failure; a denial lasting this long is a real permission problem.
+    let denied_limit = std::time::Duration::from_secs(120);
+    let mut denied_since = None;
     loop {
         match std::fs::create_dir(lock_dir) {
             Ok(()) => return DirLock(lock_dir.to_path_buf()),
@@ -104,6 +110,15 @@ fn acquire_lock(lock_dir: &std::path::Path) -> DirLock {
                     let _ = std::fs::remove_dir(lock_dir);
                     continue;
                 }
+                std::thread::sleep(wait);
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    && denied_since
+                        .get_or_insert_with(std::time::Instant::now)
+                        .elapsed()
+                        < denied_limit =>
+            {
                 std::thread::sleep(wait);
             }
             Err(err) => panic!("create lock {}: {err}", lock_dir.display()),

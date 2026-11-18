@@ -136,23 +136,30 @@ fn argv_strings(argv: &CSlice<*const c_char>) -> Vec<String> {
 
 // ---- program tables --------------------------------------------------
 
-/// One declared var as the compiler lays it out: `ns/name` and its
-/// Lite native hint (`clj_eval::aot_boot::lite_native_hint`).
+/// One declared var as generated code describes it: its namespace and
+/// name as byte spans `(at, len)` of the program's names text, and its
+/// Lite native hint.
 #[repr(C)]
-pub struct VarDecl {
-    ns: CSlice<u8>,
-    name: CSlice<u8>,
+pub struct VarRow {
+    ns_at: u32,
+    ns_len: u32,
+    at: u32,
+    len: u32,
     hint: u32,
 }
 
-/// Declare the program's vars, in index order.
+/// Declare the program's vars, in index order: `names` holds each
+/// namespace once and every var name, and each row spans its var's
+/// namespace and name in it (#271: the text is validated and copied
+/// once, with no allocation per var).
 #[unsafe(no_mangle)]
-pub extern "C" fn rt_n_declare_vars(decls: &CSlice<VarDecl>) {
+pub extern "C" fn rt_n_declare_vars(names: &CSlice<u8>, rows: &CSlice<VarRow>) {
+    let text: std::sync::Arc<str> = std::sync::Arc::from(names.as_str().as_ref());
     native::declare_vars(
-        decls
-            .get()
+        text,
+        rows.get()
             .iter()
-            .map(|d| (d.ns.as_str(), d.name.as_str(), d.hint)),
+            .map(|r| ((r.ns_at, r.ns_len), (r.at, r.len), r.hint)),
     );
 }
 
@@ -609,9 +616,11 @@ fn def_finish_named(
     meta: Option<&CSlice<Value>>,
     (line, col): (u32, u32),
 ) -> i32 {
-    let doc = (doc_k != NONE).then(|| str_const(doc_k));
     let value = value.cloned();
     let step = with_active(|eval| {
+        // A program that keeps no var metadata never reads the doc
+        // (#271: no string built per def).
+        let doc = (doc_k != NONE && native_abi::keeps_var_meta(eval)).then(|| str_const(doc_k));
         let name_meta = match meta {
             Some(kvs) => Some(native_abi::map_pairs(eval, kvs.get())?),
             None => sym.meta().cloned(),

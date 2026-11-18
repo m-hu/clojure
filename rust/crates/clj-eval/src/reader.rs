@@ -120,139 +120,35 @@ fn utf8_io_err() -> NativeError {
     )
 }
 
-/// Push a validated UTF-8 piece into `out`, normalizing `\r\n` / `\r` to `\n`
-/// across chunk boundaries (`prev_cr` tracks a trailing `\r` from the prior piece).
-fn push_normalized_piece(out: &mut String, piece: &str, prev_cr: &mut bool) {
-    let s = if std::mem::take(prev_cr) {
-        piece.strip_prefix('\n').unwrap_or(piece)
-    } else {
-        piece
-    };
-    if !s.contains('\r') {
-        out.push_str(s);
-        return;
+/// Append `s` onto `out` with `\r\n` and a lone `\r` normalized to `\n`.
+fn push_normalized(out: &mut String, s: &str) {
+    let mut rest = s;
+    while let Some(i) = rest.find('\r') {
+        out.push_str(&rest[..i]);
+        out.push('\n');
+        rest = &rest[i + 1..];
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
     }
-    let bytes = s.as_bytes();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\r' {
-            out.push_str(&s[start..i]);
-            out.push('\n');
-            if i + 1 < bytes.len() {
-                start = if bytes[i + 1] == b'\n' { i + 2 } else { i + 1 };
-                i = start;
-                continue;
-            }
-            *prev_cr = true;
-            return;
-        }
-        i += 1;
-    }
-    out.push_str(&s[start..]);
+    out.push_str(rest);
 }
 
-/// Read `src` into bounded chunks (`8 KB` -> `64 KB` -> `256 KB`) so large
-/// `(slurp *in*)` inputs never trigger multi-MB `Vec` doubling `realloc`s.
-fn read_slurp_chunks(src: &mut dyn Read) -> Result<(Vec<Vec<u8>>, usize), NativeError> {
-    let mut chunks = Vec::new();
-    let mut total = 0usize;
-    let mut cap = 8 * 1024usize;
-    loop {
-        let mut buf = vec![0u8; cap];
-        let mut pos = 0usize;
-        while pos < buf.len() {
-            match src.read(&mut buf[pos..]) {
-                Ok(0) => {
-                    buf.truncate(pos);
-                    total += pos;
-                    if pos > 0 {
-                        chunks.push(buf);
-                    }
-                    return Ok((chunks, total));
-                }
-                Ok(n) => pos += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(NativeError::new(ThrowClass::IOException, e.to_string())),
-            }
-        }
-        total += pos;
-        chunks.push(buf);
-        cap = (cap * 4).min(256 * 1024);
-    }
-}
-
-/// Complete a partial leading multi-byte UTF-8 sequence carried in `tail`,
-/// returning the unconsumed tail of `chunk`.
-fn flush_utf8_tail<'a>(
-    tail: &mut [u8; 4],
-    tail_len: &mut usize,
-    chunk: &'a [u8],
-    emit: &mut dyn FnMut(&str),
-) -> Result<&'a [u8], NativeError> {
-    let mut rest = chunk;
-    while *tail_len > 0 && !rest.is_empty() {
-        tail[*tail_len] = rest[0];
-        *tail_len += 1;
-        rest = &rest[1..];
-        match std::str::from_utf8(&tail[..*tail_len]) {
-            Ok(s) => {
-                emit(s);
-                *tail_len = 0;
-            }
-            Err(e) if e.error_len().is_some() => return Err(utf8_io_err()),
-            Err(_) => {}
-        }
-    }
-    Ok(rest)
-}
-
-/// Append one UTF-8 chunk onto `out`, resolving any incomplete multi-byte
-/// sequence from the prior chunk and normalizing `\r\n` / `\r` to `\n`.
-fn append_utf8_chunk(
-    out: &mut String,
-    chunk: &[u8],
-    tail: &mut [u8; 4],
-    tail_len: &mut usize,
-    prev_cr: &mut bool,
-) -> Result<(), NativeError> {
-    let mut emit = |s: &str| push_normalized_piece(out, s, prev_cr);
-    let rest = flush_utf8_tail(tail, tail_len, chunk, &mut emit)?;
-    match std::str::from_utf8(rest) {
-        Ok(s) => emit(s),
-        Err(e) if e.error_len().is_some() => return Err(utf8_io_err()),
-        Err(e) => {
-            let (head, rem) = rest.split_at(e.valid_up_to());
-            emit(std::str::from_utf8(head).expect("valid utf8 prefix"));
-            tail[..rem.len()].copy_from_slice(rem);
-            *tail_len = rem.len();
-        }
-    }
-    Ok(())
-}
-
-/// Drain the live stdin reader into `out` via chunked reads + single-pass UTF-8
-/// validation, avoiding `Vec` doubling reallocations and `shrink_to_fit` copies.
+/// Drain the live stdin reader into `out`: one buffer grown as the input
+/// arrives and never zero-filled, validated once. Most inputs are tens
+/// of bytes, and the previous zeroed 8 KiB first chunk cost ~8K
+/// instructions per program (#271). std's `read_to_end` probes small
+/// inputs on the stack, retries interrupted reads, and grows large
+/// buffers by `realloc`.
 fn slurp_buf_reader(src: &mut dyn Read, out: &mut String) -> Result<(), NativeError> {
-    let (mut chunks, total) = read_slurp_chunks(src)?;
-    if total == 0 {
+    let mut buf = Vec::new();
+    src.read_to_end(&mut buf)
+        .map_err(|e| NativeError::new(ThrowClass::IOException, e.to_string()))?;
+    if out.is_empty() && !buf.contains(&b'\r') {
+        *out = String::from_utf8(buf).map_err(|_| utf8_io_err())?;
         return Ok(());
     }
-    if chunks.len() == 1 && out.is_empty() && !chunks[0].contains(&b'\r') {
-        let single = chunks.pop().expect("len == 1");
-        *out = String::from_utf8(single).map_err(|_| utf8_io_err())?;
-        return Ok(());
-    }
-    out.reserve_exact(total);
-    let mut tail = [0u8; 4];
-    let mut tail_len = 0usize;
-    let mut prev_cr = false;
-    for chunk in chunks {
-        append_utf8_chunk(out, &chunk, &mut tail, &mut tail_len, &mut prev_cr)?;
-    }
-    if tail_len != 0 {
-        return Err(utf8_io_err());
-    }
+    let text = std::str::from_utf8(&buf).map_err(|_| utf8_io_err())?;
+    out.reserve_exact(text.len());
+    push_normalized(out, text);
     Ok(())
 }
 
@@ -274,8 +170,10 @@ pub(crate) fn slurp_reader(r: &StreamReader) -> Result<String, NativeError> {
         if let Some(src) = state.stdin.as_mut() {
             slurp_buf_reader(src, &mut out)?;
         }
+        // Closed like `.close`; the parser was just drained, so it
+        // stays (a fresh one costs ~3K instructions to build, #271).
+        state.closed = true;
     }
-    close_stream_reader(r)?;
     Ok(out)
 }
 
@@ -1589,8 +1487,9 @@ mod tests {
         slurp_buf_reader(&mut Cursor::new(b"".as_slice()), &mut empty).unwrap();
         assert_eq!(empty, "");
 
-        // Multi-chunk (`> 8 KB`) with split multi-byte UTF-8, split CRLF (`\r` | `\n`),
-        // trailing `\r` at EOF, `Interrupted`, and IO error / malformed UTF-8 coverage.
+        // Inputs past the old 8 KiB first-chunk edge (one buffer now): a
+        // multi-byte char and a CRLF across that edge, a trailing `\r` at
+        // EOF, `Interrupted`, and IO error / malformed UTF-8 coverage.
         let mut big = vec![b'x'; 8 * 1024 - 1];
         big.extend_from_slice("\r\n€".as_bytes()); // `\r` ends chunk 1, `\n€` starts chunk 2
         let mut big2 = vec![b'y'; 8 * 1024 - 1];
@@ -1615,7 +1514,7 @@ mod tests {
         slurp_buf_reader(&mut Cursor::new(big2), &mut multi2).unwrap();
         assert!(multi2.ends_with("€\n"));
 
-        // Truncated UTF-8 at EOF across boundary & corrupt tail/mid-chunk UTF-8 & read error.
+        // Truncated UTF-8 at EOF, corrupt UTF-8 at and past the old edge, and a read error.
         let mut trunc = vec![b'a'; 8 * 1024 - 1];
         trunc.push(0xE2); // 1st byte of 3-byte char at EOF
         assert_eq!(

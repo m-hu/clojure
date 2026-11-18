@@ -738,7 +738,7 @@ fn boot_lite_impl(
         let err = crate::io::stderr_writer(&mut eval);
         install_core_dynamic(&mut eval, "*err*", err, false);
     }
-    if need_all || need_stdin {
+    if need_all || need_stdin || has_core_ref(vars, "*in*") {
         let stdin = if need_stdin {
             crate::reader::stdin_reader(&mut eval)
         } else {

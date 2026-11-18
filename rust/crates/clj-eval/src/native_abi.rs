@@ -39,8 +39,8 @@ pub fn invoke(eval: &mut Evaluator, f: &Value, args: &[Value]) -> Step {
 
 /// The runtime var for a fully qualified symbol (interned like the
 /// analyzer does when it resolves a def target or a global).
-pub fn intern_var(eval: &mut Evaluator, ns: &Arc<str>, name: &Arc<str>) -> Var {
-    let sym = Symbol::from_shared(Some(Arc::clone(ns)), Arc::clone(name));
+pub fn intern_var(eval: &mut Evaluator, ns: &str, name: &str) -> Var {
+    let sym = Symbol::new(Some(ns), name);
     let id = eval.registry.intern(&sym);
     Var { id, sym }
 }
@@ -49,6 +49,13 @@ pub fn intern_var(eval: &mut Evaluator, ns: &Arc<str>, name: &Arc<str>) -> Var {
 /// deref like the interpreter does).
 pub fn deref(eval: &mut Evaluator, var: &Var) -> Value {
     eval.deref_var_cached(var.id, &var.sym)
+}
+
+/// Whether `def`s keep var metadata (doc, auto keys): a Lite program
+/// that cannot read var metadata keeps only the name's own keys.
+#[must_use]
+pub fn keeps_var_meta(eval: &Evaluator) -> bool {
+    !eval.skip_var_meta
 }
 
 /// `(def sym …)` first half: the target var's id, before the init
