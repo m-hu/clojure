@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Probe (throwaway, #271): resident memory at exit (gdb at exit_group,
 # /proc/PID/smaps) on empty stdin, with the committed hot-text order (A)
-# and with probe/hot-text-new.ld (B), over the same programs.
+# and with three alternative orders, over the same programs.
 set -euo pipefail
 root=$(pwd)
 mkdir -p /tmp/rss /tmp/bin
@@ -24,6 +24,10 @@ phase() {  # tag
     run_one "$1" "$n" "/tmp/bin/$n.$1"
   done < probe/rss-ab-scripts.txt
 }
-phase A
-cp probe/hot-text-new.ld rust/hot-text-aot.ld
-phase B
+# A: the committed order; B: no order; C: an order trained only on the
+# independent workloads; D: the order trained on the snippets.
+cp rust/hot-text-aot.ld /tmp/order-A.ld
+for tag in A B C D; do
+  [ "$tag" = A ] || cp "probe/order-$tag.ld" rust/hot-text-aot.ld
+  phase "$tag"
+done
