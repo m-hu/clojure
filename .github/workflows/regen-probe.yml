@@ -1,0 +1,38 @@
+name: regen-probe
+on:
+  push:
+    branches: [probe/regen-271]
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: rev
+      - uses: actions/checkout@v5
+        with:
+          repository: hhh-pa/clojure-code-snippet
+          path: snippets
+      - name: Install valgrind
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q valgrind
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rev/rust
+      - uses: ./rev/.github/actions/setup-llvm
+      - name: Regenerate (no resources on the fork: empty stdin)
+        run: |
+          set -o pipefail
+          time bash rev/scripts/bench/hot-text/regen-aot.sh rev/rust snippets "$RUNNER_TEMP/hot-text-aot.ld" 2>&1 | tee regen.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regen
+          path: |
+            regen.log
+            ${{ runner.temp }}/hot-text-aot.ld
