@@ -25,7 +25,7 @@ jobs:
         with:
           workspaces: rev/rust
       - uses: ./rev/.github/actions/setup-llvm
-      - name: Regenerate (no resources on the fork: empty stdin)
+      - name: "Regenerate (no resources on the fork, so empty stdin)"
         run: |
           set -o pipefail
           time bash rev/scripts/bench/hot-text/regen-aot.sh rev/rust snippets "$RUNNER_TEMP/hot-text-aot.ld" 2>&1 | tee regen.log
