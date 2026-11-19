@@ -1,0 +1,24 @@
+name: rss-hold2
+on:
+  push:
+    branches: [probe/rss-hold2-271]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-llvm
+      - name: Probe
+        run: set -o pipefail; bash probe/rss-hold2.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rss-hold2
+          path: |
+            probe-out.txt
+            /tmp/hold2/rss.txt
+            /tmp/hold2/*.ld
