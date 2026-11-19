@@ -1,0 +1,28 @@
+name: pages
+on:
+  push:
+    branches: [probe/pages-271]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: hhh-pa/clojure-code-snippet
+          path: snip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: ./.github/actions/setup-llvm
+      - name: Probe
+        run: set -o pipefail; bash probe/pages.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pages
+          path: |
+            probe-out.txt
+            /tmp/pages.tgz
