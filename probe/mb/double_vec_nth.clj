@@ -1,0 +1,8 @@
+(def v (vec (range 1000)))
+(def m100 (zipmap (range 100) (range 100)))
+(def rec {:a 1 :b 2 :c 3})
+(def mk (zipmap (map #(keyword (str "k" %)) (range 40)) (range 40)))
+(def mv (zipmap (for [a (range 10) b (range 10)] [a b]) (range 100)))
+(def dv (vec (map #(* 1.5 %) (range 100))))
+(defn work [n] (long (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (* 1.5 (nth dv (rem i 100))))) s))))
+(println (work (Long/parseLong (clojure.string/trim (slurp *in*)))))
