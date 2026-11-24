@@ -1,0 +1,35 @@
+name: init-profile
+on:
+  push:
+    branches: [probe/init2-271]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: hhh-pa/clojure-code-snippet
+          path: snip
+      - name: Install tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q valgrind
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: ./.github/actions/setup-llvm
+      - name: Profile
+        run: |
+          set -o pipefail; bash probe/fixed-cg.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: init-profile-271
+          path: |
+            probe-out.txt
+            /tmp/prof/
+            /tmp/rss/
+            /tmp/mb/summary.txt
