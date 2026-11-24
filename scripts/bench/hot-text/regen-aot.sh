@@ -82,7 +82,14 @@ done
 echo "   $(ls "$work"/cg/corpus-*.cg 2> /dev/null | wc -l) corpus profiles"
 
 echo "== order"
-python3 "$here/hot_text.py" "$work/prog" "$work/new.ld" "$work"/cg/*.cg
+# The C runtime links statically without function sections: list the
+# archive members the profiles ran (hot_text.py --archive).
+archives=()
+for lib in libc.a libm.a libgcc.a; do
+  path=$(cc -print-file-name="$lib")
+  [ -f "$path" ] && archives+=(--archive "$path")
+done
+python3 "$here/hot_text.py" "${archives[@]}" "$work/prog" "$work/new.ld" "$work"/cg/*.cg
 # Restore the revision's order, then write OUT (which may be that
 # order itself), and drop the restoring trap.
 cp "$work/previous.ld" "$order"
