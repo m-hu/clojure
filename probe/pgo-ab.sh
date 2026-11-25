@@ -13,6 +13,23 @@ bash scripts/bench/hot-text/regen-aot.sh rust > $out/regen.log 2>&1 || { tail -2
 (cd rust && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/build.log 2>&1 || { tail -30 $out/build.log; exit 1; }
 c=$root/rust/target/release/clojure-rs
 base=$root/rust/target/release/libcljrt.a
+measure() { # tag compiler
+  local v=$1 cc_=$2
+  for f in probe/prog/*.clj; do
+    k=$(basename $f .clj)
+    $cc_ build $f -o $out/$v-$k > /dev/null 2>&1 || { echo "$v $k build-fail"; continue; }
+    for inp in probe/prog/$k.in /dev/null; do
+      tag=$([ $inp = /dev/null ] && echo empty || echo input)
+      valgrind --tool=callgrind --callgrind-out-file=$out/$v-$k-$tag.cg $out/$v-$k < $inp > /dev/null 2>$out/$v-$k-$tag.vg || true
+      ins=$(grep -m1 '^summary:' $out/$v-$k-$tag.cg | awk '{print $2}')
+      rss=$(for i in 1 2 3 4 5 6 7; do /usr/bin/time -f %M $out/$v-$k < $inp 2>&1 >/dev/null | tail -1; done | sort -n | sed -n 4p)
+      echo "$v $k $tag ins=$ins rss=$rss"
+    done
+  done | tee $out/$v.txt
+  ls -l $out/$v-sudoku | awk '{print "size", $5}'
+}
+cp $c $out/clojure-rs-base
+measure base $c
 (cd rust && CARGO_TARGET_DIR=$root/rust/target-gen RUSTFLAGS="-Cprofile-generate=$out/raw" cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/gen.log 2>&1 || { tail -30 $out/gen.log; exit 1; }
 gen=$root/rust/target-gen/release/libcljrt.a
 # The instrumented archive references the LLVM profiler runtime, which
@@ -37,24 +54,13 @@ echo "trained $n programs; $(ls $out/raw | wc -l) raw profiles"
 [ "$(ls $out/raw | wc -l)" -gt 20 ] || { echo "too few profiles"; exit 1; }
 $profdata merge -o $out/merged.profdata $out/raw/*.profraw
 ls -l $out/merged.profdata
-(cd rust && CARGO_TARGET_DIR=$root/rust/target-use RUSTFLAGS="-Cprofile-use=$out/merged.profdata -Cllvm-args=-pgo-warn-missing-function=false" cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/use.log 2>&1 || { tail -30 $out/use.log; exit 1; }
-use=$root/rust/target-use/release/libcljrt.a
-ls -l $base $use
-for v in base pgo; do
-  a=$base; [ $v = pgo ] && a=$use
-  for f in probe/prog/*.clj; do
-    k=$(basename $f .clj)
-    $c build $f -o $out/$v-$k --runtime-archive $a > /dev/null 2>&1 || { echo "$v $k build-fail"; continue; }
-    for inp in probe/prog/$k.in /dev/null; do
-      tag=$([ $inp = /dev/null ] && echo empty || echo input)
-      valgrind --tool=callgrind --callgrind-out-file=$out/$v-$k-$tag.cg $out/$v-$k < $inp > /dev/null 2>$out/$v-$k-$tag.vg || true
-      ins=$(grep -m1 '^summary:' $out/$v-$k-$tag.cg | awk '{print $2}')
-      rss=$(for i in 1 2 3 4 5 6 7; do /usr/bin/time -f %M $out/$v-$k < $inp 2>&1 >/dev/null | tail -1; done | sort -n | sed -n 4p)
-      echo "$v $k $tag ins=$ins rss=$rss"
-    done
-  done | tee $out/$v.txt
-  ls -l $out/$v-sudoku | awk '{print "size", $5}'
-done
+# The PGO build as CI would ship it: the hot-text order regenerated from
+# the PGO-built runtime (its own layout), then the compiler and archive.
+export RUSTFLAGS="-Cprofile-use=$out/merged.profdata -Cllvm-args=-pgo-warn-missing-function=false"
+bash scripts/bench/hot-text/regen-aot.sh rust > $out/regen-pgo.log 2>&1 || { tail -20 $out/regen-pgo.log; exit 1; }
+(cd rust && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/build-pgo.log 2>&1 || { tail -30 $out/build-pgo.log; exit 1; }
+ls -l $base
+measure pgo $root/rust/target/release/clojure-rs
 python3 - <<'PY'
 import collections, re
 rows = collections.defaultdict(dict)
