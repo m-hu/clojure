@@ -54,23 +54,31 @@ echo "trained $n programs; $(ls $out/raw | wc -l) raw profiles"
 [ "$(ls $out/raw | wc -l)" -gt 20 ] || { echo "too few profiles"; exit 1; }
 $profdata merge -o $out/merged.profdata $out/raw/*.profraw
 ls -l $out/merged.profdata
-# The PGO build as CI would ship it: the hot-text order regenerated from
-# the PGO-built runtime (its own layout), then the compiler and archive.
-export RUSTFLAGS="-Cprofile-use=$out/merged.profdata -Cllvm-args=-pgo-warn-missing-function=false"
-bash scripts/bench/hot-text/regen-aot.sh rust > $out/regen-pgo.log 2>&1 || { tail -20 $out/regen-pgo.log; exit 1; }
-(cd rust && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/build-pgo.log 2>&1 || { tail -30 $out/build-pgo.log; exit 1; }
-ls -l $base
-measure pgo $root/rust/target/release/clojure-rs
+# PGO builds as CI would ship them (the hot-text order regenerated from
+# each PGO-built runtime), varying how much hot call sites inline: LLVM's
+# PGO default (3000) grew the binary ~700 KB and peak RSS by 100-800 KB.
+pgo_variant() { # tag extra-llvm-args
+  export RUSTFLAGS="-Cprofile-use=$out/merged.profdata -Cllvm-args=-pgo-warn-missing-function=false $2"
+  bash scripts/bench/hot-text/regen-aot.sh rust > $out/regen-$1.log 2>&1 || { tail -20 $out/regen-$1.log; return 1; }
+  (cd rust && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/build-$1.log 2>&1 || { tail -30 $out/build-$1.log; return 1; }
+  measure $1 $root/rust/target/release/clojure-rs
+  unset RUSTFLAGS
+}
+pgo_variant hot325 "-Cllvm-args=-hot-callsite-threshold=325"
+pgo_variant hot0 "-Cllvm-args=-hot-callsite-threshold=0"
 python3 - <<'PY'
 import collections, re
 rows = collections.defaultdict(dict)
-for v in ('base', 'pgo'):
-    for l in open(f'/tmp/pgo/{v}.txt').read().splitlines():
+for v in ('base', 'hot325', 'hot0'):
+    try: lines = open(f'/tmp/pgo/{v}.txt').read().splitlines()
+    except FileNotFoundError: continue
+    for l in lines:
         m = re.match(r'(\S+) (\S+) (\S+) ins=(\d+) rss=(\d+)', l)
         if m: rows[(m.group(2), m.group(3))][v] = (int(m.group(4)), int(m.group(5)))
-print(f"{'program':16} {'tag':6} {'base ins':>12} {'pgo/b':>7} | {'base KB':>8} {'pgo-b':>6}")
+print(f"{'program':16} {'tag':6} {'base ins':>12} {'h325/b':>7} {'h0/b':>7} | {'base KB':>8} {'h325-b':>6} {'h0-b':>6}")
 for (k, t), d in sorted(rows.items()):
-    if 'base' in d and 'pgo' in d:
-        b, p = d['base'], d['pgo']
-        print(f"{k:16} {t:6} {b[0]:12d} {p[0]/b[0]:7.3f} | {b[1]:8d} {p[1]-b[1]:+6d}")
+    if 'base' in d:
+        b = d['base']
+        f = lambda v, i: (f"{d[v][0]/b[0]:.3f}" if i == 0 else f"{d[v][1]-b[1]:+d}") if v in d else '-'
+        print(f"{k:16} {t:6} {b[0]:12d} {f('hot325',0):>7} {f('hot0',0):>7} | {b[1]:8d} {f('hot325',1):>6} {f('hot0',1):>6}")
 PY
