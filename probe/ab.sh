@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Probe (throwaway, #271): Linux A/B of two revisions (A = HEAD~2's rust/,
-# B = HEAD~1's rust/; HEAD adds only this probe). Per side: regenerate the
+# Probe (throwaway, #271): Linux A/B of two revisions' rust/ trees, the
+# commits named in probe/ab-refs (A then B). Per side: regenerate the
 # AOT hot-text order (as CI does), build, then per program (public snippet
 # sources, synthetic inputs written for this probe) the callgrind
 # instruction total of one run and the median peak RSS of 7 runs.
 set -euo pipefail
 root=$(pwd); out=/tmp/ab; mkdir -p $out
 for v in A B; do
-  ref=HEAD~2; [ $v = B ] && ref=HEAD~1
+  ref=$(sed -n 1p probe/ab-refs); [ $v = B ] && ref=$(sed -n 2p probe/ab-refs)
   git checkout -q $ref -- rust
   echo "######## $v $(git rev-parse --short $ref)"
   bash scripts/bench/hot-text/regen-aot.sh rust > $out/$v-regen.log 2>&1 || { tail -20 $out/$v-regen.log; exit 1; }
