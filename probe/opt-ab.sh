@@ -12,18 +12,13 @@ variant() {
   unset RUSTFLAGS
   case $1 in
     base) ;;
-    o3|o3v3)
-      sed -i 's/optimize_module(&module, &machine, "default<O2>")/optimize_module(\&module, \&machine, "default<O3>")/' rust/crates/clj-aot/src/lib.rs
-      sed -i 's/            OptimizationLevel::Default,/            OptimizationLevel::Aggressive,/' rust/crates/clj-aot/src/target.rs ;;
-  esac
-  case $1 in
-    v3|o3v3)
-      sed -i 's/            "generic",/            "x86-64-v3",/' rust/crates/clj-aot/src/target.rs
-      export RUSTFLAGS="-C target-cpu=x86-64-v3" ;;
+    rtv2) export RUSTFLAGS="-C target-cpu=x86-64-v2" ;;
+    rtv3) export RUSTFLAGS="-C target-cpu=x86-64-v3" ;;
+    modv3) sed -i 's/            "generic",/            "x86-64-v3",/' rust/crates/clj-aot/src/target.rs ;;
   esac
   git diff --stat rust
 }
-for v in base o3 v3 o3v3; do
+for v in base rtv2 rtv3 modv3; do
   echo "######## $v"
   variant $v
   bash scripts/bench/hot-text/regen-aot.sh rust > $out/$v-regen.log 2>&1 || { tail -20 $out/$v-regen.log; continue; }
@@ -45,16 +40,16 @@ done
 python3 - <<'PY'
 import collections, re
 rows = collections.defaultdict(dict)
-for v in ('base', 'o3', 'v3', 'o3v3'):
+for v in ('base', 'rtv2', 'rtv3', 'modv3'):
     try: lines = open(f'/tmp/opt/{v}.txt').read().splitlines()
     except FileNotFoundError: continue
     for l in lines:
         m = re.match(r'(\S+) (\S+) (\S+) ins=(\d+) rss=(\d+)', l)
         if m: rows[(m.group(2), m.group(3))][v] = (int(m.group(4)), int(m.group(5)))
-print(f"{'program':16} {'tag':6} {'base ins':>12} {'o3/b':>7} {'v3/b':>7} {'o3v3/b':>7} | {'base KB':>8} {'o3-b':>6} {'v3-b':>6} {'o3v3-b':>6}")
+print(f"{'program':16} {'tag':6} {'base ins':>12} {'rtv2/b':>7} {'rtv3/b':>7} {'modv3/b':>7} | {'base KB':>8} {'rtv2-b':>6} {'rtv3-b':>6} {'modv3-b':>6}")
 for (k, t), d in sorted(rows.items()):
     g = d.get('base')
     if not g: continue
     f = lambda v, i: (f"{d[v][0]/g[0]:.3f}" if i == 0 else f"{d[v][1]-g[1]:+d}") if v in d else '-'
-    print(f"{k:16} {t:6} {g[0]:12d} {f('o3',0):>7} {f('v3',0):>7} {f('o3v3',0):>7} | {g[1]:8d} {f('o3',1):>6} {f('v3',1):>6} {f('o3v3',1):>6}")
+    print(f"{k:16} {t:6} {g[0]:12d} {f('rtv2',0):>7} {f('rtv3',0):>7} {f('modv3',0):>7} | {g[1]:8d} {f('rtv2',1):>6} {f('rtv3',1):>6} {f('modv3',1):>6}")
 PY
