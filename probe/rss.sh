@@ -18,34 +18,34 @@ for v in A B; do
   size -A $out/$v-clojure-rs | awk '$1 ~ /^\.(text|text\.hot|rodata|data|bss|data\.rel\.ro|eh_frame|gcc_except_table)$/ {printf "  %s %d\n", $1, $2}'
   git checkout -q HEAD -- rust
 done
+gcc -O2 -shared -fPIC -o $out/advise.so probe/advise.c
 med() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
-run() { # bin prog input tunables
-  for i in 1 2 3 4 5 6 7 8 9; do GLIBC_TUNABLES="$4" /usr/bin/time -f %M "$1" run "$2" < "$3" 2>&1 >/dev/null | tail -1; done | med
+run() { # env... -- cmd
+  for i in 1 2 3 4 5 6 7 8 9; do env "$@" 2>/dev/null; done | med
 }
-printf '%-8s %-6s %-36s %8s %8s %6s\n' prog stdin tunables A B B-A
+rss1() { /usr/bin/time -f %M "$@" 2>&1 >/dev/null | tail -1; }
+export -f rss1 2>/dev/null || true
+m() { # bin args input mode
+  for i in 1 2 3 4 5 6 7 8 9; do
+    if [ "$4" = none ]; then /usr/bin/time -f %M "$1" $2 < "$3" 2>&1 >/dev/null | tail -1;
+    elif [ "$4" = all ]; then LD_PRELOAD=$out/advise.so ADVISE=random ADVISE_ALL=1 /usr/bin/time -f %M "$1" $2 < "$3" 2>&1 >/dev/null | tail -1;
+    else LD_PRELOAD=$out/advise.so ADVISE=$4 /usr/bin/time -f %M "$1" $2 < "$3" 2>&1 >/dev/null | tail -1; fi
+  done | med
+}
+printf '%-8s %-6s %-8s %8s %8s\n' prog stdin advise A B
 for p in trivial bentley; do
-  for inp in in empty; do
-    f=probe/rssprog/$p.in; [ $inp = empty ] && f=/dev/null
-    for t in "" glibc.malloc.trim_threshold=0 glibc.malloc.top_pad=0 glibc.malloc.arena_max=1 glibc.malloc.mmap_threshold=65536 glibc.malloc.tcache_count=0; do
-      a=$(run $out/A-clojure-rs probe/rssprog/$p.clj $f "$t"); b=$(run $out/B-clojure-rs probe/rssprog/$p.clj $f "$t")
-      printf '%-8s %-6s %-36s %8s %8s %+6d\n' $p $inp "${t:-default}" $a $b $((b-a))
-    done
+  for mode in none random nohuge all; do
+    a=$(m $out/A-clojure-rs "run probe/rssprog/$p.clj" probe/rssprog/$p.in $mode); b=$(m $out/B-clojure-rs "run probe/rssprog/$p.clj" probe/rssprog/$p.in $mode)
+    printf '%-8s %-6s %-8s %8s %8s\n' $p in $mode $a $b
   done
 done
-echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null
-for p in trivial bentley; do
-  a=$(run $out/A-clojure-rs probe/rssprog/$p.clj probe/rssprog/$p.in ""); b=$(run $out/B-clojure-rs probe/rssprog/$p.clj probe/rssprog/$p.in "")
-  printf '%-8s %-6s %-36s %8s %8s %+6d\n' $p in thp-never $a $b $((b-a))
-done
-# Where the pages are at the end of a run: the program then sleeps, and
-# smaps sums each mapping's Rss by kind.
-printf '%s\n' '(load-file "probe/rssprog/bentley.clj")' '(let [t (System/currentTimeMillis)] (loop [] (when (< (- (System/currentTimeMillis) t) 1500) (recur))))' > $out/hold.clj
-for v in A B; do
-  $out/$v-clojure-rs run $out/hold.clj < probe/rssprog/bentley.in > /dev/null &
-  pid=$!; sleep 1.2
-  echo "== $v smaps at rest (KB)"
-  [ -r /proc/$pid/smaps ] || { echo "  (exited early)"; continue; }
-  awk '/^[0-9a-f]+-[0-9a-f]+ / {name=$6; if (name=="") name="[anon]"; perm=$2} /^Rss:/ {k=name" "perm; s[k]+=$2} END {for (k in s) if (s[k] > 32) printf "  %7d %s\n", s[k], k}' /proc/$pid/smaps | sort -rn | head -14
-  grep -E '^(Rss|Pss|Anonymous|AnonHugePages):' /proc/$pid/smaps_rollup | tr -s ' ' | sed 's/^/  /'
-  wait $pid || true
+# The AOT side: the PR head's compiler (built with LLVM) on public programs.
+echo "== AOT"
+(cd rust && cargo build --release --locked -p clojure-rs && cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/aot-build.log 2>&1 || { tail -20 $out/aot-build.log; exit 1; }
+for p in probe/prog/*.clj; do
+  k=$(basename $p .clj)
+  rust/target/release/clojure-rs build $p -o $out/aot-$k > /dev/null 2>&1 || { echo "$k build-fail"; continue; }
+  printf '%-14s' $k
+  for mode in none random all; do printf ' %s=%s' $mode $(m $out/aot-$k "" probe/prog/$k.in $mode); done
+  echo
 done
