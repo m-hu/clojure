@@ -22,7 +22,11 @@ echo "profiler builtins: $pb"
 mkdir -p $out/pb && (cd $out/pb && ar x "$pb") && ar r "$gen" $out/pb/*.o
 n=0
 train() { # src input
-  $c build "$1" -o $out/train --runtime-archive $gen > $out/train.err 2>&1 || { echo "train build fail $1: $(tail -1 $out/train.err | cut -c1-200)"; return 0; }
+  # Link by hand: the profile writer registers at startup only when the
+  # binary references `__llvm_profile_runtime` (rustc's own links do).
+  $c build "$1" -o $out/train --emit-obj $out/train.o > $out/train.err 2>&1 \
+    && cc $out/train.o $gen -o $out/train -lm -Wl,-u,__llvm_profile_runtime >> $out/train.err 2>&1 \
+    || { echo "train build fail $1: $(tail -1 $out/train.err | cut -c1-200)"; return 0; }
   LLVM_PROFILE_FILE="$out/raw/%m-%p.profraw" $out/train < "$2" > /dev/null 2>&1 || true
   n=$((n+1))
 }
@@ -30,7 +34,7 @@ h=scripts/bench/hot-text
 for w in $h/workloads/*.clj $h/aot-workloads/*.clj; do i=${w%.clj}.in; [ -f "$i" ] || i=/dev/null; train $w $i; done
 for w in docs/spec/i259-native-compiler/corpus/*.clj; do train $w /dev/null; done
 echo "trained $n programs; $(ls $out/raw | wc -l) raw profiles"
-[ "$(ls $out/raw | wc -l)" -gt 0 ] || { echo "no profiles"; exit 1; }
+[ "$(ls $out/raw | wc -l)" -gt 20 ] || { echo "too few profiles"; exit 1; }
 $profdata merge -o $out/merged.profdata $out/raw/*.profraw
 ls -l $out/merged.profdata
 (cd rust && CARGO_TARGET_DIR=$root/rust/target-use RUSTFLAGS="-Cprofile-use=$out/merged.profdata -Cllvm-args=-pgo-warn-missing-function=false" cargo rustc --release --locked -p clj-rt --crate-type staticlib) > $out/use.log 2>&1 || { tail -30 $out/use.log; exit 1; }
