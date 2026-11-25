@@ -1,0 +1,28 @@
+name: startup
+on:
+  push:
+    branches: [probe/startup-*]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: ./.github/actions/setup-llvm
+      - name: Install valgrind
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q valgrind time
+      - name: Probe
+        run: |
+          set -o pipefail; bash probe/startup.sh 2>&1 | tee probe-out.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: startup
+          path: |
+            probe-out.txt
+            /tmp/st/*.top
+            /tmp/st/totals.txt
