@@ -1,0 +1,8 @@
+(def v (vec (range 1000)))
+(def nodes (vec (for [i (range 16)] {:k i :v (* 2 i) :l nil :r nil :c (if (even? i) :red :black) :sz 1})))
+(def pts (vec (for [i (range 16)] [i (* 3 i)])))
+(def ps (set (for [a (range 6) b (range 6)] [a b])))
+(defn red? [h] (and (some? h) (= (:c h) :red)))
+(defn f3 [a b c] (+ a (* b c)))
+(defn work [n] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (if (red? (nth nodes (bit-and i 15))) (inc acc) acc)) acc)))
+(println (work (Long/parseLong (clojure.string/trim (slurp *in*)))))
