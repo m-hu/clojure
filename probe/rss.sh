@@ -39,11 +39,12 @@ for p in trivial bentley; do
 done
 # Where the pages are at the end of a run: the program then sleeps, and
 # smaps sums each mapping's Rss by kind.
-printf '%s\n' '(load-file "probe/rssprog/bentley.clj")' '(Thread/sleep 1500)' > $out/hold.clj
+printf '%s\n' '(load-file "probe/rssprog/bentley.clj")' '(let [t (System/currentTimeMillis)] (loop [] (when (< (- (System/currentTimeMillis) t) 1500) (recur))))' > $out/hold.clj
 for v in A B; do
   $out/$v-clojure-rs run $out/hold.clj < probe/rssprog/bentley.in > /dev/null &
   pid=$!; sleep 1.2
   echo "== $v smaps at rest (KB)"
+  [ -r /proc/$pid/smaps ] || { echo "  (exited early)"; continue; }
   awk '/^[0-9a-f]+-[0-9a-f]+ / {name=$6; if (name=="") name="[anon]"; perm=$2} /^Rss:/ {k=name" "perm; s[k]+=$2} END {for (k in s) if (s[k] > 32) printf "  %7d %s\n", s[k], k}' /proc/$pid/smaps | sort -rn | head -14
   grep -E '^(Rss|Pss|Anonymous|AnonHugePages):' /proc/$pid/smaps_rollup | tr -s ' ' | sed 's/^/  /'
   wait $pid || true
