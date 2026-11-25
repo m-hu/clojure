@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 __attribute__((constructor)) static void advise_self(void) {
     const char *mode = getenv("ADVISE");
     if (!mode) return;
