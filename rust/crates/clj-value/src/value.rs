@@ -67,8 +67,8 @@ type SetSlots = crate::trie::PVec<Option<Value>>;
 /// counter (the `ATOM_ID` precedent); `Clone` preserves it, so two
 /// evaluations of the same binding compare identical while two
 /// separately built collections never do. Equality and hashing
-/// ignore the ids. [`Map`] instead identifies by its entries `Arc`
-/// (see [`Map::id`]) — no counter, no field.
+/// ignore the ids. [`Map`] instead identifies by an allocation
+/// address (see [`Map::id`]) — no counter, no field.
 static LIST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static VECTOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static SET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -996,8 +996,9 @@ impl MapShape {
 /// A small map's entries: the shared shape plus this version's
 /// values (parallel to `shape.keys`). Boxed slices, not vecs: no
 /// capacity field (a 3-pair map buckets at 256B instead of 288B)
-/// and no growth slack ever.
-#[derive(Debug)]
+/// and no growth slack ever. Inline in the map's data (#271: one
+/// allocation fewer per map version than behind its own `Arc`).
+#[derive(Clone, Debug)]
 struct SmallMap {
     shape: Arc<MapShape>,
     vals: Box<[Value]>,
@@ -1114,26 +1115,25 @@ fn intern_shape(keys: &[Value]) -> Arc<MapShape> {
     })
 }
 
-/// Shared empty shape (`Map::id` is the [`SmallMap`] `Arc`
-/// address, so every empty map still allocates a fresh
-/// [`SmallMap`] around this shared shape).
+/// Shared empty shape (every empty shaped map's entries).
 static EMPTY_MAP_SHAPE: LazyLock<Arc<MapShape>> = LazyLock::new(|| intern_shape(&[]));
 
-/// A fresh empty entries allocation (identity-fresh; the shape is
-/// the shared empty shape).
-fn fresh_empty_small() -> Arc<SmallMap> {
-    Arc::new(SmallMap {
+/// Empty entries (the shared empty shape, no values: no allocation —
+/// the map's identity is its data's address, see [`Map::id`]).
+fn fresh_empty_small() -> SmallMap {
+    SmallMap {
         shape: EMPTY_MAP_SHAPE.clone(),
         vals: Box::default(),
-    })
+    }
 }
 
 /// A map's fields, behind the handle's `Arc` so a `Map` (inline
 /// in every `Value`) stays one word (#254: `Value` shrinks to 32
 /// bytes). Writers go through `Arc::make_mut` on the handle data
-/// first — a shared handle clones the fields (entries `Arc`s
-/// shared, identities preserved) before any in-place update,
-/// exactly like the old struct copy.
+/// first — a shared handle clones the fields (a shaped map's
+/// entries included, a hash map's trie `Arc` shared) before any
+/// in-place update; [`Map::set_small`] replaces the entries
+/// without copying the old ones.
 #[derive(Clone)]
 struct MapData {
     /// The entries when `small` is `None` (`None` for shaped maps
@@ -1143,9 +1143,9 @@ struct MapData {
     /// `Some` = shaped authoritative (an interned key-set plus
     /// this version's values, at most [`INLINE_MAP_MAX`] entries
     /// in iteration order); `None` = `inner` authoritative (plus
-    /// `keys` when sorted). Writers mint a fresh entries `Arc`
-    /// except uniquely-owned in-place updates (see [`Map::id`]).
-    small: Option<Arc<SmallMap>>,
+    /// `keys` when sorted). Inline: a shaped map's identity is its
+    /// data's address (see [`Map::id`]).
+    small: Option<SmallMap>,
     /// Comparator-order sidecar for sorted maps when `small` is
     /// `None` (`None` otherwise — plain hash-maps iterate the
     /// trie, never this). Writers maintain it only when sorted.
@@ -1185,7 +1185,7 @@ impl Map {
         if self.is_sorted() {
             return None;
         }
-        let small = self.0.small.as_deref()?;
+        let small = self.0.small.as_ref()?;
         if let Value::Keyword(kw) = k {
             let pos = small
                 .shape
@@ -2275,12 +2275,32 @@ impl Map {
         )
     }
 
-    /// The handle fields, mutably: shared data clones first (the
-    /// entries `Arc`s stay shared, so aliasing/identity rules are
-    /// exactly the old struct copy's).
+    /// The handle fields, mutably: shared data clones first (a
+    /// shaped map's entries copy with it — a fresh identity, see
+    /// [`Map::id`]; a hash map's trie `Arc` stays shared).
     #[inline]
     fn data_mut(&mut self) -> &mut MapData {
         Arc::make_mut(&mut self.0)
+    }
+
+    /// This map's data with its shaped entries replaced by `small`: a
+    /// shared map copies its other fields only (never the old entries),
+    /// a uniquely held one updates in place.
+    fn set_small(&mut self, small: SmallMap) -> &mut MapData {
+        if Arc::get_mut(&mut self.0).is_none() {
+            let d = &*self.0;
+            self.0 = Arc::new(MapData {
+                inner: None,
+                small: None,
+                keys: d.keys.clone(),
+                meta: d.meta.clone(),
+                hashy: d.hashy,
+                sort: d.sort.clone(),
+            });
+        }
+        let data = Arc::get_mut(&mut self.0).expect("unique after the copy");
+        data.small = Some(small);
+        data
     }
 
     pub fn from_kvs_checked(pairs: Vec<(Value, Value)>) -> Result<Self, Value> {
@@ -2337,10 +2357,10 @@ impl Map {
         debug_assert!(keys.iter().all(|k| matches!(k, Value::Keyword(_))));
         Self(Arc::new(MapData {
             inner: None,
-            small: Some(Arc::new(SmallMap {
+            small: Some(SmallMap {
                 shape: intern_shape(keys),
                 vals: vals.into_boxed_slice(),
-            })),
+            }),
             keys: None,
             meta: None,
             hashy: false,
@@ -2363,10 +2383,10 @@ impl Map {
         {
             return Self(Arc::new(MapData {
                 inner: None,
-                small: Some(Arc::new(SmallMap {
+                small: Some(SmallMap {
                     shape: Arc::clone(&small.shape),
                     vals: vals.into_boxed_slice(),
-                })),
+                }),
                 keys: None,
                 meta: None,
                 hashy: template.0.hashy,
@@ -2400,10 +2420,10 @@ impl Map {
         }
         Self(Arc::new(MapData {
             inner: None,
-            small: Some(Arc::new(SmallMap {
+            small: Some(SmallMap {
                 shape: intern_shape(&keys),
                 vals: vals.into_boxed_slice(),
-            })),
+            }),
             keys: None,
             meta: None,
             hashy,
@@ -2428,12 +2448,11 @@ impl Map {
     /// the `frequencies`/`group-by` walk closures — so they skip
     /// the `mem::replace` dummy map per item).
     ///
-    /// Uniquely-owned storage mutates with no fresh entries or
-    /// sidecar `Arc` (same [`id`](Self::id) — unobservable: the
-    /// in-place arms run only with no live alias, and the consumed
-    /// input is dead); shared storage mints fresh `Arc`s exactly
-    /// as before, so live aliases keep their versions and
-    /// identities.
+    /// Uniquely-owned storage mutates in place (same
+    /// [`id`](Self::id) — unobservable: the in-place arms run only
+    /// with no live alias, and the consumed input is dead); shared
+    /// storage copies into fresh allocations, so live aliases keep
+    /// their versions and identities.
     pub fn insert_mut(&mut self, k: Value, v: Value) {
         if self.0.small.is_some() {
             return self.insert_shaped_mut(k, v);
@@ -2486,28 +2505,17 @@ impl Map {
     /// shared); new keys intern the extended key-set (hits
     /// allocate nothing past values).
     fn insert_shaped_mut(&mut self, k: Value, v: Value) {
-        let data = self.data_mut();
-        let small = data.small.as_mut().expect("shaped checked above");
+        let small = self.0.small.as_ref().expect("shaped checked above");
         if let Some(idx) = small.shape.find_key(&k) {
-            // `get_mut` succeeds only with no live alias (not even
-            // the consumed input survives), so the write is
-            // invisible and the entries `Arc` (see [`Map::id`])
-            // stays put.
-            if let Some(entries) = Arc::get_mut(small) {
-                entries.vals[idx] = v;
-                return;
-            }
-            let mut vals = small.vals.clone();
-            vals[idx] = v;
-            *small = Arc::new(SmallMap {
-                shape: Arc::clone(&small.shape),
-                vals,
-            });
+            // A shared map copies its data (values included) once; a
+            // uniquely held one writes in place, its identity (see
+            // [`Map::id`]) unobservable: no live alias.
+            let data = self.data_mut();
+            data.small.as_mut().expect("shaped checked above").vals[idx] = v;
             return;
         }
         let size = small.vals.len();
-        let promote = !data.hashy && (size >= 64 || (size >= 8 && !matches!(k, Value::Keyword(_))));
-        data.hashy |= promote;
+        let promote = !self.0.hashy && (size >= 64 || (size >= 8 && !matches!(k, Value::Keyword(_))));
         if size < INLINE_MAP_MAX {
             // Exact-size: the new version is frozen, so no growth
             // slack (see [`SmallMap`]).
@@ -2517,12 +2525,15 @@ impl Map {
             let mut vals = Vec::with_capacity(size + 1);
             vals.extend(small.vals.iter().cloned());
             vals.push(v);
-            *small = Arc::new(SmallMap {
+            let next = SmallMap {
                 shape: intern_shape(&keys),
                 vals: vals.into_boxed_slice(),
-            });
+            };
+            self.set_small(next).hashy |= promote;
             return;
         }
+        let data = self.data_mut();
+        data.hashy |= promote;
         let small = data.small.take().expect("shaped checked above");
         self.promote_with_mut(&small, k, v);
     }
@@ -2535,37 +2546,29 @@ impl Map {
         k: &Value,
         f: impl FnOnce(Value) -> Result<Value, Value>,
     ) -> bool {
-        if let Some(small) = &self.0.small {
-            let Some(idx) = small.shape.find_key(k) else {
+        if let Some(found) = self.0.small.as_ref().map(|s| s.shape.find_key(k)) {
+            let Some(idx) = found else {
                 return false;
             };
-            let small = self
-                .data_mut()
-                .small
-                .as_mut()
-                .expect("shaped checked above");
-            if let Some(entries) = Arc::get_mut(small) {
-                let old = std::mem::replace(&mut entries.vals[idx], Value::Nil);
+            if let Some(data) = Arc::get_mut(&mut self.0) {
+                let vals = &mut data.small.as_mut().expect("shaped checked above").vals;
+                let old = std::mem::replace(&mut vals[idx], Value::Nil);
                 match f(old) {
                     Ok(new) => {
-                        entries.vals[idx] = new;
+                        vals[idx] = new;
                         return true;
                     }
                     Err(orig) => {
-                        entries.vals[idx] = orig;
+                        vals[idx] = orig;
                         return false;
                     }
                 }
             }
-            let Ok(new) = f(small.vals[idx].clone()) else {
+            let current = self.0.small.as_ref().expect("shaped checked above").vals[idx].clone();
+            let Ok(new) = f(current) else {
                 return false;
             };
-            let mut vals = small.vals.clone();
-            vals[idx] = new;
-            *small = Arc::new(SmallMap {
-                shape: Arc::clone(&small.shape),
-                vals,
-            });
+            self.data_mut().small.as_mut().expect("shaped checked above").vals[idx] = new;
             return true;
         }
         let Some(slot) = self.trie_mut().get_mut(k) else {
@@ -2617,17 +2620,17 @@ impl Map {
     /// otherwise the entries drop it (and the comparator-order
     /// sidecar when sorted). The class never demotes (a shrunk
     /// hash-map stays a hash-map); neither does the
-    /// representation (a shrunk hash-map stays hashed). Always
-    /// mints fresh identity on a hit (`dissoc` news on the JVM).
+    /// representation (a shrunk hash-map stays hashed). A hit on a
+    /// shared map mints fresh identity (`dissoc` news on the JVM); a
+    /// miss returns the map itself.
     #[must_use]
     pub fn without(mut self, k: &Value) -> Self {
-        if let Some(small) = self.data_mut().small.take() {
+        if let Some(small) = &self.0.small {
             let Some(idx) = small.shape.find_key(k) else {
-                self.data_mut().small = Some(small);
                 return self;
             };
             if small.vals.len() == 1 {
-                self.data_mut().small = Some(fresh_empty_small());
+                self.set_small(fresh_empty_small());
                 return self;
             }
             let mut keys = Vec::with_capacity(small.vals.len() - 1);
@@ -2647,10 +2650,10 @@ impl Map {
                     .enumerate()
                     .filter_map(|(i, ev)| if i == idx { None } else { Some(ev.clone()) }),
             );
-            self.data_mut().small = Some(Arc::new(SmallMap {
+            self.set_small(SmallMap {
                 shape: intern_shape(&keys),
                 vals: vals.into_boxed_slice(),
-            }));
+            });
             return self;
         }
         if self.trie().get(k).is_none() {
@@ -2815,10 +2818,10 @@ impl Map {
             }
             return Self(Arc::new(MapData {
                 inner: None,
-                small: Some(Arc::new(SmallMap {
+                small: Some(SmallMap {
                     shape: intern_shape(&keys),
                     vals: vals.into_boxed_slice(),
-                })),
+                }),
                 keys: None,
                 meta: self.0.meta.clone(),
                 hashy: self.0.hashy,
@@ -2859,13 +2862,14 @@ impl Map {
     /// shaped map (replacing the slot with `Value::Nil`) so nested collections
     /// keep a refcount of 1 across `assoc-in` / `update`.
     pub fn take_value(&mut self, k: &Value) -> Option<Value> {
-        if self.0.small.is_some() {
-            let data = self.data_mut();
-            let small = data.small.as_mut().expect("shaped checked above");
+        if let Some(small) = &self.0.small {
             let idx = small.shape.find_key(k)?;
-            return Some(match Arc::get_mut(small) {
-                Some(entries) => std::mem::replace(&mut entries.vals[idx], Value::Nil),
-                None => small.vals[idx].clone(),
+            return Some(match Arc::get_mut(&mut self.0) {
+                Some(data) => std::mem::replace(
+                    &mut data.small.as_mut().expect("shaped checked above").vals[idx],
+                    Value::Nil,
+                ),
+                None => self.0.small.as_ref().expect("shaped checked above").vals[idx].clone(),
             });
         }
         self.trie().get(k).cloned()
@@ -2928,22 +2932,19 @@ impl Map {
     pub fn with_meta(mut self, meta: Option<Map>) -> Self {
         let data = self.data_mut();
         data.meta = meta.map(Arc::new);
-        // A new object on the JVM (`withMeta` news), so fresh
-        // entries (identity rides the entries `Arc`).
-        if let Some(small) = data.small.take() {
-            data.small = Some(Arc::new(SmallMap {
-                shape: Arc::clone(&small.shape),
-                vals: small.vals.clone(),
-            }));
-        } else {
+        // A new object on the JVM (`withMeta` news): a shared shaped
+        // map's data just copied (its identity, see [`Map::id`]); a
+        // hash map mints a fresh trie `Arc`.
+        if data.small.is_none() {
             let inner = data.inner.take().expect("map has small or trie");
             data.inner = Some(Arc::new((*inner).clone()));
         }
         self
     }
 
-    /// The allocation identity for `identical?` (S16): the entries
-    /// `Arc` address (shaped) or the trie `Arc` address (hash).
+    /// The allocation identity for `identical?` (S16): the data's
+    /// `Arc` address (shaped: the entries live inline, #271) or the
+    /// trie `Arc` address (hash).
     /// Writers mint a fresh `Arc` except uniquely-owned in-place
     /// updates (#227 — same address, unobservable: no live alias
     /// shares it), `Clone` shares it, and no-ops return `self` —
@@ -2954,7 +2955,7 @@ impl Map {
     #[must_use]
     pub fn id(&self) -> u64 {
         match &self.0.small {
-            Some(small) => Arc::as_ptr(small).addr() as u64,
+            Some(_) => Arc::as_ptr(&self.0).addr() as u64,
             None => {
                 Arc::as_ptr(self.0.inner.as_ref().expect("hash map holds a trie")).addr() as u64
             }
