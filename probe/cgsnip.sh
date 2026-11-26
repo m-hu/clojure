@@ -2,7 +2,7 @@
 # Probe (throwaway, #271): where the AOT spends Linux instructions on
 # losing snippet programs (public code, synthetic inputs). Callgrind of
 # each program built by the PR head's compiler with symbols kept.
-set -euo pipefail
+set -eu
 out=/tmp/cg; mkdir -p $out
 ref=$(sed -n 2p probe/rss-refs)
 git checkout -q $ref -- rust scripts
@@ -21,7 +21,9 @@ for f in *.cg; do
   tot=$(callgrind_annotate --threshold=100 $f 2>/dev/null | awk '/PROGRAM TOTALS/ {gsub(",", "", $1); print $1}')
   echo "=== $s total $tot  output: $(head -c 60 $s.out | tr '\n' '|')"
   echo "  -- self"
-  callgrind_annotate --inclusive=no --threshold=100 $f 2>/dev/null | grep -E '^ *[0-9,]+ \(' | head -14 | sed -E 's/ \[[^]]*\]$//' | cut -c1-170
+  callgrind_annotate --inclusive=no --threshold=100 $f > $s.self 2>/dev/null || true
+  grep -E '^ *[0-9,]+ \(' $s.self | sed -n 2,16p | sed -E 's/ \[[^]]*\]$//' | cut -c1-170 || true
   echo "  -- inclusive"
-  callgrind_annotate --inclusive=yes --threshold=100 $f 2>/dev/null | grep -E '^ *[0-9,]+ \(' | head -22 | sed -E 's/ \[[^]]*\]$//' | cut -c1-170
+  callgrind_annotate --inclusive=yes --threshold=100 $f > $s.incl 2>/dev/null || true
+  grep -E '^ *[0-9,]+ \(' $s.incl | sed -n 2,30p | sed -E 's/ \[[^]]*\]$//' | cut -c1-170 || true
 done
