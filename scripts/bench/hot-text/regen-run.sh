@@ -40,10 +40,16 @@ bin=$ws/target/release/clojure-rs
 
 echo "== profile the workloads"
 mkdir -p "$work/cg"
+# Each workload runs as programs are run, by a path relative to the
+# working directory (#271): a relative script's `*file*` is absolutized
+# at load (`current_dir`, `Path::join`), code every real run executes.
+# Profiled from absolute paths, it stayed in cold `.text`, where the
+# kernel maps executable text in large page-cache folios: those three
+# small functions alone kept ~1 MB of cold text resident in every run.
 for w in "$here"/workloads/*.clj; do
   name=$(basename "$w" .clj)
-  valgrind --tool=callgrind --demangle=no --dump-instr=no \
-    --callgrind-out-file="$work/cg/$name.cg" "$bin" run "$w" < /dev/null > /dev/null 2> "$work/$name.err" || {
+  (cd "$here/workloads" && valgrind --tool=callgrind --demangle=no --dump-instr=no \
+    --callgrind-out-file="$work/cg/$name.cg" "$bin" run "$name.clj") < /dev/null > /dev/null 2> "$work/$name.err" || {
     tail -n 5 "$work/$name.err" >&2
     echo "regen-run: workload $name failed" >&2
     exit 1
