@@ -40,7 +40,5 @@ for prog in ('bentley', 'trivial'):
         elif txt_lo <= a < txt_lo + txt_sz:
             cold.append((sz, fn)); windows.add((a - txt_lo) // 65536)
     print(f"== {prog}: executed fns {len(fns)} (not in nm {unknown}), in .text.hot {hot}, in cold .text {len(cold)} ({sum(s for s,_ in cold)//1024} KB), cold 64K windows {len(windows)} of {txt_sz//65536}")
-    with open(f'/tmp/cold/{prog}-cold.txt', 'w') as out:
-        for sz, k in sorted(cold, reverse=True): out.write(f"{sz} {k}\n")
+    for sz, k in sorted(cold, reverse=True): print(f"COLD {prog} {sz} {k}")
 PY
-for p in bentley trivial; do echo "== $p cold (size name)"; cat /tmp/cold/$p-cold.txt; done
