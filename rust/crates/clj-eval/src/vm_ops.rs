@@ -653,6 +653,7 @@ pub(crate) const APPLY2: &[(&str, Apply2)] = &[
     ("unchecked-subtract", <UncheckedSub as Op2>::apply),
     ("unchecked-multiply", <UncheckedMul as Op2>::apply),
     ("compare", <CompareNum as Op2>::apply),
+    ("subvec", <Subvec2 as Op2>::apply),
 ];
 
 /// Specialized regex matcher kept outside [`APPLY2`] so non-regex AOT binaries
@@ -664,6 +665,7 @@ pub(crate) const APPLY3: &[(&str, Apply3)] = &[
     ("nth", <Nth3 as Op3>::apply),
     ("get", <Get3 as Op3>::apply),
     ("aset", <Aset as Op3>::apply),
+    ("subvec", <Subvec3 as Op3>::apply),
 ];
 
 /// The 3+-argument forms over borrowed args for native code (#259):
@@ -695,6 +697,7 @@ const TERNARY: &[Row3] = &[
     ("nth", shape3::<Nth3>),
     ("get", shape3::<Get3>),
     ("aset", shape3::<Aset>),
+    ("subvec", shape3::<Subvec3>),
 ];
 
 /// The two-argument ops by core name: the value code, and the
@@ -749,6 +752,7 @@ const BINARY: &[Row2] = &[
     ("unchecked-subtract", shape2::<UncheckedSub, AsValue>, None),
     ("unchecked-multiply", shape2::<UncheckedMul, AsValue>, None),
     ("compare", shape2::<CompareNum, AsValue>, None),
+    ("subvec", shape2::<Subvec2, AsValue>, None),
     (
         "re-matches",
         shape2::<ReMatches, AsValue>,
@@ -2359,6 +2363,29 @@ impl Op1 for First {
     #[inline(always)]
     fn apply(a: &Value) -> Option<Value> {
         crate::lazy::first_fast(a)
+    }
+}
+
+/// `(subvec v start)` of a vector (#271 Slice 6p): `subvec3` to its
+/// count; anything else, and every error, takes the native.
+pub(crate) struct Subvec2;
+
+impl Op2 for Subvec2 {
+    #[inline(always)]
+    fn apply(a: &Value, b: &Value) -> Option<Value> {
+        let Value::Vector(v) = a else { return None };
+        crate::coll::subvec3(a, b, &Value::Int(v.len() as i64)).ok()
+    }
+}
+
+/// `(subvec v start end)` (#271 Slice 6p): `subvec3`; every error takes
+/// the native.
+pub(crate) struct Subvec3;
+
+impl Op3 for Subvec3 {
+    #[inline(always)]
+    fn apply(a: &Value, b: &Value, c: &Value) -> Option<Value> {
+        crate::coll::subvec3(a, b, c).ok()
     }
 }
 

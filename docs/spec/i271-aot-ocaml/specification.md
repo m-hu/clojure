@@ -964,6 +964,16 @@ They were not specific to the program. They were the generic paths the 26 traini
   - A trivial program stayed at 5312 KB, against 5320 without the workload.
   - Its output is identical between `run` and the native binary.
 
+### 6.73 Slice 6p: `subvec` inline
+
+The token parser many programs share opens with `(let [cs (vec tok) … digits (subvec cs (if neg 1 0))] …)`. In the generic-call trace, `point_in_polygon` and `closest_pair` made about 25 `subvec` calls per case, each through the general native and the var table.
+
+- **Ops (`Subvec2`, `Subvec3`, `clj-eval/src/vm_ops.rs`, appended to the two- and three-arg inline tables so no other op's index moves):** `(subvec v start [end])` calls the native's own `subvec3`. The two-arg form does so only for a vector, with its count as the end. Any other argument, and every error, takes the native, so its exceptions are unchanged. The VM and the native runtime share the tables.
+- **Not taken:** an inline `vec` of a string or vector. Routing `vec` through the inline table moved some calls off the native that consumes the lazy seqs it owns: a later test run no longer reached those walks.
+- **Verification:** corpus `vec_subvec_inline.clj`, with output identical between `run` and the native binary, and between this `run` and 6n's. It covers the parser shape, nested subvectors, empty windows, the out-of-range, negative, reversed and non-vector errors, the subvector class, and equality.
+
+Measured (macOS): `point_in_polygon` -10K and -72K instructions on its first two cases, `closest_pair` -56K and -20K.
+
 ## 7. Acceptance Checklist (Issue #271)
 
 - [ ] `h2h-compare` `--allow-extra-challenger` implemented and covered by Go tests.

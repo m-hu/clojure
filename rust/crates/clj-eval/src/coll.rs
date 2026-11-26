@@ -2884,7 +2884,7 @@ fn splitvec_subvec(
     })())
 }
 
-fn subvec3(v: &Value, start_v: &Value, end_v: &Value) -> Result<Value, NativeError> {
+pub(crate) fn subvec3(v: &Value, start_v: &Value, end_v: &Value) -> Result<Value, NativeError> {
     if let Some(r) = splitvec_subvec(v, start_v, end_v) {
         return r;
     }
