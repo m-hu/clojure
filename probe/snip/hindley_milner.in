@@ -1,0 +1,3 @@
+2
+(lam f (lam x (app f x)))
+(let id (lam x x) (app id T))
