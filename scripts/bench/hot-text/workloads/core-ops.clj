@@ -62,4 +62,47 @@
         sm (into (sorted-map-by (fn [a b] (compare b a))) (map (fn [i] [i (* i i)]) (range n)))]
     [(first ss) (count (subseq ss > 5)) (first sm) (count (rsubseq sm < 10)) (get sm 3) (contains? ss 4)]))
 
-(println (count input) (tally 200 37) (vectors 120) (walks 100) (numbers 80) (sorted-colls 60))
+;; Each binary op over every operand shape the loop tier specializes: two
+;; locals, a local and a constant (both orders), an upvalue (a value the
+;; enclosing fn captured), and computed operands; tested and as values.
+(defmacro shapes [op a b]
+  `(let [up# ~b]
+     (fn [n#]
+       (loop [i# 1 acc# []]
+         (if (< i# n#)
+           (let [j# (inc i#)
+                 vs# [(~op i# j#) (~op i# ~b) (~op ~a j#) (~op up# i#) (~op i# up#) (~op up# up#)
+                      (~op (inc i#) (dec j#)) (~op i# (inc j#)) (~op (inc i#) j#) (~op up# (inc i#))]
+                 ts# [(if (~op i# j#) 1 0) (if (~op i# ~b) 1 0) (if (~op ~a j#) 1 0) (if (~op up# i#) 1 0)
+                      (if (~op (inc i#) j#) 1 0) (if (~op i# (inc j#)) 1 0) (if (~op up# (inc i#)) 1 0)]]
+             (recur j# (if (< i# 3) (conj acc# vs# ts#) acc#)))
+           acc#)))))
+
+(def binary-ops
+  [(shapes < 3 5) (shapes <= 3 5) (shapes > 3 5) (shapes >= 3 5) (shapes = 3 5) (shapes == 3 5)
+   (shapes not= 3 5) (shapes + 3 5) (shapes - 3 5) (shapes * 3 5) (shapes min 3 5) (shapes max 3 5)
+   (shapes compare 3 5) (shapes quot 3 5) (shapes rem 3 5) (shapes mod 3 5) (shapes bit-and 3 5)])
+
+;; Unary ops and collection reads over a local, an upvalue and a computed
+;; operand, in loops.
+(defn unary [n]
+  (let [v [1 2 3] m {:a 1 :b 2} s #{1 2}]
+    (loop [i 0 acc 0 out []]
+      (if (< i n)
+        (let [k (rem i 3) w (conj v i)]
+          (recur (inc i)
+                 (+ acc (if (zero? k) 1 0) (if (pos? k) 1 0) (if (neg? (- k)) 1 0) (if (nil? (get m k)) 1 0)
+                    (if (not (contains? s k)) 1 0) (if (contains? m :a) 1 0) (if (some? (get w k)) 1 0)
+                    (nth v k) (nth w (inc k)) (count w) (second w) (get m :b) (long (/ i 2)) (- k)
+                    (count v) (second v) (nth v 1) (if (even? i) 1 0) (if (odd? k) 1 0))
+                 (if (< i 2) (conj out [(zero? k) (pos? i) (not (zero? k)) (- i) (nil? w) (empty? w) (first w)]) out)))
+        [acc out]))))
+
+;; Lazy walks consumed one item at a time.
+(defn lazy-walks [n]
+  (let [xs (vec (range (- n) n))]
+    (loop [s (seq (concat (filter even? xs) (drop-while neg? xs) (take-while neg? xs) (remove odd? xs))) acc 0]
+      (if s (recur (next s) (+ acc (first s))) acc))))
+
+(println (count input) (tally 200 37) (vectors 120) (walks 100) (numbers 80) (sorted-colls 60)
+         (mapv (fn [f] (count (f 100))) binary-ops) (unary 150) (lazy-walks 100))
