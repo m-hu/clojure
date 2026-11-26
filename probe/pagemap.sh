@@ -8,10 +8,11 @@ for v in A B; do
   ref=$(sed -n 1p probe/rss-refs); [ $v = B ] && ref=$(sed -n 2p probe/rss-refs)
   git checkout -q $ref -- rust scripts
   bash scripts/bench/hot-text/regen-run.sh rust > $out/$v-regen.log 2>&1 || { tail -20 $out/$v-regen.log; exit 1; }
-  (cd rust && cargo build --release --locked --no-default-features -p clojure-rs) > $out/$v-build.log 2>&1 || { tail -30 $out/$v-build.log; exit 1; }
+  (cd rust && CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --locked --no-default-features -p clojure-rs) > $out/$v-build.log 2>&1 || { tail -30 $out/$v-build.log; exit 1; }
   cp rust/target/release/clojure-rs $out/$v-bin
   readelf -SW $out/$v-bin > $out/$v.sec
   readelf -lW $out/$v-bin > $out/$v.seg
+  nm -n --defined-only $out/$v-bin | awk '$2 ~ /[tTwW]/ {print $1, $3}' > $out/$v.nm
   git checkout -q HEAD -- rust scripts
 done
 cat > $out/res.py <<'PY'
@@ -38,12 +39,26 @@ for a in res:
     name = next((n for n, s, z in secs if s <= a < s + z), '?')
     by[name] = by.get(name, 0) + 4
 print(' '.join(f"{k}={v}" for k, v in sorted(by.items(), key=lambda kv: -kv[1])))
+if len(sys.argv) > 4:
+    import bisect
+    nm = [(int(a, 16), n) for a, n in (l.split()[:2] for l in open(sys.argv[4]) if len(l.split()) >= 2)]
+    addrs = [a for a, _ in nm]
+    txt = next((s, z) for n, s, z in secs if n == '.text')
+    pages = sorted(a for a in res if txt[0] <= a < txt[0] + txt[1])
+    runs = []
+    for a in pages:
+        if runs and a == runs[-1][1]: runs[-1][1] = a + 4096
+        else: runs.append([a, a + 4096])
+    print(f"  .text resident runs: {len(runs)}")
+    for lo, hi in runs[:40]:
+        i = bisect.bisect_right(addrs, lo) - 1
+        print(f"    +{(lo - txt[0]) // 1024:6d} KB len {(hi - lo) // 1024:4d} KB at {nm[i][1][:90] if i >= 0 else '?'}")
 PY
 for p in trivial hill; do
   for v in A B; do
     printf '%s\n' "(load-file \"probe/rssprog/$p.clj\")" '(let [t (System/currentTimeMillis)] (loop [] (when (< (- (System/currentTimeMillis) t) 1500) (recur))))' > $out/hold-$p.clj
     $out/$v-bin run $out/hold-$p.clj < probe/rssprog/$p.in > /dev/null & pid=$!; sleep 1.2
-    echo "$p $v resident KB by section: $(sudo python3 $out/res.py $pid $out/$v-bin $out/$v.sec)"
+    echo "$p $v resident KB by section:"; sudo python3 $out/res.py $pid $out/$v-bin $out/$v.sec $out/$v.nm
     wait $pid || true
   done
 done
