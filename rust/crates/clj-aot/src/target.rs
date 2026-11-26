@@ -47,12 +47,40 @@ pub fn emit_object_buffer<'ctx>(
     machine: &TargetMachine,
     module: &Module<'ctx>,
 ) -> inkwell::memory_buffer::MemoryBuffer<'ctx> {
-    module.set_triple(&TargetMachine::get_default_triple());
+    let triple = TargetMachine::get_default_triple();
+    split_function_sections(module, is_elf(&triple.as_str().to_string_lossy()));
+    module.set_triple(&triple);
     let layout = machine.get_target_data().get_data_layout();
     module.set_data_layout(&layout);
     machine
         .write_to_memory_buffer(module, FileType::Object)
         .expect("host machine emits object for verified module")
+}
+
+/// Whether objects for `triple` are ELF (Linux and other Unix targets;
+/// Mach-O and COFF name sections differently).
+fn is_elf(triple: &str) -> bool {
+    !(triple.contains("apple") || triple.contains("darwin") || triple.contains("windows"))
+}
+
+/// On ELF, every function the module defines in its own `.text.<name>`
+/// section, as `-ffunction-sections` places Rust's (#271 Slice 6p). The
+/// hot-text linker script orders functions by such sections: with the
+/// whole program in one `.text`, the order's entries for the program
+/// object's own functions (`main`, the frame-info wrappers, the bitcode
+/// helpers linked in, which every workload profile names) never matched,
+/// so those stayed in cold `.text`, each faulting in a 64 KiB window.
+fn split_function_sections(module: &Module<'_>, elf: bool) {
+    if !elf {
+        return;
+    }
+    for f in module
+        .get_functions()
+        .filter(|f| f.count_basic_blocks() > 0)
+    {
+        let section = format!(".text.{}", f.get_name().to_string_lossy());
+        f.as_global_value().set_section(Some(&section));
+    }
 }
 
 /// Emit `module` as a native object file (stamps the module triple
@@ -94,6 +122,30 @@ mod tests {
         let module = ctx.create_module("empty");
         let obj = tmp("no-such-dir").join("x.o");
         assert!(emit_object(&machine, &module, &obj).is_err());
+    }
+
+    #[test]
+    fn elf_objects_give_each_defined_function_its_section_271() {
+        assert!(super::is_elf("x86_64-unknown-linux-gnu"));
+        assert!(!super::is_elf("arm64-apple-darwin25.0.0"));
+        assert!(!super::is_elf("x86_64-pc-windows-msvc"));
+        let ctx = Context::create();
+        let module = ctx.create_module("sections");
+        let ty = ctx.void_type().fn_type(&[], false);
+        let defined = module.add_function("defined_fn", ty, None);
+        let builder = ctx.create_builder();
+        builder.position_at_end(ctx.append_basic_block(defined, "entry"));
+        builder.build_return(None).expect("ret");
+        let declared = module.add_function("declared_fn", ty, None);
+        super::split_function_sections(&module, false);
+        assert_eq!(defined.as_global_value().get_section(), None);
+        super::split_function_sections(&module, true);
+        let global = defined.as_global_value();
+        let section = global
+            .get_section()
+            .map(|s| s.to_string_lossy().into_owned());
+        assert_eq!(section.as_deref(), Some(".text.defined_fn"));
+        assert_eq!(declared.as_global_value().get_section(), None);
     }
 
     #[test]
